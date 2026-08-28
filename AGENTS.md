@@ -12,8 +12,8 @@ round, fresh moderator, ballots, controller-derived consensus, stop).
 
 ## The specification is the source of truth
 
-`GptPro/DIALECTIC_MVP_IMPLEMENTATION_AND_TEST_SPEC_V0.5.2.md` — **frozen MVP
-implementation baseline**, 1929 lines.
+`GptPro/DIALECTIC_MVP_IMPLEMENTATION_AND_TEST_SPEC_V0.5.3.md` — **frozen MVP
+implementation baseline**, 1958 lines.
 
 Read the relevant section before implementing against it. It went through five
 review rounds with two independent reviewers and its clauses are load-bearing:
@@ -21,7 +21,7 @@ bounds, orderings, and failure kinds are deliberate, not incidental. When code a
 spec disagree, the spec wins. When the spec is genuinely ambiguous, say so and ask —
 do not resolve it silently.
 
-Earlier revisions (V0.1–V0.5) and all `*_REVIEW-*.md` files are history. Consult
+Earlier revisions (V0.1–V0.5.2) and all `*_REVIEW-*.md` files are history. Consult
 them only to understand *why* a clause exists; never implement from them.
 
 ## Settled decisions — do not reopen
