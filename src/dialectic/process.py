@@ -238,6 +238,8 @@ class WindowsCreatedProcess:
 class WindowsJobBackend(Protocol):
     """Narrow injectable boundary around the release-platform Win32 calls."""
 
+    def nested_jobs_supported(self) -> bool: ...
+
     def create_kill_on_close_job(self) -> object: ...
 
     def create_standard_stream_pipes(self) -> Mapping[str, tuple[object, object]]: ...
@@ -286,6 +288,8 @@ class WindowsJobLauncher:
         cwd: str,
         environment: Mapping[str, str],
     ) -> "WindowsJobProcessUnit":
+        if not self._backend.nested_jobs_supported():
+            raise RuntimeError("nested Windows Job execution is unavailable")
         job: object | None = None
         pipes: Mapping[str, tuple[object, object]] = {}
         attribute_list: object | None = None
@@ -472,8 +476,17 @@ class WindowsReaderHandoff:
         coordinator: ReaderHandoffCoordinator,
         notify: Callable[[], None],
         loop: asyncio.AbstractEventLoop | None = None,
+        queue_capacity_bytes: int | None = None,
     ) -> None:
+        capacity = (
+            min(limit_bytes, MAX_READER_CHUNK_BYTES)
+            if queue_capacity_bytes is None
+            else queue_capacity_bytes
+        )
+        if limit_bytes <= 0 or not 0 < capacity <= limit_bytes:
+            raise ValueError("reader handoff capacity must be within the stream limit")
         self.limit_bytes = limit_bytes
+        self.queue_capacity_bytes = capacity
         self.coordinator = coordinator
         self._notify = notify
         self._loop = loop
@@ -520,7 +533,7 @@ class WindowsReaderHandoff:
                     )
                     while (
                         not overflow_now
-                        and self._queued_bytes + accepted_length > self.limit_bytes
+                        and self._queued_bytes + accepted_length > self.queue_capacity_bytes
                         and not self.coordinator.abort.is_set()
                         and not self.coordinator.overflow.is_set()
                     ):

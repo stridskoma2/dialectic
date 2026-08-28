@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import ctypes
 import hashlib
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -17,6 +20,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError
 from typer.testing import CliRunner
 
+import dialectic.ingress as ingress_module
 from dialectic.adapters import (
     AgentRegistry,
     ModelMismatchError,
@@ -92,12 +96,10 @@ from dialectic.scratch import (
 from dialectic.service import DialecticService
 from dialectic.store import (
     BootstrapError,
-    InvalidRunIdError,
     RunNotFoundError,
     RunStore,
     StateCorruptError,
     canonical_json_bytes,
-    validate_run_id,
 )
 
 
@@ -414,9 +416,19 @@ def test_core_013_large_prompt_uses_request_payload_not_argv(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize("run_id", ["../run", "20260828T010101Z-AAAAAAAAAA", "x", ""])
-def test_core_014_run_id_is_validated_before_path_join(run_id: str) -> None:
-    with pytest.raises(InvalidRunIdError):
-        validate_run_id(run_id)
+def test_core_014_run_id_is_validated_before_path_join(tmp_path: Path, run_id: str) -> None:
+    class PathJoinForbidden:
+        def __truediv__(self, part: object) -> Path:
+            raise AssertionError(f"path joining occurred for invalid run id: {part!r}")
+
+    store = RunStore(tmp_path / "state")
+    store.runs_root = PathJoinForbidden()  # type: ignore[assignment]
+    result = CliRunner().invoke(
+        create_app(lambda: DialecticService(store)),
+        ["status", run_id],
+    )
+    assert result.exit_code == 2
+    assert "canonical grammar" in result.output
 
 
 def test_core_015_controller_artifact_schemas_are_closed_and_versioned() -> None:
@@ -714,7 +726,7 @@ def test_core_025_status_phase_and_explicit_null_contracts() -> None:
 
 
 def test_core_026_failure_and_bounded_ingress_contracts(
-    tmp_path: Path, config_bytes: bytes
+    tmp_path: Path, config_bytes: bytes, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     for index, kind in enumerate(FAILURE_KINDS, start=1):
         run_id = f"20260828T0606{index:02d}Z-aaaaaaaaaa"
@@ -734,30 +746,175 @@ def test_core_026_failure_and_bounded_ingress_contracts(
     directory.mkdir()
     with pytest.raises(InputAcquisitionError, match="regular"):
         acquire_named_file(directory, label="input")
-    huge = tmp_path / "huge"
-    with huge.open("wb") as stream:
+    sparse = tmp_path / "sparse"
+    with sparse.open("wb") as stream:
         stream.seek(262_144)
         stream.write(b"x")
+    assert sparse.stat().st_size == 262_145
     with pytest.raises(InputAcquisitionError, match="exceeds"):
-        acquire_named_file(huge, label="input")
-    with pytest.raises(InputAcquisitionError):
-        acquire_named_file("NUL", label="input")
+        acquire_named_file(sparse, label="input")
 
-    service = DialecticService(
+    ceiling = 131_073
+    bounded = tmp_path / "bounded"
+    expected = b"x" * ceiling
+    bounded.write_bytes(expected)
+    selected_read_calls: list[int] = []
+    if os.name == "nt":
+        selected_reader = ingress_module._read_windows_handle
+
+        def track_selected_read(kernel32: object, handle: int, count: int) -> bytes:
+            selected_read_calls.append(count)
+            return selected_reader(kernel32, handle, count)
+
+        monkeypatch.setattr(ingress_module, "_read_windows_handle", track_selected_read)
+    else:
+        selected_reader = ingress_module._read_fd_bounded
+
+        def track_selected_read(fd: int, count: int) -> bytes:
+            selected_read_calls.append(count)
+            return selected_reader(fd, count)
+
+        monkeypatch.setattr(ingress_module, "_read_fd_bounded", track_selected_read)
+    assert acquire_named_file(bounded, label="input", ceiling=ceiling) == expected
+    assert selected_read_calls == [ceiling + 1]
+
+    read_payload = bytearray(b"p" * (ceiling + 1))
+    posix_read_sizes: list[int] = []
+
+    def fake_os_read(fd: int, count: int) -> bytes:
+        posix_read_sizes.append(count)
+        chunk = bytes(read_payload[:count])
+        del read_payload[:count]
+        return chunk
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ingress_module.os, "read", fake_os_read)
+        assert len(ingress_module._read_fd_bounded(1, ceiling + 1)) == ceiling + 1
+    assert sum(posix_read_sizes) == ceiling + 1
+    assert max(posix_read_sizes) <= 65_536
+
+    class FakeKernel32:
+        def __init__(self) -> None:
+            self.payload = bytearray(b"w" * (ceiling + 1))
+            self.read_sizes: list[int] = []
+
+        def ReadFile(
+            self,
+            handle: object,
+            buffer: object,
+            requested: int,
+            read_pointer: object,
+            overlapped: object,
+        ) -> int:
+            self.read_sizes.append(requested)
+            chunk = bytes(self.payload[:requested])
+            del self.payload[:requested]
+            ctypes.memmove(buffer, chunk, len(chunk))
+            read_pointer._obj.value = len(chunk)  # type: ignore[attr-defined]
+            return 1
+
+    fake_kernel32 = FakeKernel32()
+    assert len(
+        ingress_module._read_windows_handle(fake_kernel32, object(), ceiling + 1)
+    ) == ceiling + 1
+    assert sum(fake_kernel32.read_sizes) == ceiling + 1
+    assert max(fake_kernel32.read_sizes) <= 65_536
+
+    growing = tmp_path / "growing"
+    growing.write_bytes(b"before")
+    if os.name == "nt":
+        monkeypatch.setattr(ingress_module, "_read_windows_handle", selected_reader)
+
+        def grow_during_windows_read(kernel32: object, handle: int, count: int) -> bytes:
+            data = selected_reader(kernel32, handle, count)
+            with growing.open("ab") as stream:
+                stream.write(b"after")
+            return data
+
+        monkeypatch.setattr(
+            ingress_module, "_read_windows_handle", grow_during_windows_read
+        )
+    else:
+        monkeypatch.setattr(ingress_module, "_read_fd_bounded", selected_reader)
+
+        def grow_during_posix_read(fd: int, count: int) -> bytes:
+            data = selected_reader(fd, count)
+            with growing.open("ab") as stream:
+                stream.write(b"after")
+            return data
+
+        monkeypatch.setattr(ingress_module, "_read_fd_bounded", grow_during_posix_read)
+    with pytest.raises(InputAcquisitionError, match="changed"):
+        acquire_named_file(growing, label="input")
+
+    with pytest.raises(InputAcquisitionError, match="regular|device"):
+        acquire_named_file(os.devnull, label="input")
+    if os.name == "nt":
+        for special in ("NUL", r"\\.\pipe\dialectic-core-026"):
+            with pytest.raises(InputAcquisitionError, match="device"):
+                acquire_named_file(special, label="input")
+    else:
+        fifo = tmp_path / "input.fifo"
+        os.mkfifo(fifo)
+        with pytest.raises(InputAcquisitionError, match="regular"):
+            acquire_named_file(fifo, label="input")
+        socket_path = tmp_path / "input.socket"
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as unix_socket:
+            unix_socket.bind(str(socket_path))
+            with pytest.raises(InputAcquisitionError, match="regular"):
+                acquire_named_file(socket_path, label="input")
+
+    for offset, invalid_config, invalid_task in (
+        (30, config_bytes, b"\xff"),
+        (31, b"version: 1\nunexpected: true\n", b"task"),
+    ):
+        service = DialecticService(
+            RunStore(
+                tmp_path / f"invalid-state-{offset}",
+                run_id_factory=lambda value=offset: f"20260828T0606{value:02d}Z-aaaaaaaaaa",
+            )
+        )
+        record = asyncio.run(
+            service.execute_code_once(
+                service.create_run("code"),
+                config_bytes=invalid_config,
+                task_bytes=invalid_task,
+                repository_path=tmp_path,
+            )
+        )
+        assert (record.status, record.failure_kind) == ("FAILED", "INVALID_INPUT")
+
+    class TrackingService(DialecticService):
+        invalid_input_calls = 0
+
+        def fail_invalid_input(self, handle, diagnostic):  # type: ignore[no-untyped-def]
+            self.invalid_input_calls += 1
+            return super().fail_invalid_input(handle, diagnostic)
+
+    cli_run_id = "20260828T060632Z-aaaaaaaaaa"
+    tracking_service = TrackingService(
         RunStore(
-            tmp_path / "invalid-state",
-            run_id_factory=lambda: "20260828T060630Z-aaaaaaaaaa",
+            tmp_path / "cli-invalid-state",
+            run_id_factory=lambda: cli_run_id,
         )
     )
-    record = asyncio.run(
-        service.execute_code_once(
-            service.create_run("code"),
-            config_bytes=config_bytes,
-            task_bytes=b"\xff",
-            repository_path=tmp_path,
-        )
+    config_path = tmp_path / "valid-config.yaml"
+    config_path.write_bytes(config_bytes)
+    cli_result = CliRunner().invoke(
+        create_app(lambda: tracking_service),
+        [
+            "code",
+            "--config",
+            str(config_path),
+            "--repo",
+            str(tmp_path),
+            "--task-file",
+            str(tmp_path / "missing-task"),
+        ],
     )
-    assert (record.status, record.failure_kind) == ("FAILED", "INVALID_INPUT")
+    assert cli_result.exit_code == 2
+    assert tracking_service.invalid_input_calls == 1
+    assert tracking_service.get_run(cli_run_id).failure_kind == "INVALID_INPUT"
 
 
 def test_core_027_stream_scratch_and_cleanup_bounds(tmp_path: Path) -> None:
@@ -808,26 +965,145 @@ def test_core_027_stream_scratch_and_cleanup_bounds(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_core_028_windows_reader_handoff_is_byte_and_callback_bounded() -> None:
-    coordinator = ReaderHandoffCoordinator()
-    notifications: list[int] = []
-    handoff = WindowsReaderHandoff(
-        limit_bytes=256,
-        coordinator=coordinator,
-        notify=lambda: notifications.append(1),
+    class ChunkedPipe:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self._chunks = chunks
+            self._lock = threading.Lock()
+            self.read_count = 0
+            self.maximum_requested = 0
+
+        def read(self, size: int) -> bytes:
+            with self._lock:
+                self.read_count += 1
+                self.maximum_requested = max(self.maximum_requested, size)
+                if not self._chunks:
+                    return b""
+                chunk = self._chunks.pop(0)
+            assert len(chunk) <= size
+            return chunk
+
+    def wait_until(predicate, timeout: float = 1.0) -> None:  # type: ignore[no-untyped-def]
+        deadline = time.monotonic() + timeout
+        while not predicate():
+            if time.monotonic() >= deadline:
+                raise AssertionError("timed out waiting for reader state")
+            time.sleep(0.001)
+
+    loop = asyncio.get_running_loop()
+    stalled_coordinator = ReaderHandoffCoordinator()
+    stalled_notifications: list[str] = []
+    stdout = WindowsReaderHandoff(
+        limit_bytes=262_144,
+        queue_capacity_bytes=65_536,
+        coordinator=stalled_coordinator,
+        notify=lambda: stalled_notifications.append("stdout"),
+        loop=loop,
     )
-    thread = threading.Thread(
-        target=handoff.read_pipe,
-        args=(io.BytesIO(b"x" * 300),),
+    stderr = WindowsReaderHandoff(
+        limit_bytes=262_144,
+        queue_capacity_bytes=65_536,
+        coordinator=stalled_coordinator,
+        notify=lambda: stalled_notifications.append("stderr"),
+        loop=loop,
+    )
+    stdout_pipe = ChunkedPipe([b"o" * 16_384 for _ in range(16)])
+    stderr_pipe = ChunkedPipe([b"e" * 16_384 for _ in range(16)])
+    stalled_threads = [
+        threading.Thread(target=stdout.read_pipe, args=(stdout_pipe,), daemon=True),
+        threading.Thread(target=stderr.read_pipe, args=(stderr_pipe,), daemon=True),
+    ]
+    for reader in stalled_threads:
+        reader.start()
+    time.sleep(0.05)  # Deliberately prevent the scheduled loop notifications from running.
+    assert stalled_notifications == []
+    assert stdout.notification_count == stderr.notification_count == 1
+    assert all(reader.is_alive() for reader in stalled_threads)
+    assert stdout.peak_queued_bytes <= stdout.queue_capacity_bytes
+    assert stderr.peak_queued_bytes <= stderr.queue_capacity_bytes
+    assert stdout.peak_resident_bytes <= stdout.queue_capacity_bytes + 65_536
+    assert stderr.peak_resident_bytes <= stderr.queue_capacity_bytes + 65_536
+    while any(reader.is_alive() for reader in stalled_threads):
+        stdout.drain()
+        stderr.drain()
+        await asyncio.sleep(0)
+    assert await join_reader_threads(
+        stalled_threads, coordinator=stalled_coordinator, timeout_seconds=1
+    )
+    assert stdout_pipe.maximum_requested <= 65_536
+    assert stderr_pipe.maximum_requested <= 65_536
+
+    abort_coordinator = ReaderHandoffCoordinator()
+    abort_handoff = WindowsReaderHandoff(
+        limit_bytes=12,
+        queue_capacity_bytes=4,
+        coordinator=abort_coordinator,
+        notify=lambda: None,
+    )
+    abort_pipe = ChunkedPipe([b"a" * 4, b"b" * 4])
+    abort_thread = threading.Thread(
+        target=abort_handoff.read_pipe, args=(abort_pipe,), daemon=True
+    )
+    abort_thread.start()
+    wait_until(lambda: abort_pipe.read_count >= 2)
+    assert abort_thread.is_alive()
+    assert abort_handoff.queued_bytes == 4
+    abort_coordinator.trigger_abort()
+    abort_thread.join(1)
+    assert not abort_thread.is_alive()
+    assert not abort_coordinator.overflow.is_set()
+
+    flood_coordinator = ReaderHandoffCoordinator()
+    flood_handoff = WindowsReaderHandoff(
+        limit_bytes=1_048_576,
+        queue_capacity_bytes=65_536,
+        coordinator=flood_coordinator,
+        notify=lambda: None,
+    )
+    flood_pipe = ChunkedPipe([b"f" * 4_096 for _ in range(256)])
+    flood_thread = threading.Thread(
+        target=flood_handoff.read_pipe, args=(flood_pipe,), daemon=True
+    )
+    flood_thread.start()
+    captured_bytes = 0
+    while flood_thread.is_alive():
+        captured_bytes += sum(len(chunk) for chunk in flood_handoff.drain())
+        await asyncio.sleep(0)
+    captured_bytes += sum(len(chunk) for chunk in flood_handoff.drain())
+    assert captured_bytes == 1_048_576
+    assert not flood_coordinator.overflow.is_set()
+    assert flood_handoff.peak_queued_bytes <= flood_handoff.queue_capacity_bytes
+
+    overflow_coordinator = ReaderHandoffCoordinator()
+    waiting_handoff = WindowsReaderHandoff(
+        limit_bytes=12,
+        queue_capacity_bytes=4,
+        coordinator=overflow_coordinator,
+        notify=lambda: None,
+    )
+    overflowing_handoff = WindowsReaderHandoff(
+        limit_bytes=4,
+        queue_capacity_bytes=4,
+        coordinator=overflow_coordinator,
+        notify=lambda: None,
+    )
+    waiting_pipe = ChunkedPipe([b"w" * 4, b"x" * 4])
+    waiting_thread = threading.Thread(
+        target=waiting_handoff.read_pipe, args=(waiting_pipe,), daemon=True
+    )
+    waiting_thread.start()
+    wait_until(lambda: waiting_pipe.read_count >= 2)
+    overflow_thread = threading.Thread(
+        target=overflowing_handoff.read_pipe,
+        args=(ChunkedPipe([b"!" * 5]),),
         daemon=True,
     )
-    thread.start()
-    thread.join(1)
-    assert not thread.is_alive()
-    assert coordinator.overflow_transition_count == 1
-    assert handoff.peak_queued_bytes <= 256
-    assert handoff.peak_resident_bytes <= 256 + 65_536
-    assert handoff.notification_count <= 2
-    assert await join_reader_threads([thread], coordinator=coordinator, timeout_seconds=1)
+    overflow_thread.start()
+    waiting_thread.join(1)
+    overflow_thread.join(1)
+    assert not waiting_thread.is_alive() and not overflow_thread.is_alive()
+    assert overflow_coordinator.overflow_transition_count == 1
+    assert not overflow_coordinator.trigger_overflow()
+    assert overflow_coordinator.overflow_transition_count == 1
 
     class Resource:
         def __init__(self, name: str) -> None:
@@ -841,6 +1117,11 @@ async def test_core_028_windows_reader_handoff_is_byte_and_callback_bounded() ->
             self.process = WindowsCreatedProcess(
                 Resource("process"), Resource("thread"), 123
             )
+            self.entrypoint_ran = False
+
+        def nested_jobs_supported(self):
+            self.calls.append("nested-probe")
+            return True
 
         def create_kill_on_close_job(self):
             self.calls.append("job")
@@ -874,6 +1155,8 @@ async def test_core_028_windows_reader_handoff_is_byte_and_callback_bounded() ->
         def resume_thread(self, thread):
             self.calls.append("resume")
             assert thread is self.process.thread_handle
+            assert "verify" in self.calls
+            self.entrypoint_ran = True  # Models an immediate descendant/sentinel attempt.
 
         def request_graceful_termination(self, process):
             self.calls.append("graceful")
@@ -899,13 +1182,15 @@ async def test_core_028_windows_reader_handoff_is_byte_and_callback_bounded() ->
         environment={"SystemRoot": "C:\\Windows"},
     )
     assert backend.calls[:6] == [
+        "nested-probe",
         "job",
         "pipes",
         "attributes",
         "create-suspended",
         "verify",
-        "resume",
     ]
+    assert backend.calls[6] == "resume"
+    assert backend.entrypoint_ran
     job_result = await ProcessSupervisor().supervise(
         unit,
         turn_timeout_seconds=1,
@@ -913,6 +1198,40 @@ async def test_core_028_windows_reader_handoff_is_byte_and_callback_bounded() ->
     )
     assert job_result.termination_reason == "completed"
     assert job_result.cleanup_confirmed
+    assert "terminate-job" in backend.calls
+    assert len(backend.closed) == 8
+
+    class JobListFailureBackend(Backend):
+        def create_attribute_list(self, *, job, inherited_handles):
+            self.calls.append("job-list-failed")
+            raise RuntimeError("creation-time Job-list assignment failed")
+
+    job_list_backend = JobListFailureBackend()
+    with pytest.raises(RuntimeError, match="Job-list"):
+        WindowsJobLauncher(job_list_backend).launch(
+            executable="agent.exe",
+            arguments=(),
+            cwd="C:\\neutral",
+            environment={"SystemRoot": "C:\\Windows"},
+        )
+    assert "create-suspended" not in job_list_backend.calls
+    assert "terminate-job" in job_list_backend.calls
+    assert len(job_list_backend.closed) == 5
+
+    class UnsupportedNestedJobBackend(Backend):
+        def nested_jobs_supported(self):
+            self.calls.append("nested-probe-failed")
+            return False
+
+    nested_backend = UnsupportedNestedJobBackend()
+    with pytest.raises(RuntimeError, match="nested Windows Job"):
+        WindowsJobLauncher(nested_backend).launch(
+            executable="agent.exe",
+            arguments=(),
+            cwd="C:\\neutral",
+            environment={"SystemRoot": "C:\\Windows"},
+        )
+    assert nested_backend.calls == ["nested-probe-failed"]
 
     class MembershipFailureBackend(Backend):
         def verify_job_membership(self, process, job):
@@ -929,6 +1248,80 @@ async def test_core_028_windows_reader_handoff_is_byte_and_callback_bounded() ->
         )
     assert "resume" not in failed_backend.calls
     assert len(failed_backend.closed) == 8
+
+    class BlockingBackend(Backend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminated = threading.Event()
+
+        def wait_process(self, process, timeout_seconds):
+            wait_seconds = 1 if timeout_seconds is None else timeout_seconds
+            return 9 if self.terminated.wait(wait_seconds) else None
+
+        def terminate_job(self, job):
+            super().terminate_job(job)
+            self.terminated.set()
+
+    blocking_backend = BlockingBackend()
+    blocking_unit = WindowsJobLauncher(blocking_backend).launch(
+        executable="agent.exe",
+        arguments=(),
+        cwd="C:\\neutral",
+        environment={"SystemRoot": "C:\\Windows"},
+    )
+    overflow_event = asyncio.Event()
+    overflow_event.set()
+    overflow_result = await ProcessSupervisor().supervise(
+        blocking_unit,
+        turn_timeout_seconds=1,
+        graceful_kill_seconds=0.01,
+        overflow=overflow_event,
+    )
+    assert overflow_result.termination_reason == "output-limit"
+    assert overflow_result.failure_kind == "AGENT_OUTPUT_TOO_LARGE"
+    assert overflow_result.cleanup_confirmed
+    assert "terminate-job" in blocking_backend.calls
+    assert len(blocking_backend.closed) == 8
+
+    class UnclosedJobBackend(BlockingBackend):
+        def close_resource(self, resource):
+            if resource is self.job:
+                return
+            super().close_resource(resource)
+
+    unclosed_backend = UnclosedJobBackend()
+    unclosed_unit = WindowsJobLauncher(unclosed_backend).launch(
+        executable="agent.exe",
+        arguments=(),
+        cwd="C:\\neutral",
+        environment={"SystemRoot": "C:\\Windows"},
+    )
+    cleanup_overflow = asyncio.Event()
+    cleanup_overflow.set()
+    cleanup_result = await ProcessSupervisor().supervise(
+        unclosed_unit,
+        turn_timeout_seconds=1,
+        graceful_kill_seconds=0.01,
+        overflow=cleanup_overflow,
+    )
+    assert cleanup_result.termination_reason == "cleanup-failed"
+    assert cleanup_result.failure_kind == "PROCESS_CLEANUP_FAILED"
+
+    slow_threads = [
+        threading.Thread(target=time.sleep, args=(0.1,), daemon=True),
+        threading.Thread(target=time.sleep, args=(0.1,), daemon=True),
+    ]
+    for reader in slow_threads:
+        reader.start()
+    join_started = time.monotonic()
+    assert not await join_reader_threads(
+        slow_threads,
+        coordinator=ReaderHandoffCoordinator(),
+        timeout_seconds=0.01,
+    )
+    assert time.monotonic() - join_started < 0.08
+    for reader in slow_threads:
+        reader.join(1)
 
 
 def test_core_029_only_scalar_utf8_without_bom_is_accepted(
