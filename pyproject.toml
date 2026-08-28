@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dialectic"
+version = "0.1.0"
+description = "A bounded local supervisor for cross-model review and deliberation"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+dependencies = [
+  "filelock>=3.16,<4",
+  "platformdirs>=4.3,<5",
+  "pydantic>=2.10,<3",
+  "PyYAML>=6.0.2,<7",
+  "rich>=13.9,<15",
+  "typer>=0.15,<1",
+  "pywin32>=308; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.3,<10",
+  "pytest-asyncio>=0.25,<2",
+]
+
+[project.scripts]
+dial = "dialectic.cli:main"
+dialectic = "dialectic.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dialectic"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+  "integration: local Git or subprocess contract test",
+  "live: opt-in authenticated provider smoke test",
+]
