@@ -56,6 +56,12 @@ def scan_scratch(root: Path | str, limits: ScratchLimits) -> ScratchUsage:
     root_info = root_path.lstat()
     if not stat.S_ISDIR(root_info.st_mode) or _is_reparse(root_info):
         raise ScratchContainmentError("scratch root is not a non-reparse directory")
+    if os.name != "nt":
+        return _scan_scratch_posix(
+            root_path,
+            limits,
+            root_identity=(root_info.st_dev, root_info.st_ino),
+        )
 
     byte_count = 0
     entry_count = 0
@@ -112,6 +118,98 @@ def scan_scratch(root: Path | str, limits: ScratchLimits) -> ScratchUsage:
     return ScratchUsage(byte_count, entry_count, maximum_depth, None, invalid_type)
 
 
+def _scan_scratch_posix(
+    root: Path,
+    limits: ScratchLimits,
+    *,
+    root_identity: tuple[int, int],
+) -> ScratchUsage:
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        root_fd = os.open(root, flags)
+    except OSError as exc:
+        raise ScratchContainmentError("scratch root cannot be opened safely") from exc
+    state: dict[str, int | str | None] = {
+        "bytes": 0,
+        "entries": 0,
+        "depth": 0,
+        "overage": None,
+        "invalid": None,
+    }
+
+    def scan(directory_fd: int, depth: int) -> None:
+        for name in os.listdir(directory_fd):
+            child_depth = depth + 1
+            state["entries"] = int(state["entries"]) + 1
+            if int(state["entries"]) > limits.max_entries:
+                state["entries"] = limits.max_entries + 1
+                state["overage"] = "entries"
+                return
+            state["depth"] = max(int(state["depth"]), child_depth)
+            if int(state["depth"]) > limits.max_depth:
+                state["depth"] = limits.max_depth + 1
+                state["overage"] = "depth"
+                return
+            try:
+                information = os.stat(
+                    name, dir_fd=directory_fd, follow_symlinks=False
+                )
+            except OSError as exc:
+                raise ScratchContainmentError(
+                    "scratch entry identity changed during traversal"
+                ) from exc
+            if stat.S_ISLNK(information.st_mode):
+                state["invalid"] = state["invalid"] or "link-or-reparse"
+            elif stat.S_ISDIR(information.st_mode):
+                try:
+                    child_fd = os.open(name, flags, dir_fd=directory_fd)
+                except OSError as exc:
+                    raise ScratchContainmentError(
+                        "scratch directory cannot be opened safely"
+                    ) from exc
+                try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino) != (
+                        information.st_dev,
+                        information.st_ino,
+                    ):
+                        raise ScratchContainmentError(
+                            "scratch directory identity changed during traversal"
+                        )
+                    scan(child_fd, child_depth)
+                finally:
+                    os.close(child_fd)
+                if state["overage"] is not None:
+                    return
+            elif stat.S_ISREG(information.st_mode):
+                state["bytes"] = min(
+                    limits.max_bytes + 1,
+                    int(state["bytes"]) + information.st_size,
+                )
+                if int(state["bytes"]) > limits.max_bytes:
+                    state["bytes"] = limits.max_bytes + 1
+                    state["overage"] = "bytes"
+                    return
+            else:
+                state["invalid"] = state["invalid"] or "special-file"
+
+    try:
+        opened_root = os.fstat(root_fd)
+        if (opened_root.st_dev, opened_root.st_ino) != root_identity:
+            raise ScratchContainmentError("scratch root identity changed during traversal")
+        scan(root_fd, 0)
+    finally:
+        os.close(root_fd)
+    return ScratchUsage(
+        int(state["bytes"]),
+        int(state["entries"]),
+        int(state["depth"]),
+        state["overage"] if isinstance(state["overage"], str) else None,
+        state["invalid"] if isinstance(state["invalid"], str) else None,
+    )
+
+
 async def monitor_scratch(
     root: Path | str,
     limits: ScratchLimits,
@@ -160,6 +258,14 @@ def cleanup_reserved_tree(
     if not stat.S_ISDIR(root_info.st_mode) or _is_reparse(root_info):
         raise ScratchContainmentError("reserved root is not a non-reparse directory")
     deadline = clock() + timeout_seconds
+    if os.name != "nt":
+        _cleanup_reserved_tree_posix(
+            root_path,
+            identity=identity,
+            deadline=deadline,
+            clock=clock,
+        )
+        return
     stack: list[tuple[Path, os.ScandirIterator[str]]] = []
     try:
         stack.append((root_path, os.scandir(root_path)))
@@ -203,6 +309,89 @@ def cleanup_reserved_tree(
             entries.close()
     if root_path.exists() or root_path.is_symlink():
         raise ScratchContainmentError("reserved root absence could not be proved")
+
+
+def _cleanup_reserved_tree_posix(
+    root: Path,
+    *,
+    identity: tuple[int, int],
+    deadline: float,
+    clock: Callable[[], float],
+) -> None:
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        root_fd = os.open(root, flags)
+    except OSError as exc:
+        raise ScratchContainmentError("reserved root cannot be opened safely") from exc
+    try:
+        information = os.fstat(root_fd)
+        if (information.st_dev, information.st_ino) != identity:
+            raise ScratchContainmentError("reserved root identity changed before cleanup")
+        _cleanup_directory_fd(root_fd, flags=flags, deadline=deadline, clock=clock)
+        current = root.lstat()
+        if (current.st_dev, current.st_ino) != identity:
+            raise ScratchContainmentError("reserved root identity changed during cleanup")
+    finally:
+        os.close(root_fd)
+    root.rmdir()
+    if os.path.lexists(root):
+        raise ScratchContainmentError("reserved root absence could not be proved")
+
+
+def _cleanup_directory_fd(
+    directory_fd: int,
+    *,
+    flags: int,
+    deadline: float,
+    clock: Callable[[], float],
+) -> None:
+    for name in os.listdir(directory_fd):
+        if clock() > deadline:
+            raise ScratchCleanupTimeout(
+                "reserved-tree cleanup exceeded its independent bound"
+            )
+        try:
+            information = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(information.st_mode) and not stat.S_ISLNK(information.st_mode):
+            try:
+                child_fd = os.open(name, flags, dir_fd=directory_fd)
+            except OSError as exc:
+                raise ScratchContainmentError(
+                    "reserved child directory cannot be opened safely"
+                ) from exc
+            try:
+                opened = os.fstat(child_fd)
+                if (opened.st_dev, opened.st_ino) != (
+                    information.st_dev,
+                    information.st_ino,
+                ):
+                    raise ScratchContainmentError(
+                        "reserved child identity changed during cleanup"
+                    )
+                _cleanup_directory_fd(
+                    child_fd,
+                    flags=flags,
+                    deadline=deadline,
+                    clock=clock,
+                )
+            finally:
+                os.close(child_fd)
+            try:
+                os.rmdir(name, dir_fd=directory_fd)
+            except OSError as exc:
+                raise ScratchContainmentError(
+                    "reserved child changed before directory removal"
+                ) from exc
+        else:
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except OSError as exc:
+                raise ScratchContainmentError(
+                    "reserved child changed before leaf removal"
+                ) from exc
 
 
 def _unlink_reparse(path: Path, info: os.stat_result) -> None:

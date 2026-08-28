@@ -12,6 +12,8 @@ from pathlib import Path
 
 from filelock import FileLock, Timeout
 
+from .filesystem import stable_filesystem_identity
+
 
 class RepositoryIdentityError(RuntimeError):
     pass
@@ -40,7 +42,7 @@ def resolve_repository_identity(path: Path | str) -> RepositoryIdentity:
     if not stat.S_ISDIR(info.st_mode):
         raise RepositoryIdentityError("repository common path is not a directory")
     platform_tag = "windows" if os.name == "nt" else "linux" if sys.platform.startswith("linux") else sys.platform
-    filesystem_identity = f"{info.st_dev:x}:{info.st_ino:x}"
+    filesystem_identity = stable_filesystem_identity(canonical)
     digest = hashlib.sha256(
         platform_tag.encode("ascii") + filesystem_identity.encode("ascii")
     ).hexdigest()

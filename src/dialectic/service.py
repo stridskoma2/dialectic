@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Callable, Protocol, Sequence
 
 from .config import ConfigError, ConfigLoader, decode_scalar_utf8, validate_mode
 from .contracts import (
@@ -228,11 +228,33 @@ class DialecticService:
         self.store.write_run(handle, record)
         return record
 
-    def finalize_code(self, handle: RunHandle, outcome: CodeOutcome) -> RunRecord:
-        return self._finalize(handle, code_outcome=outcome, consensus_outcome=None)
+    def finalize_code(
+        self,
+        handle: RunHandle,
+        outcome: CodeOutcome,
+        *,
+        unresolved_items: Sequence[str] = (),
+        artifact_paths: dict[str, str] | None = None,
+        markdown_notes: Sequence[str] = (),
+    ) -> RunRecord:
+        return self._finalize(
+            handle,
+            code_outcome=outcome,
+            consensus_outcome=None,
+            unresolved_items=unresolved_items,
+            artifact_paths=artifact_paths,
+            markdown_notes=markdown_notes,
+        )
 
     def finalize_council(self, handle: RunHandle, outcome: ConsensusOutcome) -> RunRecord:
-        return self._finalize(handle, code_outcome=None, consensus_outcome=outcome)
+        return self._finalize(
+            handle,
+            code_outcome=None,
+            consensus_outcome=outcome,
+            unresolved_items=(),
+            artifact_paths=None,
+            markdown_notes=(),
+        )
 
     def _finalize(
         self,
@@ -240,6 +262,9 @@ class DialecticService:
         *,
         code_outcome: CodeOutcome | None,
         consensus_outcome: ConsensusOutcome | None,
+        unresolved_items: Sequence[str],
+        artifact_paths: dict[str, str] | None,
+        markdown_notes: Sequence[str],
     ) -> RunRecord:
         previous = self.store.read_handle(handle)
         now = datetime.now(UTC)
@@ -257,7 +282,13 @@ class DialecticService:
         )
         record = RunRecord.model_validate(record.model_dump())
         self._persist_with_event(handle, record, "run-finalized", {})
-        self._persist_terminal_summary(handle, record)
+        self._persist_terminal_summary(
+            handle,
+            record,
+            unresolved_items=unresolved_items,
+            artifact_paths=artifact_paths,
+            markdown_notes=markdown_notes,
+        )
         return record
 
     def fail_run(
@@ -319,6 +350,8 @@ class DialecticService:
 
     def get_result(self, run_id: str) -> SummaryRecord:
         record = self.get_run(run_id)
+        if record.status in {"FINALIZED", "FAILED", "TIMED_OUT", "CANCELLED"}:
+            return self.store.read_summary(run_id)
         outcome = record.code_outcome or record.consensus_outcome
         return SummaryRecord(
             artifact_schema_version=ARTIFACT_SCHEMA_VERSION,
@@ -359,7 +392,20 @@ class DialecticService:
             ),
         )
 
-    def _persist_terminal_summary(self, handle: RunHandle, record: RunRecord) -> None:
+    def _persist_terminal_summary(
+        self,
+        handle: RunHandle,
+        record: RunRecord,
+        *,
+        unresolved_items: Sequence[str] = (),
+        artifact_paths: dict[str, str] | None = None,
+        markdown_notes: Sequence[str] = (),
+    ) -> None:
+        paths = {"events": "events.jsonl", "run": "run.json"}
+        if (self.store.assert_handle(handle) / "git" / "workspace.json").is_file():
+            paths["workspace"] = "git/workspace.json"
+        if artifact_paths:
+            paths.update(artifact_paths)
         summary = SummaryRecord(
             artifact_schema_version=ARTIFACT_SCHEMA_VERSION,
             tool_version=TOOL_VERSION,
@@ -368,8 +414,8 @@ class DialecticService:
             status=record.status,
             outcome=record.code_outcome or record.consensus_outcome,
             failure_kind=record.failure_kind,
-            unresolved_items=[],
-            artifact_paths={"events": "events.jsonl", "run": "run.json"},
+            unresolved_items=list(unresolved_items),
+            artifact_paths=paths,
         )
         self.store.write_artifact(handle, "summary.json", summary)
         lines = [f"# Dialectic run {record.run_id}", "", f"Status: {record.status}"]
@@ -378,6 +424,11 @@ class DialecticService:
             lines.append(f"Outcome: {outcome}")
         if record.failure_kind is not None:
             lines.append(f"Failure: {record.failure_kind}")
+        if unresolved_items:
+            lines.extend(["", "Unresolved findings:"])
+            lines.extend(f"- {item}" for item in unresolved_items)
+        if markdown_notes:
+            lines.extend(["", *markdown_notes])
         self.store.write_artifact(
             handle,
             "summary.md",

@@ -21,7 +21,7 @@ from pydantic import BaseModel, ValidationError
 
 from .contracts import RUN_ID_PATTERN, RunMode
 from .contracts import ARTIFACT_SCHEMA_VERSION, TOOL_VERSION
-from .schemas import CapabilityAttestationArtifact, EventRecord, RunRecord
+from .schemas import CapabilityAttestationArtifact, EventRecord, RunRecord, SummaryRecord
 
 import re
 
@@ -171,6 +171,20 @@ class RunStore:
     def read_handle(self, handle: RunHandle) -> RunRecord:
         self.assert_handle(handle)
         return self.read_run(handle.run_id)
+
+    def read_summary(self, run_id: str) -> SummaryRecord:
+        validate_run_id(run_id)
+        path = self.runs_root / run_id / "summary.json"
+        if not path.exists():
+            raise RunNotFoundError(f"run summary not found: {run_id}")
+        try:
+            raw = _bounded_artifact_read(path, 1_048_576)
+            summary = SummaryRecord.model_validate_json(raw, strict=True)
+        except (OSError, ValidationError, ValueError) as exc:
+            raise StateCorruptError(f"run summary is corrupt: {run_id}") from exc
+        if summary.run_id != run_id:
+            raise StateCorruptError(f"run summary id mismatch: {run_id}")
+        return summary
 
     def write_run(
         self,

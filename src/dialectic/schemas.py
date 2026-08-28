@@ -477,6 +477,38 @@ class FeedbackArtifact(ControllerArtifact):
     findings: list[NormalizedFinding]
 
 
+class FindingDisposition(ClosedModel):
+    finding_key: str
+    outcome: Literal["fixed", "rejected_with_evidence", "not_fixed"]
+    explanation: str
+
+    @field_validator("finding_key", "explanation")
+    @classmethod
+    def required_disposition_text(cls, value: str, info: ValidationInfo) -> str:
+        return _nonempty(value, info.field_name)
+
+
+class DriverRepairReport(ClosedModel):
+    schema_version: Literal[1]
+    summary: str
+    dispositions: list[FindingDisposition]
+
+    @field_validator("summary")
+    @classmethod
+    def repair_summary_nonempty(cls, value: str) -> str:
+        return _nonempty(value, "summary")
+
+    @model_validator(mode="after")
+    def disposition_keys_are_exact(self, info: ValidationInfo) -> Self:
+        keys = [disposition.finding_key for disposition in self.dispositions]
+        if len(keys) != len(set(keys)):
+            raise ValueError("disposition finding keys must be unique")
+        expected = (info.context or {}).get("finding_keys")
+        if expected is not None and set(keys) != set(expected):
+            raise ValueError("dispositions must contain every supplied finding key exactly once")
+        return self
+
+
 class SummaryRecord(ControllerArtifact):
     run_id: str
     mode: RunMode
@@ -569,6 +601,10 @@ class DynamicFilesystemIdentity(ClosedModel):
         "saved_auth_path",
         "os_temp_root",
         "outside_sentinel",
+        "turn_scratch_root",
+        "turn_scratch_control",
+        "turn_scratch_tmp",
+        "neutral_role_dir",
     ]
     path_sha256: str
     filesystem_identity: str
@@ -620,6 +656,38 @@ class CapabilityBindingArtifact(ControllerArtifact):
         if keys != sorted(keys) or len(keys) != len(set(keys)):
             raise ValueError("dynamic filesystem identities must be sorted and unique")
         return value
+
+    @model_validator(mode="after")
+    def identity_roles_match_access_mode(self) -> Self:
+        roles = [identity.role for identity in self.dynamic_filesystem_identities]
+        scratch_roles = {
+            "turn_scratch_root",
+            "turn_scratch_control",
+            "turn_scratch_tmp",
+        }
+        if self.access_mode == "driver-write":
+            if self.role != "driver":
+                raise ValueError("driver-write bindings require the driver role")
+            for scratch_role in scratch_roles:
+                if roles.count(scratch_role) != 1:
+                    raise ValueError(
+                        f"driver binding requires exactly one {scratch_role} identity"
+                    )
+            if "neutral_role_dir" in roles:
+                raise ValueError("driver binding cannot contain neutral_role_dir")
+        else:
+            if self.role == "driver":
+                raise ValueError("packet-only bindings cannot use the driver role")
+            if roles.count("neutral_role_dir") != 1:
+                raise ValueError(
+                    "packet-only binding requires exactly one neutral_role_dir identity"
+                )
+            forbidden = scratch_roles | {"isolated_worktree"}
+            if forbidden.intersection(roles):
+                raise ValueError(
+                    "packet-only binding cannot contain scratch or isolated-worktree identities"
+                )
+        return self
 
 
 class AgentRequestArtifact(ControllerArtifact):

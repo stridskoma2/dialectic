@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 from pydantic import ValidationError
 
+from .filesystem import stable_filesystem_identity
 from .schemas import (
     CapabilityAttestationArtifact,
     CapabilityBindingArtifact,
@@ -124,27 +126,13 @@ def build_capability_binding(
     if set(dynamic_paths) != set(fixture.dynamic_roles):
         raise CapabilityEvidenceError("dynamic role set does not exactly match the fixture")
 
-    identities: list[DynamicFilesystemIdentity] = []
     substitutions: dict[str, str] = {}
     for dynamic_role, path in dynamic_paths.items():
-        try:
-            resolved = path.resolve(strict=True)
-            info = resolved.stat()
-        except OSError as exc:
-            raise CapabilityEvidenceError(
-                f"dynamic object {dynamic_role} does not exist before binding"
-            ) from exc
-        if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
-            raise CapabilityEvidenceError(f"dynamic object {dynamic_role} has unsupported type")
-        path_hash = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()
-        substitutions[dynamic_role] = str(resolved)
-        identities.append(
-            DynamicFilesystemIdentity(
-                role=dynamic_role,
-                path_sha256=path_hash,
-                filesystem_identity=f"{info.st_dev:x}:{info.st_ino:x}",
-            )
-        )
+        substitutions[dynamic_role] = str(_resolve_dynamic_path(dynamic_role, path))
+    identities = _capture_dynamic_identities(
+        dynamic_paths,
+        platform_backend=attestation.platform_backend,
+    )
     expected_profile = _substitute_template(fixture.template, substitutions)
     if _canonical_bytes(expected_profile) != _canonical_bytes(supplied_concrete_profile):
         raise CapabilityEvidenceError("concrete profile is not the canonical template instantiation")
@@ -163,6 +151,72 @@ def build_capability_binding(
         dynamic_filesystem_identities=identities,
         canonical_instantiation_verified=True,
     )
+
+
+def validate_binding_identities(
+    binding: CapabilityBindingArtifact,
+    *,
+    dynamic_paths: Mapping[str, Path],
+    platform_backend: str,
+) -> None:
+    """Revalidate every authoritative identity before a bound start or resume."""
+
+    expected = _capture_dynamic_identities(
+        dynamic_paths,
+        platform_backend=platform_backend,
+    )
+    if binding.dynamic_filesystem_identities != expected:
+        raise CapabilityEvidenceError(
+            "capability binding dynamic path or filesystem identity changed"
+        )
+
+
+def _capture_dynamic_identities(
+    dynamic_paths: Mapping[str, Path],
+    *,
+    platform_backend: str,
+) -> list[DynamicFilesystemIdentity]:
+    try:
+        backend = platform_backend.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise CapabilityEvidenceError("platform backend must be ASCII") from exc
+    identities: list[DynamicFilesystemIdentity] = []
+    for dynamic_role, path in dynamic_paths.items():
+        resolved = _resolve_dynamic_path(dynamic_role, path)
+        info = resolved.stat()
+        canonical_key = os.path.normcase(str(resolved)) if os.name == "nt" else str(resolved)
+        identities.append(
+            DynamicFilesystemIdentity(
+                role=dynamic_role,
+                path_sha256=hashlib.sha256(
+                    backend + b"\0" + canonical_key.encode("utf-8")
+                ).hexdigest(),
+                filesystem_identity=stable_filesystem_identity(resolved),
+            )
+        )
+    identities.sort(key=lambda item: (item.role, item.path_sha256))
+    return identities
+
+
+def _resolve_dynamic_path(dynamic_role: str, path: Path) -> Path:
+    try:
+        resolved = path.resolve(strict=True)
+        info = resolved.stat()
+    except OSError as exc:
+        raise CapabilityEvidenceError(
+            f"dynamic object {dynamic_role} does not exist before binding"
+        ) from exc
+    if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+        raise CapabilityEvidenceError(f"dynamic object {dynamic_role} has unsupported type")
+    directory_roles = {
+        "turn_scratch_root",
+        "turn_scratch_control",
+        "turn_scratch_tmp",
+        "neutral_role_dir",
+    }
+    if dynamic_role in directory_roles and not stat.S_ISDIR(info.st_mode):
+        raise CapabilityEvidenceError(f"dynamic object {dynamic_role} must be a directory")
+    return resolved
 
 
 class BindingBarrier:

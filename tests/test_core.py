@@ -34,6 +34,7 @@ from dialectic.capabilities import (
     CapabilityFixture,
     build_capability_binding,
     validate_cached_attestation,
+    validate_binding_identities,
     validate_or_probe_attestation,
 )
 from dialectic.cli import create_app
@@ -1360,10 +1361,26 @@ def test_core_029_only_scalar_utf8_without_bom_is_accepted(
 def test_core_030_capability_evidence_and_binding_barriers_are_fail_closed(
     tmp_path: Path,
 ) -> None:
+    scratch_root = tmp_path / ".dialectic-turn"
+    scratch_control = scratch_root / "control"
+    scratch_tmp = scratch_root / "tmp"
+    scratch_control.mkdir(parents=True)
+    scratch_tmp.mkdir()
+    driver_paths = {
+        "state_root": tmp_path,
+        "turn_scratch_root": scratch_root,
+        "turn_scratch_control": scratch_control,
+        "turn_scratch_tmp": scratch_tmp,
+    }
     fixture = CapabilityFixture(
         probe_ids=("network-denied",),
-        dynamic_roles=("state_root",),
-        template={"rules": [{"path": {"dynamic_path": "state_root"}}]},
+        dynamic_roles=tuple(driver_paths),
+        template={
+            "rules": [
+                {"role": role, "path": {"dynamic_path": role}}
+                for role in driver_paths
+            ]
+        },
     )
     probe = CapabilityProbeResult(
         probe_id="network-denied",
@@ -1456,7 +1473,12 @@ def test_core_030_capability_evidence_and_binding_barriers_are_fail_closed(
         authentication_verified=True,
     )
     preflight_bytes = canonical_json_bytes(preflight)
-    concrete = {"rules": [{"path": str(tmp_path.resolve())}]}
+    concrete = {
+        "rules": [
+            {"role": role, "path": str(path.resolve())}
+            for role, path in driver_paths.items()
+        ]
+    }
     binding = build_capability_binding(
         binding_id="driver-initial",
         role="driver",
@@ -1466,16 +1488,113 @@ def test_core_030_capability_evidence_and_binding_barriers_are_fail_closed(
         attestation_bytes=attestation_bytes,
         attestation=attestation,
         fixture=fixture,
-        dynamic_paths={"state_root": tmp_path},
+        dynamic_paths=driver_paths,
         supplied_concrete_profile=concrete,
     )
     assert binding.canonical_instantiation_verified is True
+    assert {
+        identity.role for identity in binding.dynamic_filesystem_identities
+    }.issuperset(
+        {"turn_scratch_root", "turn_scratch_control", "turn_scratch_tmp"}
+    )
+    with pytest.raises(CapabilityEvidenceError, match="role set"):
+        build_capability_binding(
+            binding_id="driver-incomplete",
+            role="driver",
+            target_id="driver",
+            access_mode="driver-write",
+            target_preflight_bytes=preflight_bytes,
+            attestation_bytes=attestation_bytes,
+            attestation=attestation,
+            fixture=fixture,
+            dynamic_paths={"state_root": tmp_path},
+            supplied_concrete_profile=concrete,
+        )
+
+    neutral_dir = tmp_path / "reviewer-a"
+    neutral_dir.mkdir()
+    packet_fixture = CapabilityFixture(
+        probe_ids=("network-denied",),
+        dynamic_roles=("neutral_role_dir",),
+        template={
+            "rules": [
+                {
+                    "role": "neutral_role_dir",
+                    "path": {"dynamic_path": "neutral_role_dir"},
+                }
+            ]
+        },
+    )
+    packet_attestation = attestation.model_copy(
+        update={"profile_template_sha256": packet_fixture.template_sha256}
+    )
+    packet_attestation_bytes = canonical_json_bytes(packet_attestation)
+    packet_preflight = preflight.model_copy(
+        update={
+            "role": "reviewer",
+            "target_id": "reviewer-a",
+            "capability_attestation_sha256": hashlib.sha256(
+                packet_attestation_bytes
+            ).hexdigest(),
+        }
+    )
+    packet_binding = build_capability_binding(
+        binding_id="reviewer-a-review",
+        role="reviewer",
+        target_id="reviewer-a",
+        access_mode="packet-only",
+        target_preflight_bytes=canonical_json_bytes(packet_preflight),
+        attestation_bytes=packet_attestation_bytes,
+        attestation=packet_attestation,
+        fixture=packet_fixture,
+        dynamic_paths={"neutral_role_dir": neutral_dir},
+        supplied_concrete_profile={
+            "rules": [
+                {
+                    "role": "neutral_role_dir",
+                    "path": str(neutral_dir.resolve()),
+                }
+            ]
+        },
+    )
+    assert [
+        identity.role for identity in packet_binding.dynamic_filesystem_identities
+    ] == ["neutral_role_dir"]
+    scratch_identity = next(
+        identity
+        for identity in binding.dynamic_filesystem_identities
+        if identity.role == "turn_scratch_root"
+    )
+    with pytest.raises(ValidationError, match="scratch or isolated-worktree"):
+        CapabilityBindingArtifact.model_validate(
+            packet_binding.model_copy(
+                update={
+                    "dynamic_filesystem_identities": [
+                        *packet_binding.dynamic_filesystem_identities,
+                        scratch_identity,
+                    ]
+                }
+            ).model_dump()
+        )
+
     barrier = BindingBarrier(["driver", "reviewer"])
     barrier.add("driver", binding)
     with pytest.raises(CapabilityEvidenceError, match="closed"):
         barrier.authorize_launch()
-    barrier.add("reviewer", binding.model_copy(update={"binding_id": "reviewer"}))
+    barrier.add("reviewer", packet_binding)
     assert len(barrier.authorize_launch()) == 2
+
+    scratch_control.rmdir()
+    scratch_tmp.rmdir()
+    scratch_root.rmdir()
+    scratch_control.mkdir(parents=True)
+    scratch_tmp.mkdir()
+    with pytest.raises(CapabilityEvidenceError, match="identity changed"):
+        validate_binding_identities(
+            binding,
+            dynamic_paths=driver_paths,
+            platform_backend=attestation.platform_backend,
+        )
 
     names = {
         name.replace("test_core_", "CORE-")[:8].upper()
