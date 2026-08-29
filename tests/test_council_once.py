@@ -381,7 +381,7 @@ async def test_council_001_complete_three_participant_artifact_and_persistent_li
             nonlocal replaced
             evidence = await original_prepare(session_id, request)
             if not replaced:
-                neutral.rmdir()
+                neutral.rename(neutral.with_name(f"{neutral.name}-displaced"))
                 neutral.mkdir(mode=0o700)
                 replaced = True
             return evidence

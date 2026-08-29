@@ -1891,9 +1891,8 @@ def test_core_030_capability_evidence_and_binding_barriers_are_fail_closed(
     barrier.add("reviewer", packet_binding)
     assert len(barrier.authorize_launch()) == 2
 
-    scratch_control.rmdir()
-    scratch_tmp.rmdir()
-    scratch_root.rmdir()
+    displaced_scratch = tmp_path / ".dialectic-turn-displaced"
+    scratch_root.rename(displaced_scratch)
     scratch_control.mkdir(parents=True)
     scratch_tmp.mkdir()
     with pytest.raises(CapabilityEvidenceError, match="identity changed"):

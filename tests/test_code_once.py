@@ -1466,8 +1466,13 @@ async def test_code_044_reserved_workspace_attacks_fail_closed_before_git(
         elif variant == "fifo":
             os.mkfifo(temporary / "hostile.fifo")
         elif variant == "socket":
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as unix_socket:
-                unix_socket.bind(str(temporary / "hostile.socket"))
+            prior_cwd = Path.cwd()
+            try:
+                os.chdir(temporary)
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as unix_socket:
+                    unix_socket.bind("hostile.socket")
+            finally:
+                os.chdir(prior_cwd)
         elif variant == "posix-rename-race":
             race = temporary / "race"
             race.mkdir()
