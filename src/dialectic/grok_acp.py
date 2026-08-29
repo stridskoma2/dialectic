@@ -9,7 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, NoReturn
 
 from .capabilities import instantiate_capability_template
 from .acp_transport import (
@@ -270,8 +270,10 @@ class GrokAdapter(NativeAdapterBase):
             response_completed = datetime.now(UTC)
             response = self._normalize(logical, request)
         except BaseException as exc:
-            await self._close_failed_prompt(session_id, state, request, started, exc)
-            raise
+            epoch = await self._close_failed_prompt(
+                session_id, state, request, started, exc
+            )
+            _raise_grok_turn_failure(exc, epoch, "Grok retained prompt failed")
         state.pending = _PendingPersistentTurn(
             request=request,
             started_at=started,
@@ -317,21 +319,9 @@ class GrokAdapter(NativeAdapterBase):
                 timeout=isinstance(exc, AcpTurnTimeout),
                 cancelled=isinstance(exc, asyncio.CancelledError),
             )
-            if not final.cleanup_confirmed:
-                raise NativeTurnError(
-                    "PROCESS_CLEANUP_FAILED",
-                    "Grok retained session boundary cleanup failed",
-                ) from exc
-            if final.stdout.result.truncated or final.stderr.result.truncated:
-                raise NativeTurnError(
-                    "AGENT_OUTPUT_TOO_LARGE",
-                    "Grok retained capture epoch exceeded its output bound",
-                ) from exc
-            if isinstance(exc, asyncio.CancelledError):
-                raise
-            raise NativeEnvelopeError(
-                "Grok retained session failed before the next prompt"
-            ) from exc
+            _raise_grok_turn_failure(
+                exc, final, "Grok retained session failed before the next prompt"
+            )
         evidence = _retained_evidence(state.lease, state.pending, epoch)
         state.pending = None
         state.resume_prepared = True
@@ -362,9 +352,14 @@ class GrokAdapter(NativeAdapterBase):
             self._last_invocation = _aborted_retained_evidence(
                 state.lease, state.prepared_request, epoch, reason=reason
             )
-        elif not epoch.cleanup_confirmed:
+        if not epoch.cleanup_confirmed:
             raise NativeTurnError(
                 "PROCESS_CLEANUP_FAILED", "Grok retained session cleanup failed"
+            )
+        if epoch.stdout.result.truncated or epoch.stderr.result.truncated:
+            raise NativeTurnError(
+                "AGENT_OUTPUT_TOO_LARGE",
+                "Grok retained final capture exceeded its output bound",
             )
 
     async def _start_persistent(self, request: AgentRequest) -> AgentResponse:
@@ -377,6 +372,7 @@ class GrokAdapter(NativeAdapterBase):
             response_completed = datetime.now(UTC)
             response = self._normalize(logical, request)
         except BaseException as exc:
+            epoch: AcpEpochCapture | None = None
             if lease is None:
                 self._record_acp_launch_failure(started, exc)
             else:
@@ -388,14 +384,19 @@ class GrokAdapter(NativeAdapterBase):
                     type(exc).__name__,
                     turn_phase=request.turn_phase,
                     timeout=isinstance(exc, AcpTurnTimeout),
+                    cancelled=isinstance(exc, asyncio.CancelledError),
                 )
-            raise
+            _raise_grok_turn_failure(exc, epoch, "Grok persistent start failed")
         if lease.session_id in self._persistent or lease.session_id in self._closed_sessions:
             epoch = await lease.close(self.graceful_kill_seconds)
             self._last_invocation = _failed_open_evidence(
                 lease, started, epoch, "ACP session id was reused"
             )
-            raise NativeEnvelopeError("Grok ACP returned a reused session id")
+            _raise_grok_turn_failure(
+                NativeEnvelopeError("Grok ACP returned a reused session id"),
+                epoch,
+                "Grok ACP returned a reused session id",
+            )
         self._persistent[lease.session_id] = _PersistentState(
             lease=lease,
             pending=_PendingPersistentTurn(
@@ -412,6 +413,7 @@ class GrokAdapter(NativeAdapterBase):
         started = datetime.now(UTC)
         unit_id = _new_process_unit_id()
         lease: AcpLease | None = None
+        epoch: AcpEpochCapture | None = None
         try:
             lease = await self._open_lease(request, unit_id)
             logical = await lease.prompt(request.prompt, request.timeout_seconds)
@@ -432,6 +434,11 @@ class GrokAdapter(NativeAdapterBase):
                 raise NativeTurnError(
                     "PROCESS_CLEANUP_FAILED", "Grok per-turn ACP cleanup failed"
                 )
+            if epoch.stdout.result.truncated or epoch.stderr.result.truncated:
+                raise NativeTurnError(
+                    "AGENT_OUTPUT_TOO_LARGE",
+                    "Grok per-turn final capture exceeded its output bound",
+                )
             return response
         except BaseException as exc:
             if lease is None:
@@ -441,7 +448,7 @@ class GrokAdapter(NativeAdapterBase):
                 self._last_invocation = _failed_open_evidence(
                     lease, started, epoch, type(exc).__name__
                 )
-            raise
+            _raise_grok_turn_failure(exc, epoch, "Grok per-turn prompt failed")
 
     async def _open_lease(self, request: AgentRequest, unit_id: str) -> AcpLease:
         bound = self._bound_profile(request)
@@ -509,7 +516,7 @@ class GrokAdapter(NativeAdapterBase):
         request: AgentRequest,
         started: datetime,
         error: BaseException,
-    ) -> None:
+    ) -> AcpEpochCapture:
         self._persistent.pop(session_id, None)
         self._closed_sessions.add(session_id)
         epoch = await state.lease.close(self.graceful_kill_seconds)
@@ -520,7 +527,9 @@ class GrokAdapter(NativeAdapterBase):
             type(error).__name__,
             turn_phase=request.turn_phase,
             timeout=isinstance(error, AcpTurnTimeout),
+            cancelled=isinstance(error, asyncio.CancelledError),
         )
+        return epoch
 
     def _record_acp_launch_failure(self, started: datetime, error: BaseException) -> None:
         self._record_launch_failure(started, error)
@@ -561,6 +570,32 @@ def _required_inventory(
     return inventory
 
 
+def _raise_grok_turn_failure(
+    error: BaseException,
+    epoch: AcpEpochCapture | None,
+    diagnostic: str,
+) -> NoReturn:
+    if epoch is not None and not epoch.cleanup_confirmed:
+        raise NativeTurnError(
+            "PROCESS_CLEANUP_FAILED", f"{diagnostic}; cleanup could not be proved"
+        ) from error
+    if epoch is not None and (
+        epoch.stdout.result.truncated or epoch.stderr.result.truncated
+    ):
+        raise NativeTurnError(
+            "AGENT_OUTPUT_TOO_LARGE", f"{diagnostic}; output limit exceeded"
+        ) from error
+    if isinstance(error, asyncio.CancelledError):
+        raise error
+    if isinstance(error, AcpTurnTimeout):
+        raise NativeTurnError(None, f"{diagnostic}; response deadline reached") from error
+    if isinstance(error, NativeEnvelopeError):
+        raise error
+    if isinstance(error, AcpError):
+        raise NativeEnvelopeError(diagnostic) from error
+    raise error
+
+
 def _retained_evidence(
     lease: AcpLease,
     pending: _PendingPersistentTurn,
@@ -590,6 +625,7 @@ def _closed_evidence(
     reason: SessionCloseReason,
 ) -> NativeInvocationEvidence:
     cleanup_failed = not epoch.cleanup_confirmed
+    output_limit = epoch.stdout.result.truncated or epoch.stderr.result.truncated
     return NativeInvocationEvidence(
         started_at=pending.started_at,
         response_completed_at=pending.response_completed_at,
@@ -600,13 +636,29 @@ def _closed_evidence(
         else "per-turn",
         process_unit_id=lease.process_unit_id,
         process_exit_code=epoch.process_exit_code,
-        attempt_end_reason="cleanup-failed" if cleanup_failed else "response-returned",
-        failure_kind="PROCESS_CLEANUP_FAILED" if cleanup_failed else None,
+        attempt_end_reason=(
+            "cleanup-failed"
+            if cleanup_failed
+            else "output-limit"
+            if output_limit
+            else "response-returned"
+        ),
+        failure_kind=(
+            "PROCESS_CLEANUP_FAILED"
+            if cleanup_failed
+            else "AGENT_OUTPUT_TOO_LARGE"
+            if output_limit
+            else None
+        ),
         process_disposition="cleanup-failed" if cleanup_failed else "closed",
         stdout=epoch.stdout,
         stderr=epoch.stderr,
         bounded_diagnostic=(
-            "ACP process-unit cleanup failed" if cleanup_failed else None
+            "ACP process-unit cleanup failed"
+            if cleanup_failed
+            else "ACP final capture exceeded its output bound"
+            if output_limit
+            else None
         ),
     )
 

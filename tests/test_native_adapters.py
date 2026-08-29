@@ -150,7 +150,7 @@ class FakeAcpLease:
         *,
         session_id: str,
         process_unit_id: str,
-        responses: list[str],
+        responses: list[str | BaseException],
         credentials: KnownCredentials,
     ) -> None:
         self.session_id = session_id
@@ -166,9 +166,12 @@ class FakeAcpLease:
 
     async def prompt(self, text: str, timeout_seconds: float) -> AcpLogicalResponse:
         self.prompts.append(text)
+        response = self.responses.popleft()
+        if isinstance(response, BaseException):
+            raise response
         return AcpLogicalResponse(
             session_id=self.session_id,
-            text=self.responses.popleft(),
+            text=response,
             actual_model="grok-model",
             usage={"turn": len(self.prompts)},
         )
@@ -201,8 +204,13 @@ class FakeAcpLease:
 
 
 class FakeAcpFactory:
-    def __init__(self, responses: list[list[str]]) -> None:
+    def __init__(
+        self,
+        responses: list[list[str | BaseException]],
+        settings: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.responses = deque(responses)
+        self.settings = deque(settings or [{} for _ in responses])
         self.leases: list[FakeAcpLease] = []
 
     async def open(self, plan, **kwargs):  # type: ignore[no-untyped-def]
@@ -212,6 +220,8 @@ class FakeAcpFactory:
             responses=self.responses.popleft(),
             credentials=kwargs["credentials"],
         )
+        for name, value in self.settings.popleft().items():
+            setattr(lease, name, value)
         self.leases.append(lease)
         return lease
 
@@ -536,6 +546,11 @@ async def test_grok_persistent_participant_has_three_epochs_one_unit_and_once_cl
         ['{"phase":"opening"}'],
         ['{"phase":"opening"}'],
         ["```json\n{not-json}\n```"],
+        [AcpProtocolError("out-of-sequence traffic")],
+        [AcpProtocolError("stream overflow")],
+        ['{"phase":"opening"}', '{"phase":"cross"}', '{"phase":"ballot"}'],
+    ], settings=[
+        {}, {}, {}, {}, {}, {}, {}, {}, {"close_data": b"x" * 2048}, {},
     ])
     credentials = KnownCredentials([KnownCredential("XAI_API_KEY", "secretvalue")])
     target = AgentTarget(runtime="grok-build", model="grok-model", effort=None)
@@ -677,6 +692,40 @@ async def test_grok_persistent_participant_has_three_epochs_one_unit_and_once_cl
     assert malformed_evidence.attempt_end_reason == "agent-failed"
     assert factory.leases[6].close_count == 1
 
+    with pytest.raises(NativeEnvelopeError, match="persistent start failed"):
+        await adapter.start(opening_request)
+    protocol_evidence = adapter.take_invocation_evidence()
+    assert protocol_evidence is not None
+    assert protocol_evidence.attempt_end_reason == "agent-failed"
+    assert factory.leases[7].close_count == 1
+
+    with pytest.raises(NativeTurnError) as prompt_overflow:
+        await adapter.start(opening_request)
+    assert prompt_overflow.value.kind == "AGENT_OUTPUT_TOO_LARGE"
+    prompt_overflow_evidence = adapter.take_invocation_evidence()
+    assert prompt_overflow_evidence is not None
+    assert prompt_overflow_evidence.attempt_end_reason == "output-limit"
+    assert factory.leases[8].close_count == 1
+
+    final_overflow = await adapter.start(opening_request)
+    await adapter.prepare_resume(final_overflow.session_id or "", cross_request)
+    assert adapter.take_invocation_evidence() is not None
+    await adapter.resume(final_overflow.session_id or "", cross_request)
+    await adapter.prepare_resume(final_overflow.session_id or "", ballot_request)
+    assert adapter.take_invocation_evidence() is not None
+    await adapter.resume(final_overflow.session_id or "", ballot_request)
+    factory.leases[9].close_data = b"x" * 2048
+    with pytest.raises(NativeTurnError) as final_capture:
+        await adapter.close_retained_session(
+            final_overflow.session_id or "", "completed"
+        )
+    assert final_capture.value.kind == "AGENT_OUTPUT_TOO_LARGE"
+    final_capture_evidence = adapter.take_invocation_evidence()
+    assert final_capture_evidence is not None
+    assert final_capture_evidence.attempt_end_reason == "output-limit"
+    assert final_capture_evidence.process_disposition == "closed"
+    assert factory.leases[9].close_count == 1
+
 
 @pytest.mark.asyncio
 async def test_grok_reviewer_uses_one_ephemeral_acp_unit(tmp_path: Path) -> None:
@@ -690,7 +739,18 @@ async def test_grok_reviewer_uses_one_ephemeral_acp_unit(tmp_path: Path) -> None
         (b"agent stdio inspect --no-auto-update --no-memory --disable-web-search --no-plan --no-subagents --safe-mode --tools\n", b"", 0),
         (b'{"configSources":[],"mcpServers":[],"tools":[]}\n', b"", 0),
     ])
-    factory = FakeAcpFactory([[], ['{"answer":"ok"}']])
+    factory = FakeAcpFactory(
+        [
+            [],
+            ['{"answer":"ok"}'],
+            [AcpProtocolError("out-of-sequence traffic")],
+            [AcpProtocolError("stream overflow")],
+            ['{"answer":"ok"}'],
+        ],
+        settings=[
+            {}, {}, {}, {"close_data": b"x" * 2048}, {"close_data": b"x" * 2048}
+        ],
+    )
     target = AgentTarget(runtime="grok-build", model="grok-model", effort=None)
     adapter = GrokAdapter(
         target,
@@ -737,6 +797,22 @@ async def test_grok_reviewer_uses_one_ephemeral_acp_unit(tmp_path: Path) -> None
     assert factory.leases[1].close_count == 1
     with pytest.raises(RuntimeError, match="do not support native resume"):
         await adapter.resume("grok-session-2", _request(neutral, phase="review"))
+    with pytest.raises(NativeEnvelopeError, match="per-turn prompt failed"):
+        await adapter.start(_request(neutral, phase="review", schema=schema))
+    assert adapter.take_invocation_evidence() is not None
+    assert factory.leases[2].close_count == 1
+    with pytest.raises(NativeTurnError) as overflow:
+        await adapter.start(_request(neutral, phase="review", schema=schema))
+    assert overflow.value.kind == "AGENT_OUTPUT_TOO_LARGE"
+    assert adapter.take_invocation_evidence() is not None
+    assert factory.leases[3].close_count == 1
+    with pytest.raises(NativeTurnError) as final_overflow:
+        await adapter.start(_request(neutral, phase="review", schema=schema))
+    assert final_overflow.value.kind == "AGENT_OUTPUT_TOO_LARGE"
+    final_overflow_evidence = adapter.take_invocation_evidence()
+    assert final_overflow_evidence is not None
+    assert final_overflow_evidence.attempt_end_reason == "output-limit"
+    assert factory.leases[4].close_count == 1
 
 
 @pytest.mark.parametrize(
