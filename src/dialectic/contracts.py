@@ -41,6 +41,9 @@ RunPhase: TypeAlias = CodePhase | CouncilPhase
 TurnPhase: TypeAlias = Literal[
     "initial", "repair", "review", "opening", "cross-examination", "candidate", "ballot"
 ]
+SessionCloseReason: TypeAlias = Literal[
+    "completed", "phase-failure", "workflow-timeout", "cancelled"
+]
 CodeOutcome: TypeAlias = Literal[
     "COMPLETED_NO_FINDINGS",
     "COMPLETED_AFTER_REPAIR",

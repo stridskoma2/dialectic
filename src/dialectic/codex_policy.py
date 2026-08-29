@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -71,29 +72,38 @@ def build_codex_driver_construction(
         "exclude": sorted(fixture.credential_environment_names, key=_environment_sort_key),
         "set": {"GIT_OPTIONAL_LOCKS": "0"},
     }
+    filesystem_template = {
+        ":root": "deny",
+        ":minimal": "read",
+        ":tmpdir": "deny",
+        ":slash_tmp": "deny",
+        "<isolated_worktree>": "write",
+        "<isolated_worktree:.git>": "read",
+        "<isolated_worktree:.codex>": "read",
+        "<git_common_dir>": "read",
+        "<original_worktree>": "deny",
+        "<state_root>": "deny",
+        "<turn_scratch_root>": "read",
+        "<turn_scratch_control>": "read",
+        "<turn_scratch_tmp>": "write",
+        **{str(path.resolve(strict=False)): "deny" for path in fixture.saved_auth_paths},
+        str(Path(tempfile.gettempdir()).resolve(strict=False)): "deny",
+    }
     template = {
-        "profile": "dialectic-driver",
         "approval_policy": "never",
-        "network": "deny",
-        "project_codex_config": "ignore-untrusted",
-        "agents_md_discovery": "preserve",
-        "subagents": "deny",
-        "web_search": "deny",
-        "mcp": "deny",
-        "filesystem": [
-            {"role": "isolated_worktree", "access": "read-write"},
-            {"role": "git_common_dir", "access": "read-only-minimum"},
-            {"role": "original_worktree", "access": "deny"},
-            {"role": "state_root", "access": "deny"},
-            {"role": "turn_scratch_root", "access": "protected"},
-            {"role": "turn_scratch_control", "access": "read-only"},
-            {"role": "turn_scratch_tmp", "access": "read-write-bounded"},
-        ],
-        "saved_auth_path_hashes": sorted(
-            hashlib.sha256(str(path.resolve(strict=False)).encode("utf-8")).hexdigest()
-            for path in fixture.saved_auth_paths
-        ),
-        "child_environment_policy": child_policy,
+        "apps": {"_default": {"enabled": False}},
+        "default_permissions": "dialectic-driver",
+        "features": {"multi_agent": False},
+        "mcp_servers": {},
+        "permissions": {
+            "dialectic-driver": {
+                "filesystem": filesystem_template,
+                "network": {"enabled": False},
+            }
+        },
+        "projects": {"<isolated_worktree>": {"trust_level": "untrusted"}},
+        "shell_environment_policy": child_policy,
+        "web_search": "disabled",
     }
     paths = {
         "isolated_worktree": worktree.resolve(strict=True),
@@ -104,22 +114,45 @@ def build_codex_driver_construction(
         "turn_scratch_control": scratch_control.resolve(strict=True),
         "turn_scratch_tmp": scratch_tmp.resolve(strict=True),
     }
+    filesystem = {
+        ":root": "deny",
+        ":minimal": "read",
+        ":tmpdir": "deny",
+        ":slash_tmp": "deny",
+        str(paths["isolated_worktree"]): "write",
+        str(paths["isolated_worktree"] / ".git"): "read",
+        str(paths["isolated_worktree"] / ".codex"): "read",
+        str(paths["git_common_dir"]): "read",
+        str(paths["original_worktree"]): "deny",
+        str(paths["state_root"]): "deny",
+        str(paths["turn_scratch_root"]): "read",
+        str(paths["turn_scratch_control"]): "read",
+        str(paths["turn_scratch_tmp"]): "write",
+        **{str(path.resolve(strict=False)): "deny" for path in fixture.saved_auth_paths},
+        str(Path(tempfile.gettempdir()).resolve(strict=False)): "deny",
+    }
     concrete = {
         **template,
-        "filesystem": [
-            {**rule, "path": str(paths[rule["role"]])}
-            for rule in template["filesystem"]  # type: ignore[index]
-        ],
+        "permissions": {
+            "dialectic-driver": {
+                "filesystem": filesystem,
+                "network": {"enabled": False},
+            }
+        },
+        "projects": {
+            str(paths["isolated_worktree"]): {"trust_level": "untrusted"}
+        },
     }
     canonical_overrides = tuple(
         item
         for key, value in sorted(concrete.items())
-        for item in ("-c", f"{key}={json.dumps(value, sort_keys=True, separators=(',', ':'))}")
+        for item in ("-c", f"{key}={_toml_literal(value)}")
     )
     arguments = (
         "exec",
         "--ignore-user-config",
         "--ignore-rules",
+        "--strict-config",
         *canonical_overrides,
         "-",
     )
@@ -140,9 +173,30 @@ def build_codex_driver_construction(
 def _reject_displacing_policy(policy: Mapping[str, object]) -> None:
     forbidden = {"sandbox_mode", "sandbox_workspace_write", "danger-full-access"}
     displaced = forbidden.intersection(policy)
-    if displaced or policy.get("profile") not in {None, "dialectic-driver"}:
+    default = policy.get("default_permissions")
+    allowed = policy.get("allowed_permission_profiles")
+    profile_denied = isinstance(allowed, Mapping) and allowed.get("dialectic-driver") is False
+    if displaced or default not in {None, "dialectic-driver"} or profile_denied:
         raise CodexPolicyError("managed policy displaces the dialectic-driver profile")
 
 
 def _environment_sort_key(name: str) -> str:
     return name.casefold() if os.name == "nt" else name
+
+
+def _toml_literal(value: object) -> str:
+    if type(value) is bool:
+        return "true" if value else "false"
+    if type(value) in {int, float}:
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return "[" + ",".join(_toml_literal(item) for item in value) + "]"
+    if isinstance(value, Mapping):
+        entries = (
+            f"{json.dumps(str(key), ensure_ascii=False)}={_toml_literal(child)}"
+            for key, child in sorted(value.items(), key=lambda item: str(item[0]))
+        )
+        return "{" + ",".join(entries) + "}"
+    raise CodexPolicyError("Codex override contains an unsupported value")

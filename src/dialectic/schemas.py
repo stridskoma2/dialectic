@@ -30,6 +30,7 @@ from .contracts import (
 MODEL_SELECTOR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]{0,127}$")
 TARGET_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+PROCESS_UNIT_ID_RE = re.compile(r"^[a-z2-7]{16}$")
 
 
 class ClosedModel(BaseModel):
@@ -569,12 +570,24 @@ class TargetPreflightArtifact(ControllerArtifact):
     launch_kind: Literal["direct", "windows-batch-shim"]
     cli_version: str
     prompt_transport: Literal["stdin", "acp-stdio"]
+    process_lifecycle: Literal["per-turn", "persistent-acp-session"]
     effective_static_flags: list[str]
     credential_env_names: list[str]
     denied_credential_path_sha256s: list[str]
     adapter_fixture_version: str
     capability_attestation_sha256: str
     authentication_verified: Literal[True]
+
+    @model_validator(mode="after")
+    def persistent_lifecycle_is_narrow(self) -> Self:
+        if self.process_lifecycle == "persistent-acp-session" and (
+            self.role != "participant"
+            or self.prompt_transport != "acp-stdio"
+        ):
+            raise ValueError(
+                "persistent lifecycle requires a participant ACP transport"
+            )
+        return self
 
 
 class CapabilityProbeResult(ClosedModel):
@@ -707,6 +720,7 @@ class StreamCaptureResult(ClosedModel):
     accepted_pre_redaction_bytes: int = Field(ge=0)
     accepted_pre_redaction_sha256: str
     discarded_guard_bytes: int = Field(ge=0)
+    discarded_guard_reason: Literal["none", "overflow", "epoch-boundary"]
     truncated: bool
     persisted_bytes: int = Field(ge=0)
     persisted_sha256: str
@@ -722,6 +736,22 @@ class StreamCaptureResult(ClosedModel):
             raise ValueError("discarded guard exceeds accepted bytes")
         if self.triggered_termination and not self.truncated:
             raise ValueError("stream-triggered termination requires truncation")
+        if (self.discarded_guard_reason == "none") != (
+            self.discarded_guard_bytes == 0
+        ):
+            raise ValueError("guard reason none is equivalent to zero discarded bytes")
+        if self.discarded_guard_reason == "overflow" and not (
+            self.discarded_guard_bytes > 0
+            and self.truncated
+            and self.triggered_termination
+        ):
+            raise ValueError("overflow guard requires terminating truncation")
+        if self.discarded_guard_reason == "epoch-boundary" and (
+            self.discarded_guard_bytes == 0
+            or self.truncated
+            or self.triggered_termination
+        ):
+            raise ValueError("epoch-boundary guard requires a bounded non-final stream")
         return self
 
 
@@ -752,12 +782,18 @@ class TurnAttemptArtifact(ControllerArtifact):
     target_preflight_artifact_sha256: str
     capability_binding_artifact_sha256: str
     started_at: datetime
-    completed_at: datetime
-    process_started: bool
-    exit_code: int | None
-    termination_reason: Literal[
-        "completed",
+    response_completed_at: datetime | None
+    capture_completed_at: datetime
+    process_origin: Literal[
+        "none", "spawned-for-attempt", "retained-from-prior-turn"
+    ]
+    process_lifecycle: Literal["per-turn", "persistent-acp-session"]
+    process_unit_id: str | None
+    process_exit_code: int | None
+    attempt_end_reason: Literal[
+        "response-returned",
         "launch-failed",
+        "agent-failed",
         "timeout",
         "cancelled",
         "output-limit",
@@ -765,7 +801,9 @@ class TurnAttemptArtifact(ControllerArtifact):
         "cleanup-failed",
     ]
     failure_kind: FailureKind | None
-    cleanup_confirmed: bool
+    process_disposition: Literal[
+        "not-started", "retained-for-session", "closed", "cleanup-failed"
+    ]
     stdout: StreamCaptureResult
     stderr: StreamCaptureResult
     response: AgentResponse | None
@@ -773,11 +811,23 @@ class TurnAttemptArtifact(ControllerArtifact):
 
     @model_validator(mode="after")
     def process_evidence_is_consistent(self) -> Self:
-        if not self.process_started:
-            if self.exit_code is not None or self.response is not None:
-                raise ValueError("an unstarted process cannot have exit code or response")
-            if self.termination_reason not in {"launch-failed", "peer-failure"}:
-                raise ValueError("unstarted process requires launch-failed or peer-failure")
+        if self.capture_completed_at < self.started_at:
+            raise ValueError("capture_completed_at cannot precede started_at")
+        if self.response_completed_at is not None and not (
+            self.started_at <= self.response_completed_at <= self.capture_completed_at
+        ):
+            raise ValueError("response_completed_at must fall within the attempt")
+        if self.process_origin == "none":
+            if (
+                self.process_unit_id is not None
+                or self.process_exit_code is not None
+                or self.response is not None
+                or self.response_completed_at is not None
+                or self.process_disposition != "not-started"
+                or self.attempt_end_reason
+                not in {"launch-failed", "peer-failure", "cancelled"}
+            ):
+                raise ValueError("an unstarted attempt has inconsistent process evidence")
             empty_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
             for stream in (self.stdout, self.stderr):
                 if (
@@ -787,21 +837,75 @@ class TurnAttemptArtifact(ControllerArtifact):
                     or stream.persisted_sha256 != empty_sha
                 ):
                     raise ValueError("an unstarted process requires exact zero-byte stream evidence")
-        if self.completed_at < self.started_at:
-            raise ValueError("completed_at cannot precede started_at")
-        if not self.cleanup_confirmed and self.failure_kind != "PROCESS_CLEANUP_FAILED":
-            raise ValueError("unconfirmed cleanup requires PROCESS_CLEANUP_FAILED")
-        if self.termination_reason == "cleanup-failed" and (
-            self.cleanup_confirmed or self.failure_kind != "PROCESS_CLEANUP_FAILED"
+        else:
+            if self.process_unit_id is None or not PROCESS_UNIT_ID_RE.fullmatch(
+                self.process_unit_id
+            ):
+                raise ValueError("owned process attempts require an opaque process-unit id")
+            if self.process_disposition == "not-started":
+                raise ValueError("an owned process cannot be not-started")
+        if self.process_disposition == "not-started" and self.process_origin != "none":
+            raise ValueError("not-started disposition requires origin none")
+        if self.process_disposition == "retained-for-session":
+            if not (
+                self.process_lifecycle == "persistent-acp-session"
+                and self.process_exit_code is None
+                and self.response is not None
+                and self.response_completed_at is not None
+                and self.attempt_end_reason == "response-returned"
+                and self.failure_kind is None
+                and self.turn_phase in {"opening", "cross-examination"}
+            ):
+                raise ValueError("retained disposition violates the persistent ACP contract")
+        if self.process_disposition == "closed" and self.process_exit_code is None:
+            raise ValueError("closed process disposition requires an observed exit code")
+        if self.process_disposition == "cleanup-failed" and not (
+            self.failure_kind == "PROCESS_CLEANUP_FAILED"
+            and self.attempt_end_reason == "cleanup-failed"
         ):
-            raise ValueError("cleanup-failed must carry authoritative cleanup failure")
-        if self.response is not None and (
-            not self.process_started
-            or self.termination_reason != "completed"
-            or self.exit_code != 0
-            or self.failure_kind is not None
+            raise ValueError("cleanup-failed disposition requires authoritative cleanup failure")
+        if self.process_lifecycle == "per-turn" and self.process_origin != "none":
+            if self.process_origin != "spawned-for-attempt" or self.process_disposition not in {
+                "closed",
+                "cleanup-failed",
+            }:
+                raise ValueError("per-turn process attempts must spawn and finalize one unit")
+        if self.process_lifecycle == "persistent-acp-session":
+            expected_origin = (
+                "spawned-for-attempt"
+                if self.turn_phase == "opening"
+                else "retained-from-prior-turn"
+            )
+            if self.process_origin != "none" and self.process_origin != expected_origin:
+                raise ValueError("persistent ACP origin mismatches its logical turn")
+            if self.turn_phase == "ballot" and self.process_disposition == "retained-for-session":
+                raise ValueError("ballot attempts cannot retain a persistent lease")
+        if self.response is None and self.response_completed_at is not None:
+            raise ValueError("response_completed_at requires a normalized response")
+        if self.response is not None and self.response_completed_at is None:
+            raise ValueError("a normalized response requires response_completed_at")
+        if self.attempt_end_reason == "response-returned" and (
+            self.response is None or self.failure_kind is not None
         ):
-            raise ValueError("a normalized response requires a successful completed process")
+            raise ValueError("response-returned requires a successful normalized response")
+        if (
+            self.response is not None
+            and self.attempt_end_reason == "response-returned"
+            and self.process_disposition == "closed"
+            and self.process_lifecycle == "per-turn"
+            and self.process_exit_code != 0
+        ):
+            raise ValueError("successful per-turn response requires zero process exit")
+        for stream in (self.stdout, self.stderr):
+            if stream.discarded_guard_reason == "epoch-boundary" and not (
+                self.process_lifecycle == "persistent-acp-session"
+                and self.process_disposition == "retained-for-session"
+            ):
+                raise ValueError("epoch-boundary guard requires a retained ACP attempt")
+            if stream.discarded_guard_reason == "overflow" and (
+                self.attempt_end_reason != "output-limit"
+            ):
+                raise ValueError("overflow guard requires output-limit attempt end")
         return self
 
 

@@ -16,6 +16,7 @@ from .schemas import (
     DialecticConfig,
     PreflightResult,
 )
+from .contracts import SessionCloseReason
 
 
 class AgentAdapter(Protocol):
@@ -25,9 +26,23 @@ class AgentAdapter(Protocol):
 
     async def resume(self, session_id: str, request: AgentRequest) -> AgentResponse: ...
 
+    async def close_retained_session(
+        self, session_id: str, reason: SessionCloseReason
+    ) -> None: ...
+
 
 class ModelMismatchError(RuntimeError):
     pass
+
+
+class AgentProcessError(RuntimeError):
+    """A native process started and returned a nonzero exit code."""
+
+    def __init__(self, exit_code: int, detail: str) -> None:
+        if exit_code == 0:
+            raise ValueError("AgentProcessError requires a nonzero exit code")
+        self.exit_code = exit_code
+        super().__init__(detail)
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +95,11 @@ class ScriptedAgentAdapter:
 
     async def resume(self, session_id: str, request: AgentRequest) -> AgentResponse:
         return await self._invoke("resume", session_id, request)
+
+    async def close_retained_session(
+        self, session_id: str, reason: SessionCloseReason
+    ) -> None:
+        raise RuntimeError("scripted per-turn adapter has no retained session lease")
 
     async def _invoke(
         self, operation: str, session_id: str | None, request: AgentRequest

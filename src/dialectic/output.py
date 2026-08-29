@@ -55,18 +55,24 @@ def extract_model_payload(
     max_items: int,
     context: dict[str, Any] | None = None,
 ) -> T:
-    try:
-        payload = strict_json_loads(assistant_text)
-    except OutputError as whole_error:
-        fences = list(_JSON_FENCE.finditer(assistant_text))
-        if len(fences) != 1 or len(re.findall(r"```json\b", assistant_text)) != 1:
-            raise OutputError("assistant output is neither whole JSON nor exactly one json fence") from whole_error
-        payload = strict_json_loads(fences[0].group("body"))
+    payload = extract_json_payload(assistant_text)
     try:
         validate_model_bounds(payload, max_chars=max_chars, max_items=max_items)
         return schema.model_validate(payload, context=context)
     except (ValidationError, ConfigError) as exc:
         raise OutputError(f"model payload failed {schema.__name__} validation") from exc
+
+
+def extract_json_payload(assistant_text: str) -> Any:
+    """Apply the complete-text-or-one-json-fence extraction rule."""
+
+    try:
+        return strict_json_loads(assistant_text)
+    except OutputError as whole_error:
+        fences = list(_JSON_FENCE.finditer(assistant_text))
+        if len(fences) != 1 or len(re.findall(r"```json\b", assistant_text)) != 1:
+            raise OutputError("assistant output is neither whole JSON nor exactly one json fence") from whole_error
+        return strict_json_loads(fences[0].group("body"))
 
 
 def _validate_json_nesting(text: str) -> None:

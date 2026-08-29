@@ -86,7 +86,9 @@ from dialectic.schemas import (
     CapabilityProbeResult,
     DialecticConfig,
     RunRecord,
+    StreamCaptureResult,
     TargetPreflightArtifact,
+    TurnAttemptArtifact,
 )
 from dialectic.scratch import (
     ScratchCleanupTimeout,
@@ -474,6 +476,128 @@ def test_core_015_controller_artifact_schemas_are_closed_and_versioned() -> None
             canonical_instantiation_verified=False,
         )
 
+    now = datetime.now(UTC)
+    empty_stream = StreamCaptureResult(
+        configured_limit_bytes=256,
+        accepted_pre_redaction_bytes=0,
+        accepted_pre_redaction_sha256=hashlib.sha256(b"").hexdigest(),
+        discarded_guard_bytes=0,
+        discarded_guard_reason="none",
+        truncated=False,
+        persisted_bytes=0,
+        persisted_sha256=hashlib.sha256(b"").hexdigest(),
+        triggered_termination=False,
+    )
+    response = make_response()
+    valid_attempt = {
+        **controller_fields(),
+        "role": "driver",
+        "target_id": "driver",
+        "turn_phase": "initial",
+        "operation": "start",
+        "request_artifact_sha256": "a" * 64,
+        "target_preflight_artifact_sha256": "b" * 64,
+        "capability_binding_artifact_sha256": "c" * 64,
+        "started_at": now,
+        "response_completed_at": now,
+        "capture_completed_at": now,
+        "process_origin": "spawned-for-attempt",
+        "process_lifecycle": "per-turn",
+        "process_unit_id": "abcdefghijklmnop",
+        "process_exit_code": 0,
+        "attempt_end_reason": "response-returned",
+        "failure_kind": None,
+        "process_disposition": "closed",
+        "stdout": empty_stream.model_dump(),
+        "stderr": empty_stream.model_dump(),
+        "response": response.model_dump(),
+        "bounded_diagnostic": None,
+    }
+    TurnAttemptArtifact.model_validate(valid_attempt)
+    invalid_attempts = [
+        {**valid_attempt, "process_origin": "none"},
+        {**valid_attempt, "process_unit_id": "not-a-unit"},
+        {
+            **valid_attempt,
+            "process_origin": "retained-from-prior-turn",
+            "process_disposition": "retained-for-session",
+            "process_exit_code": None,
+        },
+        {**valid_attempt, "response": None},
+        {**valid_attempt, "process_exit_code": None},
+        {
+            **valid_attempt,
+            "stdout": {
+                **empty_stream.model_dump(),
+                "discarded_guard_bytes": 1,
+                "discarded_guard_reason": "epoch-boundary",
+            },
+        },
+    ]
+    for invalid in invalid_attempts:
+        with pytest.raises(ValidationError):
+            TurnAttemptArtifact.model_validate(invalid)
+
+    persistent = {
+        **valid_attempt,
+        "role": "participant",
+        "target_id": "participant-a",
+        "turn_phase": "opening",
+        "process_lifecycle": "persistent-acp-session",
+        "process_exit_code": None,
+        "process_disposition": "retained-for-session",
+    }
+    TurnAttemptArtifact.model_validate(persistent)
+    with pytest.raises(ValidationError):
+        TurnAttemptArtifact.model_validate(
+            {
+                **persistent,
+                "turn_phase": "cross-examination",
+                "process_origin": "spawned-for-attempt",
+            }
+        )
+    with pytest.raises(ValidationError):
+        TurnAttemptArtifact.model_validate(
+            {**persistent, "turn_phase": "ballot"}
+        )
+
+    persistent_preflight = {
+        **controller_fields(),
+        "role": "participant",
+        "target_id": "participant-a",
+        "target": {"runtime": "grok-build", "model": "grok-model", "effort": None},
+        "resolved_executable": "grok.exe",
+        "resolved_executable_identity": "grok-id",
+        "resolved_executable_sha256": "d" * 64,
+        "spawned_root_executable": "grok.exe",
+        "spawned_root_identity": "grok-id",
+        "spawned_root_sha256": "d" * 64,
+        "launch_kind": "direct",
+        "cli_version": "0.1.220",
+        "prompt_transport": "acp-stdio",
+        "process_lifecycle": "persistent-acp-session",
+        "effective_static_flags": [],
+        "credential_env_names": [],
+        "denied_credential_path_sha256s": [],
+        "adapter_fixture_version": "grok-0.1.220-acp-v1",
+        "capability_attestation_sha256": "e" * 64,
+        "authentication_verified": True,
+    }
+    TargetPreflightArtifact.model_validate(persistent_preflight)
+    for mutation in (
+        {"role": "moderator"},
+        {"prompt_transport": "stdin"},
+    ):
+        with pytest.raises(ValidationError):
+            TargetPreflightArtifact.model_validate({**persistent_preflight, **mutation})
+    TargetPreflightArtifact.model_validate(
+        {
+            **persistent_preflight,
+            "target": {"runtime": "codex", "model": "future-acp", "effort": None},
+            "adapter_fixture_version": "future-process-local-acp-v1",
+        }
+    )
+
 
 def test_core_016_configuration_bounds_name_the_invalid_field(
     config_data: dict[str, object]
@@ -579,14 +703,69 @@ def test_core_018_strict_output_extraction_accepts_only_two_forms() -> None:
 
 @pytest.mark.asyncio
 async def test_core_019_unconfirmed_tree_cleanup_overrides_timeout() -> None:
-    unit = FakeProcessUnit(root_delay=1, cleanup_confirmed=False)
-    result = await ProcessSupervisor().supervise(
-        unit,
-        turn_timeout_seconds=0.01,
-        graceful_kill_seconds=0.01,
+    scenarios: list[tuple[FakeProcessUnit, asyncio.Event | None, asyncio.Event | None]] = [
+        (FakeProcessUnit(root_delay=0, cleanup_confirmed=False), None, None),
+        (FakeProcessUnit(root_delay=1, cleanup_confirmed=False), None, None),
+    ]
+    cancelled = asyncio.Event()
+    cancelled.set()
+    scenarios.append(
+        (FakeProcessUnit(root_delay=1, cleanup_confirmed=False), cancelled, None)
     )
-    assert result.termination_reason == "cleanup-failed"
-    assert result.failure_kind == "PROCESS_CLEANUP_FAILED"
+    failed_fast = asyncio.Event()
+    failed_fast.set()
+    scenarios.append(
+        (FakeProcessUnit(root_delay=1, cleanup_confirmed=False), None, failed_fast)
+    )
+    for unit, cancellation, overflow in scenarios:
+        result = await ProcessSupervisor().supervise(
+            unit,
+            turn_timeout_seconds=0.01,
+            graceful_kill_seconds=0.01,
+            cancellation=cancellation,
+            overflow=overflow,
+        )
+        assert result.termination_reason == "cleanup-failed"
+        assert result.failure_kind == "PROCESS_CLEANUP_FAILED"
+
+    now = datetime.now(UTC)
+    empty = StreamCaptureResult(
+        configured_limit_bytes=256,
+        accepted_pre_redaction_bytes=0,
+        accepted_pre_redaction_sha256=hashlib.sha256(b"").hexdigest(),
+        discarded_guard_bytes=0,
+        discarded_guard_reason="none",
+        truncated=False,
+        persisted_bytes=0,
+        persisted_sha256=hashlib.sha256(b"").hexdigest(),
+        triggered_termination=False,
+    )
+    retained = TurnAttemptArtifact(
+        **controller_fields(),
+        role="participant",
+        target_id="participant-a",
+        turn_phase="opening",
+        operation="start",
+        request_artifact_sha256="a" * 64,
+        target_preflight_artifact_sha256="b" * 64,
+        capability_binding_artifact_sha256="c" * 64,
+        started_at=now,
+        response_completed_at=now,
+        capture_completed_at=now,
+        process_origin="spawned-for-attempt",
+        process_lifecycle="persistent-acp-session",
+        process_unit_id="abcdefghijklmnop",
+        process_exit_code=None,
+        attempt_end_reason="response-returned",
+        failure_kind=None,
+        process_disposition="retained-for-session",
+        stdout=empty,
+        stderr=empty,
+        response=make_response(),
+        bounded_diagnostic=None,
+    )
+    assert retained.process_disposition == "retained-for-session"
+    assert retained.failure_kind is None
 
 
 def test_core_020_absent_actual_model_is_recorded_without_mismatch() -> None:
@@ -932,6 +1111,28 @@ def test_core_027_stream_scratch_and_cleanup_bounds(tmp_path: Path) -> None:
     assert len(finished.persisted) <= 256
     assert hashlib.sha256(finished.persisted).hexdigest() == finished.result.persisted_sha256
 
+    epoch_one = BoundedStreamCapture(256, credentials)
+    epoch_one.feed(b"opening:" + secret[:8].encode())
+    first_epoch = epoch_one.finish(epoch_boundary=True)
+    epoch_two = BoundedStreamCapture(256, credentials)
+    epoch_two.feed(
+        secret[8:].encode() + b":cross:moderator-idle:padding-padding-padding"
+    )
+    second_epoch = epoch_two.finish(epoch_boundary=True)
+    epoch_three = BoundedStreamCapture(256, credentials)
+    epoch_three.feed(b"ballot-final")
+    final_epoch = epoch_three.finish()
+    epochs = (first_epoch, second_epoch, final_epoch)
+    assert [item.result.configured_limit_bytes for item in epochs] == [256, 256, 256]
+    assert first_epoch.result.discarded_guard_bytes == min(
+        len(secret.encode()) - 1,
+        first_epoch.result.accepted_pre_redaction_bytes,
+    )
+    assert second_epoch.result.discarded_guard_reason == "epoch-boundary"
+    assert final_epoch.result.discarded_guard_reason == "none"
+    assert b"moderator-idle" in second_epoch.persisted
+    assert secret.encode() not in b"".join(item.persisted for item in epochs)
+
     with pytest.raises(CredentialBoundaryError, match="max_agent_stdout_bytes"):
         credentials.validate_stream_limits(stdout_bytes=90, stderr_bytes=256)
 
@@ -1106,6 +1307,31 @@ async def test_core_028_windows_reader_handoff_is_byte_and_callback_bounded() ->
     assert not overflow_coordinator.trigger_overflow()
     assert overflow_coordinator.overflow_transition_count == 1
 
+    epoch_coordinator = ReaderHandoffCoordinator()
+    epoch_handoffs = [
+        WindowsReaderHandoff(
+            limit_bytes=32,
+            queue_capacity_bytes=32,
+            coordinator=epoch_coordinator,
+            notify=lambda: None,
+        )
+        for _ in range(2)
+    ]
+    epoch_threads = [
+        threading.Thread(
+            target=handoff.read_pipe,
+            args=(ChunkedPipe([chunk]),),
+            daemon=True,
+        )
+        for handoff, chunk in zip(epoch_handoffs, (b"stdout-epoch", b"stderr-epoch"))
+    ]
+    for reader in epoch_threads:
+        reader.start()
+    wait_until(lambda: all(handoff.completed for handoff in epoch_handoffs))
+    switched = epoch_coordinator.switch_epoch(epoch_handoffs)
+    assert switched == ([b"stdout-epoch"], [b"stderr-epoch"])
+    assert all(handoff.epoch_accepted_bytes == 0 for handoff in epoch_handoffs)
+
     class Resource:
         def __init__(self, name: str) -> None:
             self.name = name
@@ -1131,13 +1357,14 @@ async def test_core_028_windows_reader_handoff_is_byte_and_callback_bounded() ->
         def create_standard_stream_pipes(self):
             self.calls.append("pipes")
             return {
+                "stdin": (Resource("stdin-parent"), Resource("stdin-child")),
                 "stdout": (Resource("stdout-parent"), Resource("stdout-child")),
                 "stderr": (Resource("stderr-parent"), Resource("stderr-child")),
             }
 
         def create_attribute_list(self, *, job, inherited_handles):
             self.calls.append("attributes")
-            assert job is self.job and len(inherited_handles) == 2
+            assert job is self.job and len(inherited_handles) == 3
             return Resource("attributes")
 
         def create_process_suspended(self, **kwargs):
@@ -1200,7 +1427,7 @@ async def test_core_028_windows_reader_handoff_is_byte_and_callback_bounded() ->
     assert job_result.termination_reason == "completed"
     assert job_result.cleanup_confirmed
     assert "terminate-job" in backend.calls
-    assert len(backend.closed) == 8
+    assert len(backend.closed) == 10
 
     class JobListFailureBackend(Backend):
         def create_attribute_list(self, *, job, inherited_handles):
@@ -1217,7 +1444,7 @@ async def test_core_028_windows_reader_handoff_is_byte_and_callback_bounded() ->
         )
     assert "create-suspended" not in job_list_backend.calls
     assert "terminate-job" in job_list_backend.calls
-    assert len(job_list_backend.closed) == 5
+    assert len(job_list_backend.closed) == 7
 
     class UnsupportedNestedJobBackend(Backend):
         def nested_jobs_supported(self):
@@ -1248,7 +1475,7 @@ async def test_core_028_windows_reader_handoff_is_byte_and_callback_bounded() ->
             environment={"SystemRoot": "C:\\Windows"},
         )
     assert "resume" not in failed_backend.calls
-    assert len(failed_backend.closed) == 8
+    assert len(failed_backend.closed) == 10
 
     class BlockingBackend(Backend):
         def __init__(self) -> None:
@@ -1282,7 +1509,7 @@ async def test_core_028_windows_reader_handoff_is_byte_and_callback_bounded() ->
     assert overflow_result.failure_kind == "AGENT_OUTPUT_TOO_LARGE"
     assert overflow_result.cleanup_confirmed
     assert "terminate-job" in blocking_backend.calls
-    assert len(blocking_backend.closed) == 8
+    assert len(blocking_backend.closed) == 10
 
     class UnclosedJobBackend(BlockingBackend):
         def close_resource(self, resource):
@@ -1465,6 +1692,7 @@ def test_core_030_capability_evidence_and_binding_barriers_are_fail_closed(
         launch_kind="direct",
         cli_version="1.0",
         prompt_transport="stdin",
+        process_lifecycle="per-turn",
         effective_static_flags=[],
         credential_env_names=[],
         denied_credential_path_sha256s=[],
@@ -1508,6 +1736,22 @@ def test_core_030_capability_evidence_and_binding_barriers_are_fail_closed(
             attestation=attestation,
             fixture=fixture,
             dynamic_paths={"state_root": tmp_path},
+            supplied_concrete_profile=concrete,
+        )
+    wrong_role_paths = dict(driver_paths)
+    wrong_role_paths["turn_scratch_control"] = scratch_tmp
+    wrong_role_paths["turn_scratch_tmp"] = scratch_control
+    with pytest.raises(CapabilityEvidenceError, match="canonical template"):
+        build_capability_binding(
+            binding_id="driver-wrong-role",
+            role="driver",
+            target_id="driver",
+            access_mode="driver-write",
+            target_preflight_bytes=preflight_bytes,
+            attestation_bytes=attestation_bytes,
+            attestation=attestation,
+            fixture=fixture,
+            dynamic_paths=wrong_role_paths,
             supplied_concrete_profile=concrete,
         )
 

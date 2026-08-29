@@ -27,6 +27,9 @@ class CapabilityEvidenceError(RuntimeError):
     pass
 
 
+_DYNAMIC_KEY_PREFIX = "<dialectic-dynamic-path:"
+
+
 @dataclass(frozen=True, slots=True)
 class CapabilityFixture:
     probe_ids: tuple[str, ...]
@@ -183,7 +186,6 @@ def _capture_dynamic_identities(
     identities: list[DynamicFilesystemIdentity] = []
     for dynamic_role, path in dynamic_paths.items():
         resolved = _resolve_dynamic_path(dynamic_role, path)
-        info = resolved.stat()
         canonical_key = os.path.normcase(str(resolved)) if os.name == "nt" else str(resolved)
         identities.append(
             DynamicFilesystemIdentity(
@@ -249,10 +251,56 @@ def _substitute_template(value: Any, substitutions: Mapping[str, str]) -> Any:
             if role not in substitutions:
                 raise CapabilityEvidenceError(f"unknown dynamic template slot {role}")
             return substitutions[role]
-        return {key: _substitute_template(child, substitutions) for key, child in value.items()}
+        result: dict[str, Any] = {}
+        for key, child in value.items():
+            replaced_key = _substitute_template_key(key, substitutions)
+            if replaced_key in result:
+                raise CapabilityEvidenceError(
+                    "dynamic template paths collapse to a duplicate key"
+                )
+            result[replaced_key] = _substitute_template(child, substitutions)
+        return result
     if isinstance(value, list):
         return [_substitute_template(child, substitutions) for child in value]
     return value
+
+
+def dynamic_path_key(role: str, *relative_parts: str) -> str:
+    """Return a stable template key for an exact dynamic path."""
+
+    if not role or any(not part or part in {".", ".."} for part in relative_parts):
+        raise ValueError("dynamic path template key is invalid")
+    suffix = ":" + ":".join(relative_parts) if relative_parts else ""
+    return f"{_DYNAMIC_KEY_PREFIX}{role}{suffix}>"
+
+
+def instantiate_capability_template(
+    fixture: CapabilityFixture, dynamic_paths: Mapping[str, Path]
+) -> dict[str, Any]:
+    substitutions = {
+        role: str(path.resolve(strict=True)) for role, path in dynamic_paths.items()
+    }
+    result = _substitute_template(fixture.template, substitutions)
+    if not isinstance(result, dict):
+        raise CapabilityEvidenceError("capability template root must be an object")
+    return result
+
+
+def _substitute_template_key(key: Any, substitutions: Mapping[str, str]) -> str:
+    if not isinstance(key, str):
+        raise CapabilityEvidenceError("capability template object keys must be strings")
+    if not key.startswith(_DYNAMIC_KEY_PREFIX):
+        return key
+    if not key.endswith(">"):
+        raise CapabilityEvidenceError("malformed dynamic template path key")
+    parts = key[len(_DYNAMIC_KEY_PREFIX) : -1].split(":")
+    role, relative_parts = parts[0], parts[1:]
+    if role not in substitutions or any(
+        not part or part in {".", ".."} or "/" in part or "\\" in part
+        for part in relative_parts
+    ):
+        raise CapabilityEvidenceError(f"unknown or invalid dynamic template key {key}")
+    return str(Path(substitutions[role]).joinpath(*relative_parts))
 
 
 def _canonical_bytes(value: Any) -> bytes:

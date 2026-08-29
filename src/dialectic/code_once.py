@@ -17,15 +17,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .adapters import AgentAdapter, AgentRegistry, ModelMismatchError
+from .adapters import AgentAdapter, AgentProcessError, AgentRegistry, ModelMismatchError
 from .capabilities import (
     BindingBarrier,
     CapabilityEvidenceError,
     CapabilityFixture,
     build_capability_binding,
+    instantiate_capability_template,
     validate_binding_identities,
 )
 from .contracts import ARTIFACT_SCHEMA_VERSION, TOOL_VERSION, CodeOutcome, FailureKind
+from .config import validate_model_bounds
 from .git_workspace import (
     ChangeValidator,
     GitCommandError,
@@ -38,6 +40,11 @@ from .git_workspace import (
     ValidatedChange,
 )
 from .locking import RepositoryBusyError, RepositoryLock
+from .native_adapters import (
+    NativeInvocationEvidence,
+    NativePreflightError,
+    NativeTurnError,
+)
 from .output import OutputError, extract_model_payload
 from .schemas import (
     AgentRequest,
@@ -207,7 +214,9 @@ class CodeOnceOrchestrator:
                 )
             except Exception as exc:
                 raise DialecticFailure(
-                    "PREFLIGHT_FAILED", f"target preflight failed for {lookup_id}"
+                    "PREFLIGHT_FAILED",
+                    f"target preflight failed for {lookup_id}: "
+                    f"{_bounded_preflight_diagnostic(exc)}",
                 ) from exc
             if not result.authentication_verified or result.target != target:
                 raise DialecticFailure(
@@ -215,6 +224,7 @@ class CodeOnceOrchestrator:
                 )
             evidence = self._persist_gate_a(
                 context,
+                adapter=adapter,
                 role=role,
                 target_id=artifact_target_id,
                 target=target,
@@ -230,12 +240,78 @@ class CodeOnceOrchestrator:
         self,
         context: ExecutionContext,
         *,
+        adapter: AgentAdapter,
         role: str,
         target_id: str,
         target: AgentTarget,
         result: PreflightResult,
         access_mode: str,
     ) -> _GateAEvidence:
+        material_reader = getattr(adapter, "preflight_material", None)
+        material = material_reader() if callable(material_reader) else None
+        if material is not None:
+            if material.process_lifecycle == "persistent-acp-session" and not (
+                role == "participant"
+                and material.prompt_transport == "acp-stdio"
+                and material.process_local_continuation
+            ):
+                raise DialecticFailure(
+                    "PREFLIGHT_FAILED",
+                    "persistent native lifecycle lacks its fixture-qualified ACP property",
+                )
+            attestation = material.attestation
+            attestation_bytes = canonical_json_bytes(attestation)
+            attestation_sha = hashlib.sha256(attestation_bytes).hexdigest()
+            context.service.store.write_capability_attestation(
+                attestation_sha, attestation
+            )
+            launch_kind = (
+                "windows-batch-shim"
+                if type(material.launch_plan).__name__ == "WindowsBatchLaunchSpec"
+                else "direct"
+            )
+            preflight = TargetPreflightArtifact(
+                artifact_schema_version=ARTIFACT_SCHEMA_VERSION,
+                tool_version=TOOL_VERSION,
+                role=role,
+                target_id=target_id,
+                target=target,
+                resolved_executable=str(material.resolved_executable),
+                resolved_executable_identity=material.resolved_executable_identity,
+                resolved_executable_sha256=material.resolved_executable_sha256,
+                spawned_root_executable=str(material.spawned_root_executable),
+                spawned_root_identity=material.spawned_root_identity,
+                spawned_root_sha256=material.spawned_root_sha256,
+                launch_kind=launch_kind,
+                cli_version=material.cli_version,
+                prompt_transport=material.prompt_transport,
+                process_lifecycle=material.process_lifecycle,
+                effective_static_flags=list(material.effective_static_flags),
+                credential_env_names=list(material.credential_environment_names),
+                denied_credential_path_sha256s=list(
+                    material.denied_credential_path_sha256s
+                ),
+                adapter_fixture_version=material.adapter_fixture_version,
+                capability_attestation_sha256=attestation_sha,
+                authentication_verified=True,
+            )
+            relative = f"audit/targets/{role}/{target_id}.json"
+            preflight_sha = context.service.store.write_artifact(
+                context.handle, relative, preflight
+            )
+            preflight_bytes = context.service.store.read_artifact(
+                context.handle, relative, 1_048_576
+            )
+            return _GateAEvidence(
+                preflight=preflight,
+                preflight_bytes=preflight_bytes,
+                preflight_sha256=preflight_sha,
+                preflight_relative_path=relative,
+                attestation=attestation,
+                attestation_bytes=attestation_bytes,
+                fixture=material.fixture,
+            )
+
         dynamic_roles = (
             (
                 "isolated_worktree",
@@ -310,6 +386,7 @@ class CodeOnceOrchestrator:
             launch_kind="direct",
             cli_version="scripted-offline-v1",
             prompt_transport="acp-stdio" if target.runtime == "grok-build" else "stdin",
+            process_lifecycle="per-turn",
             effective_static_flags=["offline-construction"],
             credential_env_names=[],
             denied_credential_path_sha256s=[],
@@ -362,7 +439,12 @@ class CodeOnceOrchestrator:
         initial_scratch = TurnWorkspace.create(workspace.path)
         driver_gate = gate_a[("driver", "driver")]
         initial_binding, initial_binding_sha, initial_paths = self._bind_driver(
-            context, workspace, initial_scratch, driver_gate, "initial"
+            context,
+            workspace,
+            initial_scratch,
+            driver_gate,
+            "initial",
+            adapter=self.driver_adapter,
         )
 
         try:
@@ -516,6 +598,7 @@ class CodeOnceOrchestrator:
             repair_scratch,
             gate_a[("driver", "driver")],
             "repair",
+            adapter=self.driver_adapter,
         )
         context.service.advance_phase(context.handle, "DRIVER_REPAIR")
         try:
@@ -651,6 +734,9 @@ class CodeOnceOrchestrator:
             neutral = reviewers_root / alias
             neutral.mkdir(mode=0o700)
             evidence = gate_a[("reviewer", reviewer_id)]
+            adapter = self.reviewer_adapters.get(reviewer_id)
+            if adapter is None:
+                adapter = self.driver_adapter
             dynamic_paths = {"neutral_role_dir": neutral}
             concrete = _concrete_profile(evidence.fixture, dynamic_paths)
             binding = build_capability_binding(
@@ -670,10 +756,8 @@ class CodeOnceOrchestrator:
                 f"audit/capabilities/reviewer/{alias}/review.binding.json",
                 binding,
             )
+            _authorize_native_binding(adapter, binding, concrete, dynamic_paths)
             barrier.add(alias, binding)
-            adapter = self.reviewer_adapters.get(reviewer_id)
-            if adapter is None:
-                adapter = self.driver_adapter
             prepared.append(
                 _ReviewerContext(
                     alias=alias,
@@ -825,8 +909,6 @@ class CodeOnceOrchestrator:
         request_sha = context.service.store.write_artifact(
             context.handle, f"{root}.request.json", request_artifact
         )
-        context.service.store.write_artifact(context.handle, f"{root}.stdout.txt", b"")
-        context.service.store.write_artifact(context.handle, f"{root}.stderr.txt", b"")
         request = AgentRequest(
             role=role,
             target_id=target_id,
@@ -840,6 +922,7 @@ class CodeOnceOrchestrator:
         started = datetime.now(UTC)
         process_started = True
         termination = "completed"
+        exit_code: int | None = None
         attempt_failure: FailureKind | None = None
         response: AgentResponse | None = None
         diagnostic: str | None = None
@@ -850,9 +933,21 @@ class CodeOnceOrchestrator:
                 if operation == "start"
                 else adapter.resume(session_id or "", request)
             )
-            response = await asyncio.wait_for(
+            raw_response = await asyncio.wait_for(
                 invocation, timeout=context.config.limits.agent_turn_seconds
             )
+            exit_code = 0
+            try:
+                response = AgentResponse.model_validate(raw_response)
+                validate_model_bounds(
+                    response.model_dump(mode="python"),
+                    max_chars=context.config.limits.max_model_field_chars,
+                    max_items=context.config.limits.max_model_list_items,
+                )
+            except Exception as exc:
+                raise TurnFailure(
+                    failure_kind, "agent returned an invalid native response envelope"
+                ) from exc
             if response.runtime != target.runtime or response.requested_model != target.model:
                 raise TurnFailure(
                     failure_kind,
@@ -874,6 +969,18 @@ class CodeOnceOrchestrator:
             attempt_failure = "MODEL_MISMATCH"
             diagnostic = str(exc)
             caught = exc
+        except AgentProcessError as exc:
+            termination = "completed"
+            exit_code = exc.exit_code
+            attempt_failure = failure_kind
+            diagnostic = str(exc)
+            response = None
+            caught = exc
+        except NativeTurnError as exc:
+            attempt_failure = exc.kind or failure_kind
+            diagnostic = exc.detail
+            response = None
+            caught = exc
         except DialecticFailure as exc:
             termination = "launch-failed"
             process_started = False
@@ -891,11 +998,77 @@ class CodeOnceOrchestrator:
             process_started = False
             attempt_failure = failure_kind
             diagnostic = f"agent invocation failed: {type(exc).__name__}"
+            response = None
             caught = exc
 
+        evidence = _take_native_invocation_evidence(adapter)
         stream_out = _empty_stream(context.config.limits.max_agent_stdout_bytes)
         stream_err = _empty_stream(context.config.limits.max_agent_stderr_bytes)
         completed = datetime.now(UTC)
+        if evidence is None:
+            process_origin = "spawned-for-attempt" if process_started else "none"
+            process_lifecycle = gate_a.preflight.process_lifecycle
+            process_unit_id = (
+                _process_unit_id(context.handle.run_id, role, target_id, phase)
+                if process_started
+                else None
+            )
+            process_exit_code = (
+                exit_code if exit_code is not None else (-1 if process_started else None)
+            )
+            process_disposition = "closed" if process_started else "not-started"
+            response_completed_at = completed if response is not None else None
+            capture_completed_at = completed
+            if caught is None:
+                attempt_end_reason = "response-returned"
+            elif not process_started:
+                attempt_end_reason = termination
+            elif termination in {"timeout", "cancelled", "peer-failure"}:
+                attempt_end_reason = termination
+            elif attempt_failure == "AGENT_OUTPUT_TOO_LARGE":
+                attempt_end_reason = "output-limit"
+            elif attempt_failure == "PROCESS_CLEANUP_FAILED":
+                attempt_end_reason = "cleanup-failed"
+            else:
+                attempt_end_reason = "agent-failed"
+        else:
+            stream_out = evidence.stdout.result
+            stream_err = evidence.stderr.result
+            started = evidence.started_at
+            process_origin = evidence.process_origin
+            process_lifecycle = evidence.process_lifecycle
+            process_unit_id = evidence.process_unit_id
+            process_exit_code = evidence.process_exit_code
+            process_disposition = evidence.process_disposition
+            capture_completed_at = evidence.capture_completed_at
+            response_completed_at = (
+                evidence.response_completed_at if response is not None else None
+            )
+            attempt_end_reason = evidence.attempt_end_reason
+            if (
+                isinstance(caught, asyncio.CancelledError)
+                and process_origin == "none"
+            ):
+                attempt_end_reason = termination
+            if caught is not None and attempt_end_reason == "response-returned":
+                attempt_end_reason = "agent-failed"
+            if evidence.failure_kind is not None:
+                attempt_failure = evidence.failure_kind  # type: ignore[assignment]
+            if evidence.bounded_diagnostic is not None and diagnostic is None:
+                diagnostic = evidence.bounded_diagnostic
+            if process_disposition == "cleanup-failed":
+                attempt_failure = "PROCESS_CLEANUP_FAILED"
+                attempt_end_reason = "cleanup-failed"
+        context.service.store.write_artifact(
+            context.handle,
+            f"{root}.stdout.txt",
+            evidence.stdout.persisted if evidence is not None else b"",
+        )
+        context.service.store.write_artifact(
+            context.handle,
+            f"{root}.stderr.txt",
+            evidence.stderr.persisted if evidence is not None else b"",
+        )
         attempt = TurnAttemptArtifact(
             artifact_schema_version=ARTIFACT_SCHEMA_VERSION,
             tool_version=TOOL_VERSION,
@@ -907,12 +1080,15 @@ class CodeOnceOrchestrator:
             target_preflight_artifact_sha256=gate_a.preflight_sha256,
             capability_binding_artifact_sha256=binding_sha256,
             started_at=started,
-            completed_at=completed,
-            process_started=process_started,
-            exit_code=0 if response is not None else None,
-            termination_reason=termination,
+            response_completed_at=response_completed_at,
+            capture_completed_at=capture_completed_at,
+            process_origin=process_origin,
+            process_lifecycle=process_lifecycle,
+            process_unit_id=process_unit_id,
+            process_exit_code=process_exit_code,
+            attempt_end_reason=attempt_end_reason,
             failure_kind=attempt_failure,
-            cleanup_confirmed=True,
+            process_disposition=process_disposition,
             stdout=stream_out,
             stderr=stream_err,
             response=response,
@@ -923,6 +1099,11 @@ class CodeOnceOrchestrator:
         )
         if caught is not None:
             if isinstance(caught, asyncio.CancelledError):
+                if attempt_failure == "PROCESS_CLEANUP_FAILED":
+                    raise DialecticFailure(
+                        "PROCESS_CLEANUP_FAILED",
+                        diagnostic or "agent cleanup failed during cancellation",
+                    ) from caught
                 raise caught
             kind = attempt_failure or failure_kind
             raise DialecticFailure(kind, diagnostic or "agent turn failed") from caught
@@ -936,6 +1117,8 @@ class CodeOnceOrchestrator:
         scratch: TurnWorkspace,
         evidence: _GateAEvidence,
         phase: str,
+        *,
+        adapter: AgentAdapter,
     ) -> tuple[CapabilityBindingArtifact, str, Mapping[str, Path]]:
         dynamic_paths = {
             "isolated_worktree": workspace.path,
@@ -967,6 +1150,7 @@ class CodeOnceOrchestrator:
             f"audit/capabilities/driver/driver/{phase}.binding.json",
             binding,
         )
+        _authorize_native_binding(adapter, binding, concrete, dynamic_paths)
         return binding, sha, dynamic_paths
 
     @staticmethod
@@ -1130,6 +1314,37 @@ def _build_feedback(
     )
 
 
+def _authorize_native_binding(
+    adapter: AgentAdapter,
+    binding: CapabilityBindingArtifact,
+    concrete_profile: Mapping[str, Any],
+    dynamic_paths: Mapping[str, Path],
+) -> None:
+    binder = getattr(adapter, "bind_capability", None)
+    if callable(binder):
+        binder(binding, concrete_profile, dynamic_paths)
+
+
+def _take_native_invocation_evidence(
+    adapter: AgentAdapter,
+) -> NativeInvocationEvidence | None:
+    reader = getattr(adapter, "take_invocation_evidence", None)
+    if not callable(reader):
+        return None
+    evidence = reader()
+    if evidence is not None and not isinstance(evidence, NativeInvocationEvidence):
+        raise DialecticFailure(
+            "INTERNAL_ERROR", "native adapter returned invalid invocation evidence"
+        )
+    return evidence
+
+
+def _bounded_preflight_diagnostic(error: BaseException) -> str:
+    detail = str(error) if isinstance(error, NativePreflightError) else type(error).__name__
+    encoded = detail.encode("utf-8", errors="replace")[:1024]
+    return encoded.decode("utf-8", errors="ignore") or "native preflight failed"
+
+
 def _initial_driver_prompt(task: str, worktree: Path) -> str:
     return (
         "Perform one bounded implementation pass and then stop.\n"
@@ -1161,22 +1376,7 @@ def _repair_prompt(feedback: FeedbackArtifact) -> str:
 def _concrete_profile(
     fixture: CapabilityFixture, dynamic_paths: Mapping[str, Path]
 ) -> dict[str, Any]:
-    substitutions = {
-        role: str(path.resolve(strict=True)) for role, path in dynamic_paths.items()
-    }
-
-    def replace(value: Any) -> Any:
-        if isinstance(value, dict):
-            if set(value) == {"dynamic_path"}:
-                return substitutions[value["dynamic_path"]]
-            return {key: replace(child) for key, child in value.items()}
-        if isinstance(value, list):
-            return [replace(child) for child in value]
-        return value
-
-    result = replace(fixture.template)
-    assert isinstance(result, dict)
-    return result
+    return instantiate_capability_template(fixture, dynamic_paths)
 
 
 def _empty_stream(limit: int) -> StreamCaptureResult:
@@ -1185,11 +1385,21 @@ def _empty_stream(limit: int) -> StreamCaptureResult:
         accepted_pre_redaction_bytes=0,
         accepted_pre_redaction_sha256=_EMPTY_SHA256,
         discarded_guard_bytes=0,
+        discarded_guard_reason="none",
         truncated=False,
         persisted_bytes=0,
         persisted_sha256=_EMPTY_SHA256,
         triggered_termination=False,
     )
+
+
+def _process_unit_id(run_id: str, role: str, target_id: str, phase: str) -> str:
+    digest = hashlib.sha256(
+        f"{run_id}\0{role}\0{target_id}\0{phase}".encode("utf-8")
+    ).digest()[:10]
+    import base64
+
+    return base64.b32encode(digest).decode("ascii").lower()
 
 
 def _redacted_response(response: AgentResponse, context: ExecutionContext) -> AgentResponse:

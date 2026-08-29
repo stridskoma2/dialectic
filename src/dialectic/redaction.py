@@ -194,16 +194,26 @@ class BoundedStreamCapture:
         self._overflowed = True
         return True
 
-    def finish(self) -> CapturedStream:
+    def finish(self, *, epoch_boundary: bool = False) -> CapturedStream:
         accepted = bytes(self._accepted)
         discarded_guard = 0
+        guard_reason = "none"
         if self._overflowed:
             guard = max(0, self._credentials.longest_utf8_bytes - 1)
             discarded_guard = min(guard, len(accepted))
+            if discarded_guard:
+                guard_reason = "overflow"
             safe_prefix = accepted[: len(accepted) - discarded_guard]
             redacted = self._credentials.redact_bytes(safe_prefix)
             available = self._limit - len(TRUNCATION_MARKER)
             persisted = redacted[:available] + TRUNCATION_MARKER
+        elif epoch_boundary:
+            guard = max(0, self._credentials.longest_utf8_bytes - 1)
+            discarded_guard = min(guard, len(accepted))
+            if discarded_guard:
+                guard_reason = "epoch-boundary"
+            safe_prefix = accepted[: len(accepted) - discarded_guard]
+            persisted = self._credentials.redact_bytes(safe_prefix)
         else:
             persisted = self._credentials.redact_bytes(accepted)
         result = StreamCaptureResult(
@@ -211,6 +221,7 @@ class BoundedStreamCapture:
             accepted_pre_redaction_bytes=len(accepted),
             accepted_pre_redaction_sha256=hashlib.sha256(accepted).hexdigest(),
             discarded_guard_bytes=discarded_guard,
+            discarded_guard_reason=guard_reason,
             truncated=self._overflowed,
             persisted_bytes=len(persisted),
             persisted_sha256=hashlib.sha256(persisted).hexdigest(),

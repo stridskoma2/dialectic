@@ -9,7 +9,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import BinaryIO, Callable, Literal, Mapping, Protocol, Sequence
+from typing import Awaitable, BinaryIO, Callable, Literal, Mapping, Protocol, Sequence
 
 from .contracts import FailureKind
 
@@ -82,6 +82,11 @@ class ProcessSupervisor:
                 await unit.force_terminate()
 
             confirmed = await unit.confirm_cleanup(graceful_kill_seconds)
+            if exit_code is None and root_wait.done() and not root_wait.cancelled():
+                try:
+                    exit_code = root_wait.result()
+                except Exception:
+                    confirmed = False
             if not confirmed:
                 return SupervisionResult(
                     exit_code,
@@ -149,11 +154,13 @@ class PosixProcessUnit:
         self._signal_group(signal.SIGKILL)
 
     async def confirm_cleanup(self, timeout_seconds: float) -> bool:
+        deadline = time.monotonic() + timeout_seconds
         try:
-            await asyncio.wait_for(self.process.wait(), timeout=timeout_seconds)
+            await asyncio.wait_for(
+                self.process.wait(), timeout=max(0.0, deadline - time.monotonic())
+            )
         except TimeoutError:
             return False
-        deadline = time.monotonic() + timeout_seconds
         while time.monotonic() <= deadline:
             try:
                 os.killpg(self.process_group, 0)
@@ -364,6 +371,7 @@ class WindowsJobProcessUnit:
         self._backend = backend
         self._job = job
         self._process = process
+        self._pipes = dict(pipes)
         self._all_resources = [
             process.thread_handle,
             process.process_handle,
@@ -376,6 +384,20 @@ class WindowsJobProcessUnit:
             resource for resource in self._all_resources if id(resource) not in preclosed_ids
         ]
         self._closed = False
+        self._io_cleanup: Callable[[float], Awaitable[bool]] | None = None
+
+    @property
+    def backend(self) -> WindowsJobBackend:
+        return self._backend
+
+    @property
+    def pipes(self) -> Mapping[str, tuple[object, object]]:
+        return self._pipes
+
+    def attach_io_cleanup(self, cleanup: Callable[[float], Awaitable[bool]]) -> None:
+        if self._io_cleanup is not None:
+            raise RuntimeError("Windows process-unit I/O cleanup is already attached")
+        self._io_cleanup = cleanup
 
     async def wait(self) -> int:
         result = await asyncio.to_thread(
@@ -396,14 +418,20 @@ class WindowsJobProcessUnit:
     async def confirm_cleanup(self, timeout_seconds: float) -> bool:
         if self._closed:
             return all(self._backend.resource_is_closed(resource) for resource in self._all_resources)
+        deadline = time.monotonic() + timeout_seconds
         exit_code = await asyncio.to_thread(
             self._backend.wait_process,
             self._process.process_handle,
-            timeout_seconds,
+            max(0.0, deadline - time.monotonic()),
         )
+        io_confirmed = True
+        if self._io_cleanup is not None:
+            io_confirmed = await self._io_cleanup(
+                max(0.0, deadline - time.monotonic())
+            )
         _close_distinct_resources(self._backend, self._open_resources)
         self._closed = True
-        return exit_code is not None and all(
+        return exit_code is not None and io_confirmed and all(
             self._backend.resource_is_closed(resource) for resource in self._all_resources
         )
 
@@ -421,7 +449,8 @@ def _close_distinct_resources(
             continue
         seen.add(identity)
         try:
-            backend.close_resource(resource)
+            if not backend.resource_is_closed(resource):
+                backend.close_resource(resource)
         except Exception:
             # Closure proof below converts any remaining resource into cleanup failure.
             pass
@@ -434,6 +463,7 @@ class ReaderHandoffCoordinator:
         self.abort = threading.Event()
         self.overflow = threading.Event()
         self._lock = threading.Lock()
+        self._admission_lock = threading.RLock()
         self._conditions: list[threading.Condition] = []
         self._overflow_transition_count = 0
 
@@ -464,6 +494,16 @@ class ReaderHandoffCoordinator:
         for condition in conditions:
             with condition:
                 condition.notify_all()
+
+    def switch_epoch(
+        self, handoffs: Sequence["WindowsReaderHandoff"]
+    ) -> tuple[list[bytes], ...]:
+        """Drain and reset a cohort at one reader-admission boundary."""
+
+        with self._admission_lock:
+            if self.abort.is_set() or self.overflow.is_set():
+                raise RuntimeError("cannot switch a terminated reader epoch")
+            return tuple(handoff._switch_epoch_locked() for handoff in handoffs)
 
 
 class WindowsReaderHandoff:
@@ -513,6 +553,26 @@ class WindowsReaderHandoff:
         with self._condition:
             return self._completed
 
+    @property
+    def epoch_accepted_bytes(self) -> int:
+        with self._condition:
+            return self._accepted_bytes
+
+    def switch_epoch(self) -> list[bytes]:
+        """Atomically close one admission epoch without restarting the reader."""
+
+        return self.coordinator.switch_epoch((self,))[0]
+
+    def _switch_epoch_locked(self) -> list[bytes]:
+        with self._condition:
+            chunks = list(self._queue)
+            self._queue.clear()
+            self._queued_bytes = 0
+            self._accepted_bytes = 0
+            self._data_notification_pending = False
+            self._condition.notify_all()
+            return chunks
+
     def read_pipe(self, pipe: BinaryIO) -> None:
         current_chunk_bytes = 0
         try:
@@ -527,25 +587,42 @@ class WindowsReaderHandoff:
                 accepted_chunk = chunk[:remaining_total]
                 accepted_length = len(accepted_chunk)
                 overflow_now = current_chunk_bytes > remaining_total
-                with self._condition:
-                    self.peak_resident_bytes = max(
-                        self.peak_resident_bytes, self._queued_bytes + current_chunk_bytes
-                    )
-                    while (
-                        not overflow_now
-                        and self._queued_bytes + accepted_length > self.queue_capacity_bytes
-                        and not self.coordinator.abort.is_set()
-                        and not self.coordinator.overflow.is_set()
-                    ):
-                        self._condition.wait()
-                    if overflow_now:
-                        pass
-                    elif self.coordinator.abort.is_set() or self.coordinator.overflow.is_set():
-                        break
-                    else:
-                        self._enqueue(accepted_chunk)
-                    if overflow_now and accepted_chunk:
-                        self._enqueue(accepted_chunk)
+                admitted = False
+                while not admitted:
+                    with self._condition:
+                        self.peak_resident_bytes = max(
+                            self.peak_resident_bytes,
+                            self._queued_bytes + current_chunk_bytes,
+                        )
+                        while (
+                            not overflow_now
+                            and self._queued_bytes + accepted_length
+                            > self.queue_capacity_bytes
+                            and not self.coordinator.abort.is_set()
+                            and not self.coordinator.overflow.is_set()
+                        ):
+                            self._condition.wait()
+                    with self.coordinator._admission_lock:
+                        with self._condition:
+                            if (
+                                self.coordinator.abort.is_set()
+                                or self.coordinator.overflow.is_set()
+                            ):
+                                admitted = True
+                                break
+                            if (
+                                not overflow_now
+                                and self._queued_bytes + accepted_length
+                                > self.queue_capacity_bytes
+                            ):
+                                continue
+                            if accepted_chunk:
+                                self._enqueue(accepted_chunk)
+                            admitted = True
+                if self.coordinator.abort.is_set() or (
+                    self.coordinator.overflow.is_set() and not overflow_now
+                ):
+                    break
                 if overflow_now:
                     self.coordinator.trigger_overflow()
                     break
@@ -597,8 +674,10 @@ async def join_reader_threads(
     *,
     coordinator: ReaderHandoffCoordinator,
     timeout_seconds: float,
+    abort_first: bool = True,
 ) -> bool:
-    coordinator.trigger_abort()
+    if abort_first:
+        coordinator.trigger_abort()
     deadline = time.monotonic() + timeout_seconds
 
     async def join_one(thread: threading.Thread) -> bool:
