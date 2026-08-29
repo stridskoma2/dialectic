@@ -228,6 +228,11 @@ class NativeAdapterBase:
         """Whether the verified fixture permits a process-local session lease."""
         return self.fixture.process_local_continuation
 
+    @property
+    def prompt_transport(self) -> Literal["stdin", "acp-stdio"]:
+        """The transport selected by the verified native fixture."""
+        return self.fixture.prompt_transport
+
     async def preflight(self, target: AgentTarget) -> PreflightResult:
         if target != self.target:
             raise NativePreflightError("native adapter target mismatch")

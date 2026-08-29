@@ -9,7 +9,7 @@ import secrets
 from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Awaitable, Callable, Protocol
+from typing import Awaitable, Callable, Literal, Protocol
 
 from .schemas import (
     AgentRequest,
@@ -26,6 +26,7 @@ SCRIPTED_STDERR_LIMIT_BYTES = 2_097_152
 
 class AgentAdapter(Protocol):
     process_local_continuation: bool
+    prompt_transport: Literal["stdin", "acp-stdio"]
 
     async def preflight(self, target: AgentTarget) -> PreflightResult: ...
 
@@ -92,6 +93,9 @@ class ScriptedAgentAdapter:
         self._steps = deque(steps)
         self.canonical_aliases = canonical_aliases or {}
         self.process_local_continuation = persistent_session
+        self.prompt_transport = (
+            "acp-stdio" if target.runtime == "grok-build" else "stdin"
+        )
         self._close_error = close_error
         self._stdout_limit = stdout_limit
         self._stderr_limit = stderr_limit

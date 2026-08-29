@@ -43,6 +43,7 @@ from dialectic.schemas import (
     LimitsSpec,
     RunRecord,
     SummaryRecord,
+    TargetPreflightArtifact,
     TurnAttemptArtifact,
     WorkspaceRecord,
 )
@@ -304,6 +305,14 @@ async def test_code_001_happy_path_two_reviewers_return_findings(
         ).hexdigest()
         assert attempt.stdout.persisted_sha256 == hashlib.sha256(b"").hexdigest()
         assert attempt.stderr.persisted_sha256 == hashlib.sha256(b"").hexdigest()
+    grok_preflight = TargetPreflightArtifact.model_validate_json(
+        (handle.path / "audit/targets/reviewer/reviewer-b.json").read_bytes(),
+        strict=True,
+    )
+    assert (grok_preflight.prompt_transport, grok_preflight.process_lifecycle) == (
+        "acp-stdio",
+        "per-turn",
+    )
     assert not list(handle.path.rglob("*.response.json"))
 
 

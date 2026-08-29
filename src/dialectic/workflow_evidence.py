@@ -223,7 +223,7 @@ class WorkflowEvidenceSupport:
             spawned_root_sha256=executable_sha,
             launch_kind="direct",
             cli_version="scripted-offline-v1",
-            prompt_transport="acp-stdio" if persistent_session else "stdin",
+            prompt_transport=adapter.prompt_transport,
             process_lifecycle=(
                 "persistent-acp-session" if persistent_session else "per-turn"
             ),

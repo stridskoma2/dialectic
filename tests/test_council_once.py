@@ -334,6 +334,13 @@ async def test_council_001_complete_three_participant_artifact_and_persistent_li
     assert all(item.attempt_end_reason == "response-returned" for item in grok)
     assert len({item.process_unit_id for item in grok}) == 1
     assert adapters[2].close_count == 1
+    grok_preflight = _read_json(
+        handle.path / "audit/targets/participant/participant-c.json"
+    )
+    assert (grok_preflight["prompt_transport"], grok_preflight["process_lifecycle"]) == (
+        "acp-stdio",
+        "persistent-acp-session",
+    )
     for path in handle.path.glob("audit/capabilities/participant/*/*.binding.json"):
         binding = CapabilityBindingArtifact.model_validate_json(path.read_bytes(), strict=True)
         assert [identity.role for identity in binding.dynamic_filesystem_identities] == [
@@ -943,6 +950,10 @@ async def test_council_032_two_accepts_one_abstention_is_rough_consensus_and_fre
         TurnAttemptArtifact.model_fields
     )
     assert get_type_hints(AgentAdapter)["process_local_continuation"] is bool
+    assert get_args(get_type_hints(AgentAdapter)["prompt_transport"]) == (
+        "stdin",
+        "acp-stdio",
+    )
     assert DynamicFilesystemIdentity.model_fields["filesystem_identity"].is_required()
     assert set(get_args(DynamicFilesystemIdentity.model_fields["role"].annotation)) == {
         "isolated_worktree",
