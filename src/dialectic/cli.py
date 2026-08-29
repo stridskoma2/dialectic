@@ -124,18 +124,14 @@ def _print_progress(console: Console, record: RunRecord) -> None:
 
 def _print_record(
     console: Console,
-    record: object,
+    record: RunRecord,
     artifact_dir: Path,
     *,
     workspace: WorkspaceRecord | None = None,
 ) -> None:
-    status = getattr(record, "status")
-    run_id = getattr(record, "run_id")
-    console.print(f"{run_id}  {status}")
-    failure_kind = getattr(record, "failure_kind")
-    failure_detail = getattr(record, "failure_detail")
-    if failure_kind is not None:
-        console.print(f"failure: {failure_kind}: {failure_detail}")
+    console.print(f"{record.run_id}  {record.status}")
+    if record.failure_kind is not None:
+        console.print(f"failure: {record.failure_kind}: {record.failure_detail}")
     console.print(f"artifacts: {artifact_dir}", soft_wrap=True)
     if workspace is not None and workspace.dialectic_worktree is not None:
         console.print(f"isolated worktree: {workspace.dialectic_worktree}", soft_wrap=True)

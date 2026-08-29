@@ -5,8 +5,8 @@ import copy
 import hashlib
 import json
 import os
-import socket
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Callable
@@ -1466,13 +1466,20 @@ async def test_code_044_reserved_workspace_attacks_fail_closed_before_git(
         elif variant == "fifo":
             os.mkfifo(temporary / "hostile.fifo")
         elif variant == "socket":
-            prior_cwd = Path.cwd()
-            try:
-                os.chdir(temporary)
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as unix_socket:
-                    unix_socket.bind("hostile.socket")
-            finally:
-                os.chdir(prior_cwd)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import socket; value = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); "
+                    "value.bind('hostile.socket'); value.close()",
+                ],
+                cwd=temporary,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            assert result.returncode == 0, result.stderr.decode(errors="replace")
         elif variant == "posix-rename-race":
             race = temporary / "race"
             race.mkdir()
