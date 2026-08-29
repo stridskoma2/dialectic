@@ -9,7 +9,7 @@ import json
 import os
 import socket
 import subprocess
-import sys
+import sysconfig
 import threading
 import time
 from datetime import UTC, datetime
@@ -392,7 +392,7 @@ def test_core_011_dial_and_dialectic_are_equivalent(
             outcomes.append((result.exit_code, tree, record.status, record.failure_kind))
         assert outcomes[0] == outcomes[1]
 
-    scripts_directory = Path(sys.executable).parent
+    scripts_directory = Path(sysconfig.get_path("scripts"))
     suffix = ".exe" if os.name == "nt" else ""
     help_results = [
         subprocess.run(
