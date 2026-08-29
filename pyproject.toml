@@ -9,6 +9,14 @@ description = "A bounded local supervisor for cross-model review and deliberatio
 readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: Microsoft :: Windows :: Windows 11",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+]
 dependencies = [
   "filelock>=3.16,<4",
   "platformdirs>=4.3,<5",
@@ -24,6 +32,9 @@ test = [
   "pytest>=8.3,<10",
   "pytest-asyncio>=0.25,<2",
 ]
+release = [
+  "build>=1.2,<2",
+]
 
 [project.scripts]
 dial = "dialectic.cli:main"
@@ -31,6 +42,16 @@ dialectic = "dialectic.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dialectic"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/tests",
+  "/examples",
+  "/README.md",
+  "/LICENSE",
+  "/pyproject.toml",
+]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

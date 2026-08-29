@@ -314,6 +314,9 @@ async def test_code_001_happy_path_two_reviewers_return_findings(
         "per-turn",
     )
     assert not list(handle.path.rglob("*.response.json"))
+    summary_text = (handle.path / "summary.md").read_text(encoding="utf-8")
+    assert "Repair turn: performed." in summary_text
+    assert "post-repair state has not been re-reviewed" in summary_text
 
 
 @pytest.mark.asyncio
@@ -329,6 +332,9 @@ async def test_code_002_all_reviewers_pass_skips_repair(
     workspace = WorkspaceRecord.model_validate_json((handle.path / "git/workspace.json").read_bytes())
     assert workspace.final_sha == workspace.review_sha
     assert (handle.path / "git/final.diff").read_bytes() == (handle.path / "git/initial.diff").read_bytes()
+    summary_text = (handle.path / "summary.md").read_text(encoding="utf-8")
+    assert "Repair turn: not performed" in summary_text
+    assert "Re-review: not applicable" in summary_text
 
 
 @pytest.mark.asyncio

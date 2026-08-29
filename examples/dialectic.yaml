@@ -1,0 +1,67 @@
+version: 1
+
+driver:
+  runtime: codex
+  model: ${CODEX_DRIVER_MODEL}
+  effort: high
+
+reviewers:
+  - id: driver-self-review
+    target: "@driver"
+    lens: general-correctness
+  - id: claude-correctness
+    runtime: claude-code
+    model: ${CLAUDE_REVIEW_MODEL}
+    lens: correctness-and-edge-cases
+  - id: grok-adversarial
+    runtime: grok-build
+    model: ${GROK_REVIEW_MODEL}
+    lens: adversarial-and-operational
+
+council:
+  participants:
+    - id: codex
+      runtime: codex
+      model: ${CODEX_COUNCIL_MODEL}
+    - id: claude
+      runtime: claude-code
+      model: ${CLAUDE_COUNCIL_MODEL}
+    - id: grok
+      runtime: grok-build
+      model: ${GROK_COUNCIL_MODEL}
+  moderator:
+    runtime: codex
+    model: ${CODEX_COUNCIL_MODEL}
+  consensus:
+    max_dissenters: 1
+
+limits:
+  max_reviewers: 5
+  max_findings_per_reviewer: 20
+  max_total_findings: 50
+  max_council_participants: 5
+  max_propositions: 8
+  max_config_bytes: 65536
+  max_input_bytes: 65536
+  max_diff_bytes: 262144
+  max_changed_paths: 1000
+  max_changed_regular_file_bytes: 8388608
+  max_candidate_change_bytes: 33554432
+  max_packet_bytes: 393216
+  max_lens_chars: 4096
+  max_model_field_chars: 32768
+  max_model_list_items: 100
+  max_agent_stdout_bytes: 8388608
+  max_agent_stderr_bytes: 2097152
+  max_turn_scratch_bytes: 67108864
+  max_turn_scratch_entries: 10000
+  max_turn_scratch_depth: 64
+  preflight_seconds: 30
+  capability_probe_seconds: 120
+  agent_turn_seconds: 300
+  code_run_seconds: 1200
+  council_run_seconds: 1200
+  graceful_kill_seconds: 5
+  turn_cleanup_seconds: 30
+  code_review_cycles: 1
+  council_discussion_rounds: 1

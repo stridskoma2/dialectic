@@ -365,6 +365,10 @@ class CodeOnceOrchestrator:
                 context.handle,
                 "COMPLETED_NO_FINDINGS",
                 artifact_paths=_code_artifact_paths(findings=False),
+                markdown_notes=[
+                    "Repair turn: not performed; reviewers returned no findings.",
+                    "Re-review: not applicable.",
+                ],
             )
 
         context.service.advance_phase(context.handle, "FEEDBACK")
@@ -471,7 +475,8 @@ class CodeOnceOrchestrator:
             unresolved_items=unresolved,
             artifact_paths=_code_artifact_paths(findings=True),
             markdown_notes=[
-                "The repaired code has not been re-reviewed.",
+                "Repair turn: performed.",
+                "Re-review: not performed; the post-repair state has not been re-reviewed.",
                 *(["Rebuttals:", *rebuttals] if rebuttals else []),
             ],
         )

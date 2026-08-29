@@ -1,22 +1,28 @@
-# Dialectic
+# Dialectic 0.1.0
 
-Dialectic is a bounded local supervisor for cross-model code review and council
-deliberation. This checkout implements the frozen MVP's **Slices 0 through 2**:
-the CLI/application boundary, strict contracts, durable run state, redaction,
-cross-platform supervision, the offline Code Once workflow, and versioned native
-Codex, Claude Code, and Grok Build adapters.
+Dialectic is a bounded local supervisor for two one-shot workflows:
 
-Code Once gives reviewers an immutable, diff-only packet and no controller-added
-repository or worktree path. That boundary does not rewrite user-authored task
-text or driver-authored product content, so a path already present in the bounded
-task or diff remains visible to reviewers.
+- **Code Once:** one Codex driver implementation, one concurrent immutable-diff
+  review, at most one repair turn, then stop without re-review.
+- **Council Once:** blind openings, one anonymized cross-examination, a fresh
+  moderator, complete ballots, controller-derived consensus, then stop.
 
-Requires Python 3.12 or newer.
+Dialectic is alpha software for trusted local use. It launches installed native
+AI CLIs with narrow, version-qualified policies, but it does not claim to confine
+a compromised CLI executable or provider implementation. On POSIX it owns the
+spawned session/process group; a malicious child that deliberately escapes with
+`setsid()` is outside that guarantee. Windows uses a kill-on-close Job Object.
 
-```powershell
+## Install
+
+Python 3.12 or newer and Git are required. From a source checkout:
+
+```bash
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[test]"
-.\.venv\Scripts\python.exe -m pytest -q
+# Linux
+.venv/bin/python -m pip install -e ".[test]"
+# Windows PowerShell
+.venv\Scripts\python.exe -m pip install -e ".[test]"
 ```
 
 Both installed entry points invoke the same application:
@@ -26,26 +32,128 @@ dial --help
 dialectic --help
 ```
 
-Run artifacts are private, sensitive, and retained beneath the platform user
-state directory in `dialectic/runs/<run-id>/`.
+For a release build, install `.[release]` and run `python -m build`. The package
+version, controller version, and artifact version are pinned to `0.1.0`, `0.1.0`,
+and `1` respectively.
 
-The current native fixtures recognize Codex CLI `0.150.0-alpha.12.2` and
-`0.151.0-alpha.7.1`, Claude Code `2.1.177`, and Grok Build `0.1.220`. Other
-versions fail preflight until their behavior is independently qualified. Native
-roles also require the corresponding installed CLI and authentication.
+## Native prerequisites
 
-Native release checks are opt-in and cost-bearing:
+Install and authenticate every CLI named by the selected workflow. The v0.1.0
+fixtures accept only these independently qualified versions:
 
-```powershell
-$env:DIALECTIC_LIVE = "1"
-$env:DIALECTIC_CODEX_MODEL = "<pinned-model>"
-$env:DIALECTIC_CLAUDE_MODEL = "<external-reviewer-model>" # or DIALECTIC_GROK_MODEL
-$env:OPENAI_API_KEY = "<trusted-cli-only credential>"
-.\.venv\Scripts\python.exe -m pytest -q -m live
+| Runtime | Executable | Accepted version |
+|---|---|---|
+| Codex | `codex` | `0.150.0-alpha.12.2`, `0.151.0-alpha.7.1` |
+| Claude Code | `claude` | `2.1.177` |
+| Grok Build | `grok` | `0.1.220` |
+
+Authentication may come from the native CLI's saved authentication or its
+fixture-declared credential environment (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+or `XAI_API_KEY`). Credentials are not accepted in Dialectic YAML. Unsupported
+versions and unverified permission shapes fail closed during preflight.
+
+## Configure and run
+
+Copy [examples/dialectic.yaml](examples/dialectic.yaml), set the referenced model
+environment variables, and remove unused targets if necessary. A present unused
+mode section must still be valid, but it is not resolved or launched.
+
+```bash
+# One coding/review/repair pass
+dial code --config dialectic.yaml --repo /path/to/repository --task-file task.md
+
+# One bounded council pass
+dial council --config dialectic.yaml --prompt-file prompt.md
+
+# Inspect any run
+dial status <run-id>
 ```
 
-They must be run separately on Windows and Linux for each release fixture. Fake
-or recorded transports prove adapter construction only; they do not establish
-native credential isolation or permission enforcement. Packet-only prompts omit
-controller-added repository paths, but Dialectic does not rewrite paths already
-present in user task text or driver-authored product content.
+Example inputs are in [examples/task.md](examples/task.md) and
+[examples/prompt.md](examples/prompt.md). Configuration, task, and prompt files
+must be scalar-value UTF-8 without a BOM. Limits are controller-enforced; the
+example uses the normative v0.1 defaults. Commands print concise persisted
+phase/status transitions and a final summary, not raw model event streams.
+
+## Runs, artifacts, and cleanup
+
+Every run is durably retained under the platform user-state directory:
+
+- Windows: `%LOCALAPPDATA%\dialectic\runs\<run-id>\`
+- Linux: `${XDG_STATE_HOME:-~/.local/state}/dialectic/runs/<run-id>/`
+
+`dial status <run-id>` prints the canonical absolute artifact directory. Artifacts
+include `run.json`, `events.jsonl`, redacted inputs, bounded turn evidence, and
+`summary.json`/`summary.md`. Code runs also record `git/workspace.json` and bounded
+diff/review evidence. Failed and cancelled runs are deliberately retained and are
+sensitive. Remove a terminal run directory manually only after confirming that no
+Dialectic process owns it; the MVP has no run-cleanup command.
+
+Code Once leaves its isolated worktree and `dialectic/<run-id>` branch in place.
+The original checked-out files, index, checked-out branch, `HEAD`, pre-existing
+branches, and `main` remain unchanged. Creating the linked worktree intentionally
+adds shared Git worktree metadata, a Dialectic branch, commits, and objects. The
+terminal prints the recorded path and branch. After inspection, run these commands
+from the original repository, substituting the recorded values:
+
+```bash
+git worktree remove <recorded-isolated-worktree-path>
+git branch -D dialectic/<run-id>
+git worktree prune
+```
+
+Cleanup is never automatic.
+
+## Security, cost, and operational boundaries
+
+- Model output is data and is never executed by the controller as a shell command.
+  Native commands use executable/argument arrays; prompts travel over stdin or ACP.
+- Codex is the only writable driver. Reviewers, council participants, and the
+  moderator receive packet-only neutral directories.
+- The controller does not inject a repository/worktree path into packet-only
+  prompts, argv, environment overrides, or packet artifacts. A bounded user task
+  or driver-authored product diff may itself contain such a path; Dialectic neither
+  discovers nor rewrites paths already authored in that content.
+- A fresh linked worktree does not contain ignored local artifacts such as `.venv`,
+  `node_modules`, build caches, generated output, or `.env`. Driver prompts say not
+  to repair the environment or create build output. Target-project test/build gates
+  are not a deterministic v0.1 controller feature.
+- Native calls may consume paid quota. Dialectic has no cost estimator or retry,
+  fallback, or format-repair loop. A required target failure stops the run while
+  retaining partial evidence, so provider charges can occur without finalization.
+- Keep task, prompt, repository, and native configuration content trusted. Known
+  injected credential values are redacted, but Dialectic does not discover arbitrary
+  secrets already present in user or repository content.
+
+## Verification and release evidence
+
+The mandatory suite is offline and uses no provider credentials:
+
+```bash
+pytest -q
+pytest -q -m integration
+```
+
+CI runs both commands on Windows and Linux. Native release evidence is manual,
+cost-bearing, and must be invoked separately on each applicable platform:
+
+```bash
+export DIALECTIC_LIVE=1
+export DIALECTIC_CODEX_MODEL='<pinned-model>'
+export DIALECTIC_CLAUDE_MODEL='<pinned-model>'
+export DIALECTIC_GROK_MODEL='<pinned-model>'
+pytest -q -m live
+```
+
+PowerShell uses `$env:NAME = 'value'`. The Code smoke requires Codex plus an
+external reviewer. The Council smoke uses two or three available configured CLIs
+and does not require agreement. Recorded/fake fixtures prove construction only;
+they are not native permission or credential-isolation evidence.
+
+## MVP limitations
+
+There are no continuous loops, second review, extra council round, provider retry,
+API transport, MCP server, daemon, background ownership, or crash resumption. Code
+Once does not support submodules, Git LFS, sparse checkout, active clean/smudge
+filters, binary changes, invalid-UTF-8 diffs, symlink additions, or multiply linked
+changed files. macOS may work but is not a v0.1.0 release platform.

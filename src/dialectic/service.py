@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,7 +25,7 @@ from .redaction import (
     RedactionError,
     redact_config,
 )
-from .schemas import DialecticConfig, EventRecord, RunRecord, SummaryRecord
+from .schemas import DialecticConfig, EventRecord, RunRecord, SummaryRecord, WorkspaceRecord
 from .store import RunHandle, RunStore
 
 
@@ -33,6 +34,9 @@ class RunExecutor(Protocol):
 
 
 CredentialProvider = Callable[[DialecticConfig, RunMode], KnownCredentials]
+ProgressObserver = Callable[[RunRecord], None]
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +77,11 @@ class DialecticService:
             "code": code_executor,
             "council": council_executor,
         }
+        self._progress_observer: ProgressObserver | None = None
+
+    def set_progress_observer(self, observer: ProgressObserver | None) -> None:
+        """Set the non-authoritative presentation observer for durable transitions."""
+        self._progress_observer = observer
 
     def create_run(self, mode: RunMode) -> RunHandle:
         return self.store.bootstrap_run(mode)
@@ -373,6 +382,10 @@ class DialecticService:
             artifact_paths={"run": "run.json"},
         )
 
+    def get_workspace(self, run_id: str) -> WorkspaceRecord | None:
+        self.get_run(run_id)
+        return self.store.read_workspace(run_id)
+
     def run_artifact_directory(self, run_id: str) -> Path:
         self.get_run(run_id)
         return (self.store.runs_root / run_id).resolve(strict=True)
@@ -399,6 +412,13 @@ class DialecticService:
                 payload=payload,
             ),
         )
+        observer = self._progress_observer
+        if observer is not None:
+            try:
+                observer(record)
+            except Exception:
+                # Terminal rendering is deliberately outside workflow authority.
+                _LOGGER.warning("progress observer failed", exc_info=True)
 
     def _persist_terminal_summary(
         self,
