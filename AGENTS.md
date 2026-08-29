@@ -12,8 +12,8 @@ round, fresh moderator, ballots, controller-derived consensus, stop).
 
 ## The specification is the source of truth
 
-`GptPro/DIALECTIC_MVP_IMPLEMENTATION_AND_TEST_SPEC_V0.5.3.md` — **frozen MVP
-implementation baseline**, 1958 lines.
+`GptPro/DIALECTIC_MVP_IMPLEMENTATION_AND_TEST_SPEC_V0.5.4.md` — **frozen MVP
+implementation baseline**, 2026 lines.
 
 Read the relevant section before implementing against it. It went through five
 review rounds with two independent reviewers and its clauses are load-bearing:
@@ -21,7 +21,7 @@ bounds, orderings, and failure kinds are deliberate, not incidental. When code a
 spec disagree, the spec wins. When the spec is genuinely ambiguous, say so and ask —
 do not resolve it silently.
 
-Earlier revisions (V0.1–V0.5.2) and all `*_REVIEW-*.md` files are history. Consult
+Earlier revisions (V0.1–V0.5.3) and all `*_REVIEW-*.md` files are history. Consult
 them only to understand *why* a clause exists; never implement from them.
 
 ## Settled decisions — do not reopen
@@ -70,9 +70,11 @@ current form. Do not "simplify" them back:
 
 **30 core + 46 Code Once + 32 Council Once.** Strengthen existing rows; do not add
 IDs. Frozen means the IDs and counts are fixed — it does **not** preserve obsolete
-expectations. Spec §11 requires a semantic audit of the corrected rows (CORE-017,
-CORE-027, CORE-028, CORE-030, CODE-001, CODE-040, COUNCIL-001) and a freeze-check
-failure if a stale expectation survives even while the count still reads 108.
+expectations. Spec §11 requires a semantic audit of the corrected rows (CORE-015,
+CORE-017, CORE-019, CORE-027, CORE-028, CORE-030, CODE-001, CODE-040, COUNCIL-001,
+COUNCIL-011, COUNCIL-012, COUNCIL-013, COUNCIL-014, COUNCIL-024, COUNCIL-027) and a
+freeze-check failure if a stale expectation survives even while the count still
+reads 108.
 
 ## Verification
 
