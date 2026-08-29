@@ -223,6 +223,11 @@ class NativeAdapterBase:
             raise NativePreflightError("versioned adapter fixture is unavailable before preflight")
         return self._fixture
 
+    @property
+    def process_local_continuation(self) -> bool:
+        """Whether the verified fixture permits a process-local session lease."""
+        return self.fixture.process_local_continuation
+
     async def preflight(self, target: AgentTarget) -> PreflightResult:
         if target != self.target:
             raise NativePreflightError("native adapter target mismatch")

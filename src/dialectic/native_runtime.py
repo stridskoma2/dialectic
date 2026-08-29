@@ -1,4 +1,4 @@
-"""Native Slice 2 composition for Code Once."""
+"""Native Slice 2 adapter composition for both bounded workflows."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 from .adapters import AgentAdapter, AgentRegistry
 from .code_once import CodeOnceOrchestrator
+from .council_once import CouncilOnceOrchestrator
 from .grok_acp import GrokAdapter
 from .native_adapters import ClaudeAdapter, CodexAdapter, ProbeProvider
 from .redaction import KnownCredentials
@@ -83,6 +84,32 @@ class NativeCodeExecutor:
             "grok-build": GrokAdapter,
         }[target.runtime]
         return adapter_type(target, **common)  # type: ignore[arg-type,return-value]
+
+
+class NativeCouncilExecutor(NativeCodeExecutor):
+    """Construct one isolated native adapter per Council execution context."""
+
+    async def __call__(self, context: ExecutionContext):  # type: ignore[no-untyped-def]
+        participants, moderator = AgentRegistry.council_targets(context.config)
+        participant_adapters = {
+            participant_id: self._adapter(
+                target,
+                role="participant",
+                access_mode="packet-only",
+                context=context,
+            )
+            for participant_id, target in participants
+        }
+        moderator_adapter = self._adapter(
+            moderator,
+            role="moderator",
+            access_mode="packet-only",
+            context=context,
+        )
+        return await CouncilOnceOrchestrator(
+            participant_adapters=participant_adapters,
+            moderator_adapter=moderator_adapter,
+        )(context)
 
 
 def native_credentials(

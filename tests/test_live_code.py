@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 import yaml
 
-from dialectic.code_once import _concrete_profile
+from dialectic.workflow_evidence import concrete_profile
 from dialectic.native_adapters import CodexAdapter, _canonical_hash, recorded_probe_provider
 from dialectic.native_runtime import NativeCodeExecutor, native_credentials
 from dialectic.redaction import KnownCredentials
@@ -105,7 +105,7 @@ async def _bound_live_codex(tmp_path: Path) -> tuple[CodexAdapter, Path, TurnWor
         "turn_scratch_control": scratch.control,
         "turn_scratch_tmp": scratch.temporary,
     }
-    concrete = _concrete_profile(adapter.preflight_material().fixture, dynamic_paths)
+    concrete = concrete_profile(adapter.preflight_material().fixture, dynamic_paths)
     binding = CapabilityBindingArtifact.model_construct(
         artifact_schema_version=1,
         tool_version="0.1.0",

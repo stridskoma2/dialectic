@@ -168,7 +168,11 @@ class CouncilSpec(ClosedModel):
         if len(ids) != len(set(ids)):
             raise ValueError("council participant ids must be unique")
         if self.consensus.max_dissenters >= len(self.participants):
-            raise ValueError("consensus.max_dissenters must be less than participant count")
+            raise ValueError(
+                "consensus.max_dissenters "
+                f"({self.consensus.max_dissenters}) must be less than participant count "
+                f"({len(self.participants)})"
+            )
         return self
 
 

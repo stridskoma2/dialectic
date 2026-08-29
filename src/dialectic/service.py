@@ -246,14 +246,22 @@ class DialecticService:
             markdown_notes=markdown_notes,
         )
 
-    def finalize_council(self, handle: RunHandle, outcome: ConsensusOutcome) -> RunRecord:
+    def finalize_council(
+        self,
+        handle: RunHandle,
+        outcome: ConsensusOutcome,
+        *,
+        unresolved_items: Sequence[str] = (),
+        artifact_paths: dict[str, str] | None = None,
+        markdown_notes: Sequence[str] = (),
+    ) -> RunRecord:
         return self._finalize(
             handle,
             code_outcome=None,
             consensus_outcome=outcome,
-            unresolved_items=(),
-            artifact_paths=None,
-            markdown_notes=(),
+            unresolved_items=unresolved_items,
+            artifact_paths=artifact_paths,
+            markdown_notes=markdown_notes,
         )
 
     def _finalize(

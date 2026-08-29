@@ -626,6 +626,18 @@ def _closed_evidence(
 ) -> NativeInvocationEvidence:
     cleanup_failed = not epoch.cleanup_confirmed
     output_limit = epoch.stdout.result.truncated or epoch.stderr.result.truncated
+    if cleanup_failed:
+        end_reason = "cleanup-failed"
+    elif output_limit:
+        end_reason = "output-limit"
+    elif reason == "completed":
+        end_reason = "response-returned"
+    else:
+        end_reason = {
+            "phase-failure": "peer-failure",
+            "workflow-timeout": "timeout",
+            "cancelled": "cancelled",
+        }[reason]
     return NativeInvocationEvidence(
         started_at=pending.started_at,
         response_completed_at=pending.response_completed_at,
@@ -636,13 +648,7 @@ def _closed_evidence(
         else "per-turn",
         process_unit_id=lease.process_unit_id,
         process_exit_code=epoch.process_exit_code,
-        attempt_end_reason=(
-            "cleanup-failed"
-            if cleanup_failed
-            else "output-limit"
-            if output_limit
-            else "response-returned"
-        ),
+        attempt_end_reason=end_reason,
         failure_kind=(
             "PROCESS_CLEANUP_FAILED"
             if cleanup_failed
