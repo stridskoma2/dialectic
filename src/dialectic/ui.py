@@ -1,4 +1,4 @@
-"""Local browser UI ingress for the bounded Dialectic workflows."""
+"""Local UI ingress for the bounded Dialectic workflows."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import asyncio
 import json
 import os
 import secrets
+import shutil
+import subprocess
 import threading
 import time
 import webbrowser
@@ -24,6 +26,49 @@ from .ui_config import RuntimeName, UiAgentChoice, UiRunConfig, build_config_byt
 
 _MAX_REQUEST_BYTES = 262_144
 _IDLE_SHUTDOWN_SECONDS = 30 * 60
+
+_MODEL_CATALOG: dict[RuntimeName, tuple[tuple[str, str, str], ...]] = {
+    "codex": (
+        ("gpt-5.6-sol", "GPT-5.6 Sol", "Flagship capability for complex work"),
+        ("gpt-5.6-terra", "GPT-5.6 Terra", "Balanced capability and cost"),
+        ("gpt-5.6-luna", "GPT-5.6 Luna", "Fast, economical high-volume work"),
+    ),
+    "claude-code": (
+        ("claude-opus-5", "Claude Opus 5", "Deep reasoning and agentic coding"),
+        ("claude-sonnet-5", "Claude Sonnet 5", "Balanced speed and intelligence"),
+        ("claude-fable-5", "Claude Fable 5", "Long-running agent work"),
+        ("claude-haiku-4-5", "Claude Haiku 4.5", "Fastest Claude option"),
+    ),
+    "grok-build": (
+        ("grok-4.6", "Grok 4.6", "Current Grok Build default"),
+        ("grok-build-0.1", "Grok Build 0.1", "Coding-focused model"),
+    ),
+}
+
+_MODEL_ENVIRONMENT: dict[RuntimeName, tuple[str, ...]] = {
+    "codex": (
+        "CODEX_DRIVER_MODEL",
+        "CODEX_REVIEW_MODEL",
+        "CODEX_COUNCIL_MODEL",
+        "DIALECTIC_CODEX_MODEL",
+    ),
+    "claude-code": (
+        "CLAUDE_REVIEW_MODEL",
+        "CLAUDE_COUNCIL_MODEL",
+        "DIALECTIC_CLAUDE_MODEL",
+    ),
+    "grok-build": (
+        "GROK_REVIEW_MODEL",
+        "GROK_COUNCIL_MODEL",
+        "DIALECTIC_GROK_MODEL",
+    ),
+}
+
+_RUNTIME_EXECUTABLES: dict[RuntimeName, str] = {
+    "codex": "codex",
+    "claude-code": "claude",
+    "grok-build": "grok",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,29 +446,54 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
 
 def _model_options() -> dict[str, object]:
-    names = {
-        "codex": (
-            "CODEX_DRIVER_MODEL",
-            "CODEX_REVIEW_MODEL",
-            "CODEX_COUNCIL_MODEL",
-            "DIALECTIC_CODEX_MODEL",
-        ),
-        "claude-code": (
-            "CLAUDE_REVIEW_MODEL",
-            "CLAUDE_COUNCIL_MODEL",
-            "DIALECTIC_CLAUDE_MODEL",
-        ),
-        "grok-build": (
-            "GROK_REVIEW_MODEL",
-            "GROK_COUNCIL_MODEL",
-            "DIALECTIC_GROK_MODEL",
-        ),
+    models: dict[RuntimeName, list[dict[str, str]]] = {}
+    for runtime, catalog in _MODEL_CATALOG.items():
+        catalog_by_id = {
+            model_id: {
+                "id": model_id,
+                "name": name,
+                "description": description,
+                "source": "catalog",
+            }
+            for model_id, name, description in catalog
+        }
+        choices: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for environment_name in _MODEL_ENVIRONMENT[runtime]:
+            selector = os.environ.get(environment_name, "").strip()
+            if not selector or selector in seen:
+                continue
+            configured = dict(
+                catalog_by_id.get(
+                    selector,
+                    {
+                        "id": selector,
+                        "name": f"Configured model ({selector})",
+                        "description": "Provided by the local environment",
+                        "source": "environment",
+                    },
+                )
+            )
+            configured["source"] = "environment"
+            choices.append(configured)
+            seen.add(selector)
+        for model_id, choice in catalog_by_id.items():
+            if model_id not in seen:
+                choices.append(choice)
+        models[runtime] = choices
+
+    runtimes = {
+        runtime: {
+            "installed": shutil.which(executable) is not None,
+            "executable": executable,
+        }
+        for runtime, executable in _RUNTIME_EXECUTABLES.items()
     }
-    models = {
-        runtime: list(dict.fromkeys(os.environ[name] for name in variables if os.environ.get(name)))
-        for runtime, variables in names.items()
+    return {
+        "models": models,
+        "runtimes": runtimes,
+        "browseSupported": os.name == "nt",
     }
-    return {"models": models, "browseSupported": os.name == "nt"}
 
 
 def _choose_repository() -> str:
@@ -466,6 +536,57 @@ def _ui_html() -> bytes:
     return files("dialectic").joinpath("ui.html").read_bytes()
 
 
+def _find_windows_app_browser() -> Path | None:
+    for executable_name in ("msedge.exe", "chrome.exe"):
+        discovered = shutil.which(executable_name)
+        if discovered:
+            return Path(discovered)
+
+    locations = (
+        ("ProgramFiles(x86)", "Microsoft/Edge/Application/msedge.exe"),
+        ("ProgramFiles", "Microsoft/Edge/Application/msedge.exe"),
+        ("LOCALAPPDATA", "Microsoft/Edge/Application/msedge.exe"),
+        ("ProgramFiles", "Google/Chrome/Application/chrome.exe"),
+        ("ProgramFiles(x86)", "Google/Chrome/Application/chrome.exe"),
+        ("LOCALAPPDATA", "Google/Chrome/Application/chrome.exe"),
+    )
+    for environment_name, relative_path in locations:
+        base = os.environ.get(environment_name)
+        if base:
+            candidate = Path(base, *relative_path.split("/"))
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def _launch_chromium_app(executable: Path, url: str) -> bool:
+    try:
+        subprocess.Popen(
+            [
+                os.fspath(executable),
+                "--new-window",
+                f"--app={url}",
+                "--no-first-run",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError:
+        return False
+    return True
+
+
+def _open_ui(url: str) -> bool:
+    if os.name == "nt":
+        executable = _find_windows_app_browser()
+        if executable is not None and _launch_chromium_app(executable, url):
+            return True
+    return webbrowser.open(url)
+
+
 def _idle_monitor(server: _UiServer) -> None:
     while True:
         time.sleep(30)
@@ -481,7 +602,7 @@ def main() -> None:
     server = _UiServer(("127.0.0.1", 0), token, state)
     threading.Thread(target=_idle_monitor, args=(server,), daemon=True).start()
     url = f"{server.origin}/?token={token}"
-    if not webbrowser.open(url):
+    if not _open_ui(url):
         print(f"Open {url}")
     try:
         server.serve_forever(poll_interval=0.25)

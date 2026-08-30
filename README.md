@@ -33,15 +33,19 @@ dialectic --help
 ```
 
 For the fast local interface, double-click `Launch Dialectic UI.cmd` on Windows
-or run `dialectic-ui` on either release platform. It opens a localhost-only page
-in your browser and calls
+or run `dialectic-ui` on either release platform. On Windows it opens the
+localhost-only interface in a dedicated Edge or Chrome app window without tabs
+or an address bar, falling back to the default browser only when neither is
+available. It calls
 `DialecticService` directly; it does not shell out to the command-line interface.
 It provides Code/Council mode selection, an implementation or deliberation prompt,
-a repository browser for Code Once, main-model and effort selection, one to five
-reviewers or two to five council participants, reviewer focus, consensus tolerance,
-live phase/status, and direct access to final summaries, artifacts, and isolated
-worktrees. Council Once remains prompt-only, so a repository selected for Code Once
-is visibly disabled and is not disclosed to council participants.
+a repository browser for Code Once, friendly model dropdowns with installed-CLI
+status, effort selection, one to five reviewers or two to five council participants,
+reviewer focus, consensus tolerance, live phase/status, and direct access to final
+summaries, artifacts, and isolated worktrees. The catalog includes locally configured
+selectors, while authentication and account-specific model access remain verified by
+native preflight. Council Once remains prompt-only, so a repository selected for Code
+Once is visibly disabled and is not disclosed to council participants.
 
 For a release build, install `.[release]` and run `python -m build`. The package
 version, controller version, and artifact version are pinned to `0.1.0`, `0.1.0`,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import http.cookiejar
+import os
+import subprocess
 import threading
 import urllib.error
 import urllib.request
@@ -9,7 +11,14 @@ from pathlib import Path
 import pytest
 
 from dialectic.config import ConfigLoader
-from dialectic.ui import _UiServer, _UiState, _prepare_run, _ui_html
+from dialectic.ui import (
+    _UiServer,
+    _UiState,
+    _launch_chromium_app,
+    _model_options,
+    _prepare_run,
+    _ui_html,
+)
 
 
 def test_desktop_ui_contains_the_primary_workflow_controls() -> None:
@@ -20,12 +29,81 @@ def test_desktop_ui_contains_the_primary_workflow_controls() -> None:
         "Repository",
         "Browse",
         "Main model",
+        "mainModel",
         "Review models",
         "Council participants",
         "Allowed dissenters",
         "Run Code Once",
     )
     assert all(item in html for item in required)
+    assert "Model ID" not in html
+
+
+def test_desktop_model_options_use_friendly_names_and_report_installed_clis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODEX_DRIVER_MODEL", "organization-codex-model")
+    monkeypatch.setattr(
+        "dialectic.ui.shutil.which",
+        lambda name: f"C:/bin/{name}.exe" if name in {"codex", "claude"} else None,
+    )
+
+    options = _model_options()
+
+    assert options["models"]["codex"][:2] == [
+        {
+            "id": "organization-codex-model",
+            "name": "Configured model (organization-codex-model)",
+            "description": "Provided by the local environment",
+            "source": "environment",
+        },
+        {
+            "id": "gpt-5.6-sol",
+            "name": "GPT-5.6 Sol",
+            "description": "Flagship capability for complex work",
+            "source": "catalog",
+        },
+    ]
+    assert options["models"]["claude-code"][0]["name"] == "Claude Opus 5"
+    assert options["models"]["grok-build"][0]["name"] == "Grok 4.6"
+    assert options["runtimes"] == {
+        "codex": {"installed": True, "executable": "codex"},
+        "claude-code": {"installed": True, "executable": "claude"},
+        "grok-build": {"installed": False, "executable": "grok"},
+    }
+
+
+def test_desktop_ui_launches_chromium_in_a_dedicated_app_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_popen(argv: list[str], **kwargs: object) -> object:
+        calls.append((argv, kwargs))
+        return object()
+
+    monkeypatch.setattr("dialectic.ui.subprocess.Popen", fake_popen)
+    url = "http://127.0.0.1:12345/?token=test"
+    executable = Path("browser-executable")
+
+    assert _launch_chromium_app(executable, url)
+    assert calls == [
+        (
+            [
+                os.fspath(executable),
+                "--new-window",
+                f"--app={url}",
+                "--no-first-run",
+            ],
+            {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+                "close_fds": True,
+                "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            },
+        )
+    ]
 
 
 def test_desktop_run_request_uses_the_selected_repository(tmp_path: Path) -> None:
