@@ -19,6 +19,7 @@ def test_release_metadata_and_entry_points_are_versioned() -> None:
     assert project["scripts"] == {
         "dial": "dialectic.cli:main",
         "dialectic": "dialectic.cli:main",
+        "dialectic-ui": "dialectic.ui:main",
     }
 
 

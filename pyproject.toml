@@ -39,6 +39,7 @@ release = [
 [project.scripts]
 dial = "dialectic.cli:main"
 dialectic = "dialectic.cli:main"
+dialectic-ui = "dialectic.ui:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dialectic"]

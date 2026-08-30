@@ -25,12 +25,23 @@ python -m venv .venv
 .venv\Scripts\python.exe -m pip install -e ".[test]"
 ```
 
-Both installed entry points invoke the same application:
+Both installed command-line entry points invoke the same application:
 
 ```text
 dial --help
 dialectic --help
 ```
+
+For the fast local interface, double-click `Launch Dialectic UI.cmd` on Windows
+or run `dialectic-ui` on either release platform. It opens a localhost-only page
+in your browser and calls
+`DialecticService` directly; it does not shell out to the command-line interface.
+It provides Code/Council mode selection, an implementation or deliberation prompt,
+a repository browser for Code Once, main-model and effort selection, one to five
+reviewers or two to five council participants, reviewer focus, consensus tolerance,
+live phase/status, and direct access to final summaries, artifacts, and isolated
+worktrees. Council Once remains prompt-only, so a repository selected for Code Once
+is visibly disabled and is not disclosed to council participants.
 
 For a release build, install `.[release]` and run `python -m build`. The package
 version, controller version, and artifact version are pinned to `0.1.0`, `0.1.0`,
