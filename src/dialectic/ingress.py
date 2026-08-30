@@ -40,6 +40,12 @@ def acquire_named_file(
 
 
 def _acquire_posix(path: Path, label: str, ceiling: int) -> bytes:
+    # Some kernels reject opening socket paths before fstat can classify them.
+    # This check provides the required bounded diagnostic; the opened handle and
+    # its before/after metadata remain authoritative against replacement races.
+    selected = path.lstat()
+    if not stat.S_ISREG(selected.st_mode):
+        raise InputAcquisitionError(f"{label} must be a regular file")
     flags = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW

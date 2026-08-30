@@ -9,7 +9,7 @@ import json
 import os
 import socket
 import subprocess
-import sys
+import sysconfig
 import threading
 import time
 from datetime import UTC, datetime
@@ -89,6 +89,7 @@ from dialectic.schemas import (
     StreamCaptureResult,
     TargetPreflightArtifact,
     TurnAttemptArtifact,
+    WorkspaceRecord,
 )
 from dialectic.scratch import (
     ScratchCleanupTimeout,
@@ -248,7 +249,9 @@ async def test_core_007_timeout_reaps_owned_descendant_before_sentinel() -> None
 
 
 @pytest.mark.asyncio
-async def test_core_008_cancellation_reaps_concurrent_units() -> None:
+async def test_core_008_cancellation_reaps_concurrent_units(
+    tmp_path: Path, config_data: dict[str, object]
+) -> None:
     sentinel: list[str] = []
     units = [
         FakeProcessUnit(
@@ -273,6 +276,35 @@ async def test_core_008_cancellation_reaps_concurrent_units() -> None:
     assert {result.termination_reason for result in results} == {"cancelled"}
     assert all(unit.forced for unit in units)
     assert sentinel == []
+
+    model_work_started = asyncio.Event()
+
+    async def cancellable_executor(_context):  # type: ignore[no-untyped-def]
+        model_work_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("cancelled executor resumed")
+
+    store = RunStore(
+        tmp_path / "cancelled-state",
+        run_id_factory=lambda: "20260828T010008Z-aaaaaaaaaa",
+    )
+    service = DialecticService(store, code_executor=cancellable_executor)
+    handle = service.create_run("code")
+    execution = asyncio.create_task(
+        service.execute_code_once(
+            handle,
+            config_bytes=yaml.safe_dump(config_data).encode("utf-8"),
+            task_bytes=b"cancel this run",
+            repository_path=tmp_path,
+        )
+    )
+    await model_work_started.wait()
+    execution.cancel()
+    cancelled = await execution
+    assert cancelled.status == "CANCELLED"
+    assert exit_code_for(cancelled.status, cancelled.failure_kind) == 130
+    assert service.get_result(handle.run_id).status == "CANCELLED"
+    assert b'"event_type":"run-cancelled"' in (handle.path / "events.jsonl").read_bytes()
 
 
 @pytest.mark.asyncio
@@ -349,6 +381,9 @@ def test_core_011_dial_and_dialectic_are_equivalent(
                 ],
                 prog_name=executable_name,
             )
+            if case_index == 1:
+                assert "PREFLIGHT  RUNNING" in result.output
+                assert "PREFLIGHT  FAILED" in result.output
             record = store.read_run(run_id)
             tree = sorted(
                 str(path.relative_to(state / "runs" / record.run_id))
@@ -357,7 +392,7 @@ def test_core_011_dial_and_dialectic_are_equivalent(
             outcomes.append((result.exit_code, tree, record.status, record.failure_kind))
         assert outcomes[0] == outcomes[1]
 
-    scripts_directory = Path(sys.executable).parent
+    scripts_directory = Path(sysconfig.get_path("scripts"))
     suffix = ".exe" if os.name == "nt" else ""
     help_results = [
         subprocess.run(
@@ -802,12 +837,40 @@ def test_core_022_status_displays_running_finalized_and_failed(tmp_path: Path) -
             service.start_run(handle, phase="PREFLIGHT")
         elif terminal == "FINALIZED":
             service.start_run(handle, phase="PREFLIGHT")
+            store.write_artifact(
+                handle,
+                "git/workspace.json",
+                WorkspaceRecord(
+                    **controller_fields(),
+                    repo_common_dir=str(tmp_path / "repo" / ".git"),
+                    repo_filesystem_identity="volume:file",
+                    repo_lock_identity_sha256="a" * 64,
+                    original_worktree=str(tmp_path / "repo"),
+                    original_branch="main",
+                    base_sha="b" * 40,
+                    dialectic_branch=f"dialectic/{run_id}",
+                    dialectic_worktree=str(tmp_path / "isolated"),
+                    review_sha="c" * 40,
+                    final_sha="c" * 40,
+                    initial_diff_sha256="d" * 64,
+                    repair_delta_sha256=None,
+                    final_diff_sha256="d" * 64,
+                ),
+            )
             service.finalize_code(handle, "COMPLETED_NO_FINDINGS")
         else:
             service.fail_run(handle, "PREFLIGHT_FAILED", "expected")
         result = runner.invoke(create_app(lambda service=service: service), ["status", run_id])
         assert result.exit_code == 0
         assert str(service.run_artifact_directory(run_id)) in result.output
+        if terminal == "FINALIZED":
+            assert str(tmp_path / "isolated") in result.output
+            assert f"dialectic/{run_id}" in result.output
+            assert "checked-out files, index, branch, HEAD" in result.output
+            assert "shared Git metadata and objects added" in result.output
+            assert "git worktree remove" in result.output
+            assert "git branch -D" in result.output
+            assert "git worktree prune" in result.output
         observed.append(service.get_run(run_id).status)
     assert observed == ["RUNNING", "FINALIZED", "FAILED"]
 
@@ -1828,9 +1891,8 @@ def test_core_030_capability_evidence_and_binding_barriers_are_fail_closed(
     barrier.add("reviewer", packet_binding)
     assert len(barrier.authorize_launch()) == 2
 
-    scratch_control.rmdir()
-    scratch_tmp.rmdir()
-    scratch_root.rmdir()
+    displaced_scratch = tmp_path / ".dialectic-turn-displaced"
+    scratch_root.rename(displaced_scratch)
     scratch_control.mkdir(parents=True)
     scratch_tmp.mkdir()
     with pytest.raises(CapabilityEvidenceError, match="identity changed"):

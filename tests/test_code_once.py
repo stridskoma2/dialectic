@@ -5,8 +5,8 @@ import copy
 import hashlib
 import json
 import os
-import socket
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Callable
@@ -314,6 +314,9 @@ async def test_code_001_happy_path_two_reviewers_return_findings(
         "per-turn",
     )
     assert not list(handle.path.rglob("*.response.json"))
+    summary_text = (handle.path / "summary.md").read_text(encoding="utf-8")
+    assert "Repair turn: performed." in summary_text
+    assert "post-repair state has not been re-reviewed" in summary_text
 
 
 @pytest.mark.asyncio
@@ -329,6 +332,9 @@ async def test_code_002_all_reviewers_pass_skips_repair(
     workspace = WorkspaceRecord.model_validate_json((handle.path / "git/workspace.json").read_bytes())
     assert workspace.final_sha == workspace.review_sha
     assert (handle.path / "git/final.diff").read_bytes() == (handle.path / "git/initial.diff").read_bytes()
+    summary_text = (handle.path / "summary.md").read_text(encoding="utf-8")
+    assert "Repair turn: not performed" in summary_text
+    assert "Re-review: not applicable" in summary_text
 
 
 @pytest.mark.asyncio
@@ -1460,8 +1466,20 @@ async def test_code_044_reserved_workspace_attacks_fail_closed_before_git(
         elif variant == "fifo":
             os.mkfifo(temporary / "hostile.fifo")
         elif variant == "socket":
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as unix_socket:
-                unix_socket.bind(str(temporary / "hostile.socket"))
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import socket; value = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); "
+                    "value.bind('hostile.socket'); value.close()",
+                ],
+                cwd=temporary,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            assert result.returncode == 0, result.stderr.decode(errors="replace")
         elif variant == "posix-rename-race":
             race = temporary / "race"
             race.mkdir()

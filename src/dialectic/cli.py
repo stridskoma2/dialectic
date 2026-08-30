@@ -12,6 +12,7 @@ from rich.console import Console
 from .contracts import exit_code_for
 from .ingress import InputAcquisitionError, acquire_named_file
 from .runtime import build_service
+from .schemas import RunRecord, WorkspaceRecord
 from .service import DialecticService
 from .store import BootstrapError, InvalidRunIdError, RunNotFoundError, StateCorruptError
 
@@ -29,6 +30,7 @@ def create_app(service_factory: ServiceFactory = build_service) -> typer.Typer:
         task_file: Path = typer.Option(..., "--task-file", dir_okay=False),
     ) -> None:
         service = service_factory()
+        service.set_progress_observer(lambda record: _print_progress(console, record))
         try:
             handle = service.create_run("code")
         except BootstrapError as exc:
@@ -49,7 +51,12 @@ def create_app(service_factory: ServiceFactory = build_service) -> typer.Typer:
                 repository_path=repo,
             )
         )
-        _print_record(console, record, service.run_artifact_directory(record.run_id))
+        _print_record(
+            console,
+            record,
+            service.run_artifact_directory(record.run_id),
+            workspace=service.get_workspace(record.run_id),
+        )
         raise typer.Exit(exit_code_for(record.status, record.failure_kind))
 
     @app.command()
@@ -58,6 +65,7 @@ def create_app(service_factory: ServiceFactory = build_service) -> typer.Typer:
         prompt_file: Path = typer.Option(..., "--prompt-file", dir_okay=False),
     ) -> None:
         service = service_factory()
+        service.set_progress_observer(lambda record: _print_progress(console, record))
         try:
             handle = service.create_run("council")
         except BootstrapError as exc:
@@ -86,13 +94,19 @@ def create_app(service_factory: ServiceFactory = build_service) -> typer.Typer:
         try:
             record = service.get_run(run_id)
             artifact_dir = service.run_artifact_directory(run_id)
+            workspace = service.get_workspace(run_id)
         except (InvalidRunIdError, RunNotFoundError) as exc:
             console.print(str(exc))
             raise typer.Exit(2) from exc
         except StateCorruptError as exc:
             console.print(str(exc))
             raise typer.Exit(3) from exc
-        _print_record(console, record, artifact_dir)
+        _print_record(
+            console,
+            record,
+            artifact_dir,
+            workspace=workspace,
+        )
 
     return app
 
@@ -104,15 +118,36 @@ def main() -> None:
     app()
 
 
-def _print_record(console: Console, record: object, artifact_dir: Path) -> None:
-    status = getattr(record, "status")
-    run_id = getattr(record, "run_id")
-    console.print(f"{run_id}  {status}")
-    failure_kind = getattr(record, "failure_kind")
-    failure_detail = getattr(record, "failure_detail")
-    if failure_kind is not None:
-        console.print(f"failure: {failure_kind}: {failure_detail}")
+def _print_progress(console: Console, record: RunRecord) -> None:
+    console.print(f"{record.run_id}  {record.phase or '-'}  {record.status}")
+
+
+def _print_record(
+    console: Console,
+    record: RunRecord,
+    artifact_dir: Path,
+    *,
+    workspace: WorkspaceRecord | None = None,
+) -> None:
+    console.print(f"{record.run_id}  {record.status}")
+    if record.failure_kind is not None:
+        console.print(f"failure: {record.failure_kind}: {record.failure_detail}")
     console.print(f"artifacts: {artifact_dir}", soft_wrap=True)
+    if workspace is not None and workspace.dialectic_worktree is not None:
+        console.print(f"isolated worktree: {workspace.dialectic_worktree}", soft_wrap=True)
+        console.print(f"branch: {workspace.dialectic_branch}")
+        console.print(
+            "original repository unchanged: checked-out files, index, branch, HEAD, "
+            "pre-existing branches, and main"
+        )
+        console.print(
+            "shared Git metadata and objects added: linked-worktree metadata, the "
+            "Dialectic branch, commits, and objects"
+        )
+        console.print("cleanup (run from the original repository; never automatic):")
+        console.print(f'  git worktree remove "{workspace.dialectic_worktree}"')
+        console.print(f"  git branch -D {workspace.dialectic_branch}")
+        console.print("  git worktree prune")
 
 
 if __name__ == "__main__":

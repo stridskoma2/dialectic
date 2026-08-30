@@ -21,7 +21,13 @@ from pydantic import BaseModel, ValidationError
 
 from .contracts import RUN_ID_PATTERN, RunMode
 from .contracts import ARTIFACT_SCHEMA_VERSION, TOOL_VERSION
-from .schemas import CapabilityAttestationArtifact, EventRecord, RunRecord, SummaryRecord
+from .schemas import (
+    CapabilityAttestationArtifact,
+    EventRecord,
+    RunRecord,
+    SummaryRecord,
+    WorkspaceRecord,
+)
 
 import re
 
@@ -185,6 +191,17 @@ class RunStore:
         if summary.run_id != run_id:
             raise StateCorruptError(f"run summary id mismatch: {run_id}")
         return summary
+
+    def read_workspace(self, run_id: str) -> WorkspaceRecord | None:
+        validate_run_id(run_id)
+        path = self.runs_root / run_id / "git" / "workspace.json"
+        if not path.exists():
+            return None
+        try:
+            raw = _bounded_artifact_read(path, 1_048_576)
+            return WorkspaceRecord.model_validate_json(raw, strict=True)
+        except (OSError, ValidationError, ValueError) as exc:
+            raise StateCorruptError(f"workspace state is corrupt: {run_id}") from exc
 
     def write_run(
         self,
@@ -435,8 +452,10 @@ def _apply_windows_private_dacl(path: Path, *, directory: bool) -> None:
     win32security.SetNamedSecurityInfo(
         str(path),
         win32security.SE_FILE_OBJECT,
-        win32security.DACL_SECURITY_INFORMATION | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
-        None,
+        win32security.OWNER_SECURITY_INFORMATION
+        | win32security.DACL_SECURITY_INFORMATION
+        | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+        user_sid,
         None,
         acl,
         None,
