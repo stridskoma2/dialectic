@@ -1434,8 +1434,6 @@ def _versioned_fixture(
     source_environment: Mapping[str, str] | None = None,
 ) -> NativeAdapterFixture:
     codex_versions = {"0.150.0-alpha.12.2", "0.151.0-alpha.7.1"}
-    if os.name != "nt":
-        codex_versions.add("0.151.0")
     supported = {
         "codex": codex_versions,
         "claude-code": {"2.1.177"},
@@ -1448,16 +1446,27 @@ def _versioned_fixture(
             "claude-code": "Claude Code",
             "grok-build": "Grok Build",
         }[runtime]
-        if runtime == "codex" and version == "0.151.0" and os.name == "nt":
+        if runtime == "codex" and version == "0.151.0":
+            if os.name == "nt":
+                detail = (
+                    "its native Windows sandbox failed both Dialectic permission profiles. "
+                    "Driver-write qualification failed because the elevated runner did not "
+                    "preserve the isolated-worktree CWD or enforce the control/tmp split. "
+                    "Packet-only qualification also failed: the unelevated backend rejected "
+                    "the split read policy, while the elevated backend could not use the "
+                    "private neutral CWD and denied its required read"
+                )
+            else:
+                detail = (
+                    "its Linux sandbox failed Dialectic's driver-write live permission matrix. "
+                    "Bubblewrap could not mount the narrower allowed worktree and Git paths "
+                    "beneath denied ancestors; repository AGENTS.md discovery was not preserved; "
+                    "and the available tool surface exceeded the qualified fixture"
+                )
             raise NativePreflightError(
-                "Codex CLI 0.151.0 is installed, but its native Windows sandbox failed "
-                "both Dialectic permission profiles. Driver-write qualification failed because "
-                "the elevated runner did not preserve the isolated-worktree CWD or enforce the "
-                "control/tmp split. Packet-only qualification also failed: the unelevated backend "
-                "rejected the split read policy, while the elevated backend could not use the "
-                "private neutral CWD and denied its required read. No sandbox boundary was "
+                f"Codex CLI 0.151.0 is installed, but {detail}. No sandbox boundary was "
                 f"weakened. Fixture-supported versions: {choices}; they still must pass this "
-                "host's live capability probe. Use non-Codex targets for Council, or upgrade "
+                "host's live capability probe. Install a fixture-supported version or upgrade "
                 "Dialectic after a Codex sandbox fix is independently requalified."
             )
         raise NativePreflightError(

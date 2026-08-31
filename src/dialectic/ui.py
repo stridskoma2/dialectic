@@ -33,7 +33,7 @@ from .ui_config import RuntimeName, UiAgentChoice, UiRunConfig, build_config_byt
 
 _MAX_REQUEST_BYTES = 262_144
 _IDLE_SHUTDOWN_SECONDS = 30 * 60
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = logging.getLogger("dialectic.ui")
 
 _MODEL_CATALOG: dict[RuntimeName, tuple[tuple[str, str, str], ...]] = {
     "codex": (

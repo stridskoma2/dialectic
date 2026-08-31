@@ -33,9 +33,9 @@ dialectic --help
 ```
 
 For the fast local interface, double-click `Launch Dialectic UI.cmd` on Windows
-or run `dialectic-ui` on either release platform. When Ubuntu WSL has Dialectic
-installed at `~/.local/share/dialectic/venv`, the Windows launcher prefers that
-Linux runtime; otherwise it falls back to the checkout's Windows `.venv`. It opens
+or run `dialectic-ui` on either release platform. The Windows launcher prefers the
+checkout's Windows `.venv`; when that is absent, it falls back to Dialectic installed
+in Ubuntu WSL at `~/.local/share/dialectic/venv`. It opens
 the localhost-only interface in a dedicated Edge or Chrome app window without tabs
 or an address bar, falling back to the default browser only when neither is
 available. The WSL path uses an authenticated, per-launch file bridge under `.git/`
@@ -63,7 +63,7 @@ current host's native capability probe before any model turn:
 
 | Runtime | Executable | Accepted version |
 |---|---|---|
-| Codex on Linux/WSL | `codex` | `0.150.0-alpha.12.2`, `0.151.0-alpha.7.1`, `0.151.0` |
+| Codex on Linux/WSL | `codex` | `0.150.0-alpha.12.2`, `0.151.0-alpha.7.1` |
 | Codex on native Windows | `codex` | `0.150.0-alpha.12.2`, `0.151.0-alpha.7.1` |
 | Claude Code | `claude` | `2.1.177` |
 | Grok Build | `grok` | `0.1.220` |
@@ -73,16 +73,17 @@ fixture-declared credential environment (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
 or `XAI_API_KEY`). Credentials are not accepted in Dialectic YAML. Unsupported
 versions and unverified permission shapes fail closed during preflight.
 
-Native-Windows Codex CLI `0.151.0` is detected but deliberately rejected. Live
+Codex CLI `0.151.0` is detected but deliberately rejected. Native-Windows live
 qualification failed both profiles: its elevated runner did not preserve the
 isolated-worktree CWD or the driver `control/` plus writable `tmp/` split, while its
 packet-only path either rejected the split read policy or failed the private neutral
-CWD/read probe. A stable version label does not override either permission matrix.
+CWD/read probe. A separate WSL2 live driver probe failed because Bubblewrap could
+not construct narrower allowed worktree and Git mounts beneath denied ancestors,
+repository `AGENTS.md` discovery was not preserved, and the available tool surface
+exceeded the qualified fixture. A stable version label does not override either
+permission matrix.
 The version allowlist is only Gate A eligibility: every listed build must still pass
 the current host's native capability probe before a model turn is allowed.
-Dialectic therefore runs stable Codex `0.151.0` through WSL2 on Windows. This moves
-Codex onto its Linux `bubblewrap` sandbox while preserving Windows repository
-selection and translating selected `C:\...` paths to `/mnt/c/...` before a run.
 
 ## Configure and run
 

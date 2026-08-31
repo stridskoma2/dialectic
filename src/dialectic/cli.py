@@ -24,7 +24,7 @@ from .service import DialecticService
 from .store import BootstrapError, InvalidRunIdError, RunNotFoundError, StateCorruptError
 
 ServiceFactory = Callable[[], DialecticService]
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = logging.getLogger("dialectic.cli")
 
 
 def create_app(service_factory: ServiceFactory = build_service) -> typer.Typer:

@@ -3,6 +3,11 @@ $repositoryRoot = Split-Path -Parent $PSCommandPath
 $wsl = Join-Path $env:SystemRoot 'System32\wsl.exe'
 $pythonw = Join-Path $repositoryRoot '.venv\Scripts\pythonw.exe'
 
+if (Test-Path -LiteralPath $pythonw) {
+    Start-Process -FilePath $pythonw -ArgumentList '-m dialectic.ui' -WorkingDirectory $repositoryRoot
+    exit 0
+}
+
 if (Test-Path -LiteralPath $wsl) {
     & $wsl -d Ubuntu -- bash -lc 'test -x ~/.local/share/dialectic/venv/bin/python' 2>$null
     if ($LASTEXITCODE -eq 0) {
@@ -37,11 +42,6 @@ if (Test-Path -LiteralPath $wsl) {
         Start-Process -FilePath $wsl -ArgumentList $arguments -WorkingDirectory $repositoryRoot -WindowStyle Hidden
         exit 0
     }
-}
-
-if (Test-Path -LiteralPath $pythonw) {
-    Start-Process -FilePath $pythonw -ArgumentList '-m dialectic.ui' -WorkingDirectory $repositoryRoot
-    exit 0
 }
 
 $installed = Get-Command dialectic-ui.exe -ErrorAction SilentlyContinue
