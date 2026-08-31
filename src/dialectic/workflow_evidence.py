@@ -374,6 +374,16 @@ class WorkflowEvidenceSupport:
             diagnostic = exc.detail
             response = None
             caught = exc
+        except NativePreflightError as exc:
+            termination = "launch-failed"
+            process_started = False
+            attempt_failure = failure_kind
+            diagnostic = (
+                "native turn preparation failed: "
+                f"{bounded_preflight_diagnostic(exc)}"
+            )
+            response = None
+            caught = exc
         except DialecticFailure as exc:
             termination = "launch-failed"
             process_started = False

@@ -970,7 +970,7 @@ class CouncilRevision(ClosedModel):
 
 
 class CandidateProposition(ClosedModel):
-    id: str
+    id: str = Field(pattern=r"^[a-z][a-z0-9-]{0,31}$")
     statement: str
     rationale: str
     supporting_participants: list[str]

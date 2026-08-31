@@ -253,6 +253,13 @@ async def test_code_001_happy_path_two_reviewers_return_findings(
         driver_target,
         [_edit_step(driver_target), _repair_step(driver_target, ["fixed", "rejected_with_evidence"], edit=True)],
     )
+    original_driver_preflight = driver.preflight
+
+    async def preflight_with_separate_probe_budget(target: AgentTarget):  # type: ignore[no-untyped-def]
+        await asyncio.sleep(1.1)
+        return await original_driver_preflight(target)
+
+    driver.preflight = preflight_with_separate_probe_budget  # type: ignore[method-assign]
     reviewer_specs = [
         {"id": "first", "runtime": "claude-code", "model": "claude-model", "lens": "correctness"},
         {"id": "second", "runtime": "grok-build", "model": "grok-model", "lens": "security"},
@@ -261,7 +268,11 @@ async def test_code_001_happy_path_two_reviewers_return_findings(
     second = ScriptedAgentAdapter(grok, [_review_step(grok, [_finding("F2")])])
     record, store, handle = await _execute(
         tmp_path,
-        _config(config_data, reviewers=reviewer_specs),
+        _config(
+            config_data,
+            reviewers=reviewer_specs,
+            limit_updates={"preflight_seconds": 1, "capability_probe_seconds": 2},
+        ),
         repo,
         driver,
         {"first": first, "second": second},

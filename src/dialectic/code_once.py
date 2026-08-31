@@ -173,7 +173,10 @@ class CodeOnceOrchestrator:
             try:
                 result = await asyncio.wait_for(
                     adapter.preflight(target),
-                    timeout=context.config.limits.preflight_seconds,
+                    timeout=(
+                        context.config.limits.preflight_seconds
+                        + context.config.limits.capability_probe_seconds
+                    ),
                 )
             except Exception as exc:
                 raise DialecticFailure(

@@ -1778,11 +1778,13 @@ def _write_schema_file(request: AgentRequest, bound: _BoundProfile) -> str | Non
         return None
     if request.access_mode == "driver-write":
         directory = bound.dynamic_paths["turn_scratch_control"]
-        relative = ".dialectic-turn/control/output-schema.json"
+        filename = "output-schema.json"
+        relative = f".dialectic-turn/control/{filename}"
     else:
         directory = bound.dynamic_paths["neutral_role_dir"]
-        relative = "output-schema.json"
-    _write_controller_json(directory / "output-schema.json", request.output_schema)
+        filename = f"output-schema-{request.turn_phase}.json"
+        relative = filename
+    _write_controller_json(directory / filename, request.output_schema)
     return relative
 
 

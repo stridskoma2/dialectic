@@ -221,7 +221,10 @@ class CouncilOnceOrchestrator:
             try:
                 result = await asyncio.wait_for(
                     adapter.preflight(target),
-                    timeout=context.config.limits.preflight_seconds,
+                    timeout=(
+                        context.config.limits.preflight_seconds
+                        + context.config.limits.capability_probe_seconds
+                    ),
                 )
             except Exception as exc:
                 raise DialecticFailure(
@@ -772,6 +775,12 @@ class CouncilOnceOrchestrator:
                 raise DialecticFailure("MODEL_MISMATCH", str(exc)) from exc
             if isinstance(exc, NativeTurnError) and exc.kind is not None:
                 raise DialecticFailure(exc.kind, exc.detail) from exc
+            if isinstance(exc, NativePreflightError):
+                raise DialecticFailure(
+                    "NO_QUORUM",
+                    "native turn preparation failed: "
+                    f"{_bounded_preflight_diagnostic(exc)}",
+                ) from exc
             if isinstance(exc, (NativeEnvelopeError, AgentProcessError, TimeoutError)):
                 raise DialecticFailure("NO_QUORUM", "persistent participant turn failed") from exc
             raise DialecticFailure(
@@ -1151,7 +1160,9 @@ def _moderator_prompt(
             "revision_ledger": revisions,
             "instruction": (
                 "Act as a fresh non-voting moderator. Produce a concise candidate answer "
-                "split into independently ratifiable propositions."
+                "split into independently ratifiable propositions. Proposition IDs must "
+                "match [a-z][a-z0-9-]{0,31} (for example p-1), and supporting_participants "
+                "may contain only aliases present in position_ledger."
             ),
             "output_schema": CandidateConclusion.model_json_schema(),
         }

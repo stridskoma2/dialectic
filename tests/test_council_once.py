@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ast
 import copy
 import hashlib
@@ -294,12 +295,30 @@ async def test_council_001_complete_three_participant_artifact_and_persistent_li
 ) -> None:
     callback_paths: list[Path] = []
 
+    limits = {
+        **limits,
+        "preflight_seconds": 1,
+        "capability_probe_seconds": 2,
+    }
+
     def barrier_callback(_request: Any) -> None:
         callback_paths.extend((tmp_path / "state" / "runs").glob("*/audit/capabilities/participant/*/opening.binding.json"))
         assert len(callback_paths) >= 3
 
+    def delayed_preflight(adapters: list[ScriptedAgentAdapter]) -> None:
+        original = adapters[0].preflight
+
+        async def preflight_with_separate_probe_budget(target: AgentTarget):  # type: ignore[no-untyped-def]
+            await asyncio.sleep(1.1)
+            return await original(target)
+
+        adapters[0].preflight = preflight_with_separate_probe_budget  # type: ignore[method-assign]
+
     record, handle, adapters, moderator, _store = await _scenario(
-        tmp_path, limits, opening_callback=barrier_callback
+        tmp_path,
+        limits,
+        opening_callback=barrier_callback,
+        adapter_mutator=delayed_preflight,
     )
     assert (record.status, record.consensus_outcome) == ("FINALIZED", "UNANIMOUS")
     assert [len(adapter.invocations) for adapter in adapters] == [3, 3, 3]
@@ -455,6 +474,11 @@ async def test_council_004_changed_mind_and_reason_are_retained(tmp_path: Path, 
 async def test_council_005_moderator_is_fresh_and_non_voting(tmp_path: Path, limits: dict[str, int]) -> None:
     _record, handle, adapters, moderator, _store = await _scenario(tmp_path, limits)
     assert [(item.operation, item.session_id) for item in moderator.invocations] == [("start", None)]
+    moderator_request = moderator.invocations[0]
+    assert "[a-z][a-z0-9-]{0,31}" in moderator_request.prompt
+    assert moderator_request.requested_schema is not None
+    proposition_schema = moderator_request.requested_schema["$defs"]["CandidateProposition"]
+    assert proposition_schema["properties"]["id"]["pattern"] == "^[a-z][a-z0-9-]{0,31}$"
     assert moderator not in adapters
     assert not (handle.path / "council/ballots/moderator.json").exists()
 
@@ -503,13 +527,20 @@ async def test_council_010_zero_dissenters_and_one_abstention_is_contested(tmp_p
 async def test_council_011_participant_failure_reaps_active_and_retained_peers(
     tmp_path: Path, limits: dict[str, int], phase: str
 ) -> None:
+    participant_error: BaseException = RuntimeError("participant failed")
+    if phase == "cross-examination":
+        participant_error = NativePreflightError("controller output schema path collided")
     record, handle, adapters, _moderator, _store = await _scenario(
         tmp_path,
         limits,
-        errors={(0, phase): RuntimeError("participant failed")},
+        errors={(0, phase): participant_error},
         delays={(1, phase): 1.0},
     )
     assert (record.status, record.failure_kind) == ("FAILED", "NO_QUORUM")
+    if phase == "cross-examination":
+        assert record.failure_detail == (
+            "native turn preparation failed: controller output schema path collided"
+        )
     assert adapters[2].close_count == 1
     attempts = [
         TurnAttemptArtifact.model_validate_json(path.read_bytes(), strict=True)

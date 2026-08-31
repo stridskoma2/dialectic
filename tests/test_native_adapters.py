@@ -410,7 +410,7 @@ async def test_native_codex_start_structured_and_resume_are_stdin_only(tmp_path:
             0,
         ),
         (events("session-1", '{"answer":"ok"}'), b"", 0),
-        (events("session-1", "repaired"), b"", 0),
+        (events("session-1", '{"repair":"done"}'), b"", 0),
         (b"native failure\n", b"bounded stderr\n", 7),
         (b"{not-json}\n", b"", 0),
     ])
@@ -455,11 +455,14 @@ async def test_native_codex_start_structured_and_resume_are_stdin_only(tmp_path:
         ("reviewer", "reviewer-a", "repair")
     ]
     schema = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"], "additionalProperties": False}
+    repair_schema = {"type": "object", "properties": {"repair": {"type": "string"}}, "required": ["repair"], "additionalProperties": False}
     hostile_prompt = "spaces ' \"\nUnicode 😀 $() ` & | ^ % < >"
     first = await adapter.start(
         _request(neutral, phase="review", schema=schema, prompt=hostile_prompt)
     )
-    second = await adapter.resume("session-1", _request(neutral, phase="repair"))
+    second = await adapter.resume(
+        "session-1", _request(neutral, phase="repair", schema=repair_schema)
+    )
     assert first.session_id == second.session_id == "session-1"
     turn_calls = transport.calls[-2:]
     assert [call["stdin"] for call in turn_calls] == [
@@ -467,6 +470,13 @@ async def test_native_codex_start_structured_and_resume_are_stdin_only(tmp_path:
         b"complete prompt over stdin",
     ]
     assert all(hostile_prompt not in " ".join(call["plan"].arguments) for call in turn_calls)
+    schema_paths = [
+        call["plan"].arguments[call["plan"].arguments.index("--output-schema") + 1]
+        for call in turn_calls
+    ]
+    assert schema_paths == ["output-schema-review.json", "output-schema-repair.json"]
+    assert json.loads((neutral / schema_paths[0]).read_text(encoding="utf-8")) == schema
+    assert json.loads((neutral / schema_paths[1]).read_text(encoding="utf-8")) == repair_schema
     assert "--sandbox" not in turn_calls[0]["plan"].arguments
     assert "--strict-config" in turn_calls[0]["plan"].arguments
     overrides = [

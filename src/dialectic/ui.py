@@ -32,6 +32,8 @@ from .runtime import build_service
 from .ui_config import RuntimeName, UiAgentChoice, UiRunConfig, build_config_bytes
 
 _MAX_REQUEST_BYTES = 262_144
+_MAX_PREVIEW_BYTES = 1_048_576
+_MAX_RESPONSE_EXCERPT_CHARS = 280
 _IDLE_SHUTDOWN_SECONDS = 30 * 60
 _LOGGER = logging.getLogger("dialectic.ui")
 
@@ -280,7 +282,14 @@ class _UiState:
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:
-            return dict(self._snapshot)
+            snapshot = dict(self._snapshot)
+        artifact_dir = snapshot.get("artifactDir")
+        snapshot["responses"] = (
+            _response_excerpts(Path(artifact_dir))
+            if isinstance(artifact_dir, str) and artifact_dir
+            else []
+        )
+        return snapshot
 
     def start(self, prepared: _PreparedRun) -> None:
         with self._lock:
@@ -323,6 +332,18 @@ class _UiState:
             raise ValueError(f"No {target} path is available")
         return Path(raw).resolve(strict=True)
 
+    def content_for(self, target: str) -> dict[str, object]:
+        if target not in {"log", "summary"}:
+            raise ValueError("Only the app log and summary can be previewed")
+        path = self.path_for(target)
+        content, truncated = _text_preview(path, tail=target == "log")
+        return {
+            "title": "App log" if target == "log" else "Run summary",
+            "path": str(path),
+            "content": content,
+            "truncated": truncated,
+        }
+
     def _progress(self, record: object) -> None:
         with self._lock:
             self._snapshot.update(
@@ -340,7 +361,12 @@ class _UiState:
             service.set_progress_observer(self._progress)
             handle = service.create_run(prepared.mode)
             with self._lock:
-                self._snapshot["runId"] = handle.run_id
+                self._snapshot.update(
+                    {
+                        "runId": handle.run_id,
+                        "artifactDir": str(handle.path),
+                    }
+                )
             log_event(
                 _LOGGER,
                 logging.INFO,
@@ -488,6 +514,11 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 target = _string(payload.get("target"), "target")
                 _open_path(self.server.ui_state.path_for(target))
                 self._json(HTTPStatus.OK, {"ok": True})
+            elif parsed.path == "/api/content":
+                if not isinstance(payload, dict):
+                    raise ValueError("Request body must be an object")
+                target = _string(payload.get("target"), "target")
+                self._json(HTTPStatus.OK, self.server.ui_state.content_for(target))
             elif parsed.path == "/api/shutdown":
                 if self.server.ui_state.snapshot()["active"]:
                     raise ValueError("Wait for the active run to finish before exiting")
@@ -659,6 +690,72 @@ def _open_path(path: Path) -> None:
         os.startfile(path)  # type: ignore[attr-defined]
     else:
         webbrowser.open(path.as_uri())
+
+
+def _text_preview(path: Path, *, tail: bool) -> tuple[str, bool]:
+    if not path.is_file():
+        raise ValueError("Preview target is not a file")
+    size = path.stat().st_size
+    truncated = size > _MAX_PREVIEW_BYTES
+    with path.open("rb") as stream:
+        if truncated and tail:
+            stream.seek(size - _MAX_PREVIEW_BYTES)
+        data = stream.read(_MAX_PREVIEW_BYTES)
+    text = data.decode("utf-8", errors="replace")
+    if truncated:
+        marker = "… earlier content omitted …\n" if tail else "\n… later content omitted …"
+        text = marker + text if tail else text + marker
+    return text, truncated
+
+
+def _response_excerpts(artifact_dir: Path) -> list[dict[str, str]]:
+    turns = artifact_dir / "turns"
+    if not turns.is_dir():
+        return []
+    responses: list[dict[str, str]] = []
+    for path in turns.glob("*/*/*.attempt.json"):
+        try:
+            if path.stat().st_size > _MAX_PREVIEW_BYTES:
+                continue
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        response = payload.get("response")
+        response_data = response if isinstance(response, dict) else {}
+        text = response_data.get("text")
+        status = "response"
+        if not isinstance(text, str) or not text.strip():
+            text = payload.get("bounded_diagnostic")
+            status = "failed"
+        if not isinstance(text, str) or not text.strip():
+            continue
+        compact = " ".join(text.split())
+        if len(compact) > _MAX_RESPONSE_EXCERPT_CHARS:
+            compact = compact[: _MAX_RESPONSE_EXCERPT_CHARS - 1] + "…"
+        responses.append(
+            {
+                "role": str(payload.get("role", "agent")),
+                "targetId": str(payload.get("target_id", "agent")),
+                "phase": str(payload.get("turn_phase", "turn")),
+                "runtime": str(response_data.get("runtime", "")),
+                "model": str(response_data.get("requested_model", "")),
+                "excerpt": compact,
+                "status": status,
+                "completedAt": str(
+                    payload.get("response_completed_at")
+                    or payload.get("capture_completed_at")
+                    or ""
+                ),
+            }
+        )
+    responses.sort(
+        key=lambda item: (
+            item["completedAt"], item["role"], item["targetId"], item["phase"]
+        )
+    )
+    return responses
 
 
 def _ui_html() -> bytes:

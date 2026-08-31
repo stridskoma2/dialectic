@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.cookiejar
+import json
 import os
 import subprocess
 import threading
@@ -18,6 +19,7 @@ from dialectic.ui import (
     _launch_chromium_app,
     _model_options,
     _prepare_run,
+    _response_excerpts,
     _resolve_repository_path,
     _shutdown_windows_bridge,
     _ui_html,
@@ -26,7 +28,7 @@ from dialectic.ui import (
 from dialectic.windows_bridge import _run_bridge
 
 
-def test_desktop_ui_contains_the_primary_workflow_controls() -> None:
+def test_desktop_ui_contains_the_primary_workflow_controls(tmp_path: Path) -> None:
     html = _ui_html().decode("utf-8")
     required = (
         "Code Once",
@@ -40,9 +42,49 @@ def test_desktop_ui_contains_the_primary_workflow_controls() -> None:
         "Allowed dissenters",
         "Run Code Once",
         "App log",
+        "Model responses",
+        "previewDialog",
+        "/api/content",
+        "contextmenu",
     )
     assert all(item in html for item in required)
     assert "Model ID" not in html
+
+    attempt = tmp_path / "turns/participant/participant-a/opening.attempt.json"
+    attempt.parent.mkdir(parents=True)
+    attempt.write_text(
+        json.dumps(
+            {
+                "role": "participant",
+                "target_id": "participant-a",
+                "turn_phase": "opening",
+                "response_completed_at": "2026-09-01T01:02:03Z",
+                "response": {
+                    "runtime": "codex",
+                    "requested_model": "gpt-5.6-sol",
+                    "text": "First line\n\nSecond line " + "x" * 400,
+                },
+                "bounded_diagnostic": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    responses = _response_excerpts(tmp_path)
+
+    assert responses[0] | {"excerpt": ""} == {
+        "role": "participant",
+        "targetId": "participant-a",
+        "phase": "opening",
+        "runtime": "codex",
+        "model": "gpt-5.6-sol",
+        "excerpt": "",
+        "status": "response",
+        "completedAt": "2026-09-01T01:02:03Z",
+    }
+    assert responses[0]["excerpt"].startswith("First line Second line")
+    assert len(responses[0]["excerpt"]) == 280
+    assert responses[0]["excerpt"].endswith("…")
 
 
 def test_desktop_model_options_use_friendly_names_and_report_installed_clis(
@@ -271,9 +313,15 @@ def test_desktop_run_request_rejects_invalid_input(payload: object, message: str
         _prepare_run(payload)
 
 
-def test_desktop_server_requires_its_session_cookie_and_same_origin() -> None:
+def test_desktop_server_requires_its_session_cookie_and_same_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     token = "test-session-token"
-    server = _UiServer(("127.0.0.1", 0), token, _UiState())
+    log_path = tmp_path / "app.jsonl"
+    log_path.write_text('{"event":"application.started"}\n', encoding="utf-8")
+    opened: list[Path] = []
+    monkeypatch.setattr("dialectic.ui._open_path", opened.append)
+    server = _UiServer(("127.0.0.1", 0), token, _UiState(log_path))
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
     try:
@@ -287,6 +335,31 @@ def test_desktop_server_requires_its_session_cookie_and_same_origin() -> None:
             assert b"Dialectic" in response.read()
         with opener.open(f"{server.origin}/api/status", timeout=5) as response:
             assert response.status == 200
+
+        preview_request = urllib.request.Request(
+            f"{server.origin}/api/content",
+            data=b'{"target":"log"}',
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with opener.open(preview_request, timeout=5) as response:
+            preview = json.load(response)
+        assert preview == {
+            "title": "App log",
+            "path": str(log_path.resolve()),
+            "content": log_path.read_bytes().decode("utf-8"),
+            "truncated": False,
+        }
+
+        external_request = urllib.request.Request(
+            f"{server.origin}/api/open",
+            data=b'{"target":"log"}',
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with opener.open(external_request, timeout=5) as response:
+            assert json.load(response) == {"ok": True}
+        assert opened == [log_path.resolve()]
 
         request = urllib.request.Request(
             f"{server.origin}/api/run",
