@@ -315,29 +315,54 @@ def test_unqualified_native_version_error_names_the_installed_and_qualified_vers
             source_environment={},
         )
 
+    qualified = ["0.150.0-alpha.12.2", "0.151.0-alpha.7.1"]
+    if os.name != "nt":
+        qualified.append("0.151.0")
     assert str(rejected.value) == (
         "Codex CLI 0.152.0 is installed but has not been qualified by Dialectic 0.1.0; "
-        "qualified versions: 0.150.0-alpha.12.2, 0.151.0-alpha.7.1. Install a qualified "
-        "CLI version or upgrade Dialectic after support is added."
+        f"qualified versions: {', '.join(sorted(qualified))}. Install a qualified CLI "
+        "version or upgrade Dialectic after support is added."
     )
+
+
+def test_stable_codex_is_fixture_eligible_only_on_posix() -> None:
+    if os.name == "nt":
+        pytest.skip("native Windows stable Codex remains unqualified")
+
+    fixture = _versioned_fixture(
+        "codex",
+        "0.151.0",
+        role="driver",
+        access_mode="driver-write",
+        source_environment={},
+    )
+
+    assert fixture.cli_version == "0.151.0"
+    assert fixture.adapter_fixture_version == "codex-0.151.0-driver-write-v1"
 
 
 def test_stable_codex_windows_rejection_explains_failed_permission_matrix() -> None:
     if os.name != "nt":
         pytest.skip("the explicit incompatibility is native-Windows-specific")
 
-    with pytest.raises(NativePreflightError) as rejected:
-        _versioned_fixture(
-            "codex",
-            "0.151.0",
-            role="driver",
-            access_mode="driver-write",
-            source_environment={},
-        )
+    for role, access_mode in (
+        ("driver", "driver-write"),
+        ("participant", "packet-only"),
+    ):
+        with pytest.raises(NativePreflightError) as rejected:
+            _versioned_fixture(
+                "codex",
+                "0.151.0",
+                role=role,
+                access_mode=access_mode,
+                source_environment={},
+            )
 
-    assert "failed Dialectic's required live permission matrix" in str(rejected.value)
-    assert "did not preserve the isolated-worktree CWD" in str(rejected.value)
-    assert "remains unqualified on Windows" in str(rejected.value)
+        message = str(rejected.value)
+        assert "failed both Dialectic permission profiles" in message
+        assert "did not preserve the isolated-worktree CWD" in message
+        assert "private neutral CWD" in message
+        assert "No sandbox boundary was weakened" in message
 
 
 @pytest.mark.asyncio

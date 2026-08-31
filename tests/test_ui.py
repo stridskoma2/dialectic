@@ -14,11 +14,16 @@ from dialectic.config import ConfigLoader
 from dialectic.ui import (
     _UiServer,
     _UiState,
+    _choose_repository,
     _launch_chromium_app,
     _model_options,
     _prepare_run,
+    _resolve_repository_path,
+    _shutdown_windows_bridge,
     _ui_html,
+    _windows_bridge_config,
 )
+from dialectic.windows_bridge import _run_bridge
 
 
 def test_desktop_ui_contains_the_primary_workflow_controls() -> None:
@@ -132,6 +137,81 @@ def test_desktop_run_request_uses_the_selected_repository(tmp_path: Path) -> Non
     assert prepared.repository == repository.resolve()
     assert prepared.prompt_bytes == b"Implement the focused change."
     assert ConfigLoader({}).load(prepared.config_bytes, mode="code").config.driver is not None
+
+
+def test_wsl_translates_a_windows_repository_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, f"{repository}\n".encode(), b"")
+
+    monkeypatch.setattr("dialectic.ui._is_wsl", lambda: True)
+    monkeypatch.setattr("dialectic.ui.subprocess.run", fake_run)
+
+    assert _resolve_repository_path(r"C:\git\repo") == repository.resolve()
+    assert calls == [["wslpath", "-a", "-u", r"C:\git\repo"]]
+
+
+def test_wsl_exposes_the_authenticated_windows_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge_directory = tmp_path / "bridge"
+    bridge_directory.mkdir()
+    monkeypatch.setattr("dialectic.ui._is_wsl", lambda: True)
+    monkeypatch.setenv("DIALECTIC_WINDOWS_BRIDGE_DIR", str(bridge_directory))
+    monkeypatch.setenv("DIALECTIC_WINDOWS_BRIDGE_TOKEN", "a" * 32)
+
+    assert _windows_bridge_config() == (bridge_directory.resolve(), "a" * 32)
+
+
+def test_wsl_rejects_a_missing_windows_bridge_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("dialectic.ui._is_wsl", lambda: True)
+    monkeypatch.setenv("DIALECTIC_WINDOWS_BRIDGE_DIR", "/missing/bridge")
+    monkeypatch.setenv("DIALECTIC_WINDOWS_BRIDGE_TOKEN", "a" * 32)
+
+    assert _windows_bridge_config() is None
+
+
+def test_windows_bridge_returns_the_selected_path_and_shuts_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = "test-bridge-token-1234567890"
+    bridge_directory = tmp_path / "bridge"
+    bridge_directory.mkdir()
+    monkeypatch.setattr("dialectic.ui._is_wsl", lambda: True)
+    monkeypatch.setenv("DIALECTIC_WINDOWS_BRIDGE_DIR", str(bridge_directory))
+    monkeypatch.setenv("DIALECTIC_WINDOWS_BRIDGE_TOKEN", token)
+    worker = threading.Thread(
+        target=_run_bridge,
+        args=(bridge_directory, token, lambda: r"C:\git\repo"),
+        kwargs={"poll_seconds": 0.001},
+        daemon=True,
+    )
+    worker.start()
+    for _attempt in range(100):
+        if (bridge_directory / ".ready").is_file():
+            break
+        threading.Event().wait(0.01)
+
+    unauthorized_id = "0" * 32
+    unauthorized = bridge_directory / f"request-{unauthorized_id}.json"
+    unauthorized.write_text('{"token":"wrong","action":"browse"}', encoding="utf-8")
+    for _attempt in range(100):
+        if not unauthorized.exists():
+            break
+        threading.Event().wait(0.01)
+    assert not (bridge_directory / f"response-{unauthorized_id}.json").exists()
+
+    assert _choose_repository() == r"C:\git\repo"
+    _shutdown_windows_bridge()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert not bridge_directory.exists()
 
 
 def test_desktop_council_request_does_not_disclose_repository() -> None:

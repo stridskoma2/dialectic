@@ -1091,7 +1091,10 @@ class CodexAdapter(NativeAdapterBase):
             or result.end_reason != "completed"
             or result.exit_code != 0
         ):
-            raise NativePreflightError("pinned Codex capability probe process failed")
+            raise NativePreflightError(
+                "pinned Codex capability probe process failed: "
+                f"{_native_process_failure_summary(result)}"
+            )
         parsed = self._parse_envelope(
             _strict_utf8(result.stdout.persisted, "Codex capability probe"), request
         )
@@ -1430,8 +1433,11 @@ def _versioned_fixture(
     access_mode: AccessMode,
     source_environment: Mapping[str, str] | None = None,
 ) -> NativeAdapterFixture:
+    codex_versions = {"0.150.0-alpha.12.2", "0.151.0-alpha.7.1"}
+    if os.name != "nt":
+        codex_versions.add("0.151.0")
     supported = {
-        "codex": {"0.150.0-alpha.12.2", "0.151.0-alpha.7.1"},
+        "codex": codex_versions,
         "claude-code": {"2.1.177"},
         "grok-build": {"0.1.220"},
     }
@@ -1445,12 +1451,14 @@ def _versioned_fixture(
         if runtime == "codex" and version == "0.151.0" and os.name == "nt":
             raise NativePreflightError(
                 "Codex CLI 0.151.0 is installed, but its native Windows sandbox failed "
-                "Dialectic's required live permission matrix: the elevated command runner did "
-                "not preserve the isolated-worktree CWD, and the required control/tmp split "
-                "could not be enforced without weakening denied-read boundaries. This version "
-                f"remains unqualified on Windows; qualified versions: {choices}. Install a "
-                "qualified CLI version or upgrade Dialectic after a Codex sandbox fix is "
-                "independently requalified."
+                "both Dialectic permission profiles. Driver-write qualification failed because "
+                "the elevated runner did not preserve the isolated-worktree CWD or enforce the "
+                "control/tmp split. Packet-only qualification also failed: the unelevated backend "
+                "rejected the split read policy, while the elevated backend could not use the "
+                "private neutral CWD and denied its required read. No sandbox boundary was "
+                f"weakened. Fixture-supported versions: {choices}; they still must pass this "
+                "host's live capability probe. Use non-Codex targets for Council, or upgrade "
+                "Dialectic after a Codex sandbox fix is independently requalified."
             )
         raise NativePreflightError(
             f"{runtime_label} CLI {version} is installed but has not been qualified by "
@@ -1680,6 +1688,20 @@ def _result_classification(result: NativeProcessResult) -> tuple[str, str | None
     if result.exit_code != 0:
         return "agent-failed", None
     return "response-returned", None
+
+
+def _native_process_failure_summary(result: NativeProcessResult) -> str:
+    """Return a bounded, already-redacted native failure summary for operator logs."""
+
+    diagnostic = result.stderr.persisted or result.stdout.persisted
+    text = diagnostic.decode("utf-8", errors="replace").strip()
+    if len(text) > 2000:
+        text = "..." + text[-1997:]
+    details = (
+        f"end_reason={result.end_reason}, exit_code={result.exit_code}, "
+        f"cleanup_confirmed={result.cleanup_confirmed}"
+    )
+    return f"{details}, diagnostic={text!r}" if text else details
 
 
 def _write_schema_file(request: AgentRequest, bound: _BoundProfile) -> str | None:

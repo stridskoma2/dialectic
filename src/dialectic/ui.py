@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -139,7 +140,7 @@ def _prepare_run(payload: object) -> _PreparedRun:
         raw_repository = _string(payload.get("repository"), "repository").strip()
         if not raw_repository:
             raise ValueError("Repository is required in Code mode")
-        repository = Path(raw_repository).expanduser().resolve()
+        repository = _resolve_repository_path(raw_repository)
         if not repository.is_dir():
             raise ValueError("Repository must be an existing directory")
 
@@ -161,6 +162,92 @@ def _optional_string(value: object, label: str) -> str:
     if value is None:
         return ""
     return _string(value, label)
+
+
+def _is_wsl() -> bool:
+    return os.name != "nt" and bool(os.environ.get("WSL_DISTRO_NAME"))
+
+
+def _windows_bridge_config() -> tuple[Path, str] | None:
+    if not _is_wsl():
+        return None
+    raw_directory = os.environ.get("DIALECTIC_WINDOWS_BRIDGE_DIR", "")
+    token = os.environ.get("DIALECTIC_WINDOWS_BRIDGE_TOKEN", "")
+    if not raw_directory or len(token) < 16:
+        return None
+    try:
+        directory = Path(raw_directory).resolve(strict=True)
+    except OSError:
+        return None
+    if not directory.is_dir():
+        return None
+    return directory, token
+
+
+def _write_bridge_message(path: Path, payload: dict[str, object]) -> None:
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _request_windows_bridge(action: str) -> dict[str, object]:
+    bridge = _windows_bridge_config()
+    if bridge is None:
+        raise ValueError("The Windows repository picker bridge is unavailable; enter the path directly")
+    directory, token = bridge
+    request_id = secrets.token_hex(16)
+    request = directory / f"request-{request_id}.json"
+    response = directory / f"response-{request_id}.json"
+    _write_bridge_message(request, {"token": token, "action": action})
+    deadline = time.monotonic() + 300
+    try:
+        while time.monotonic() < deadline:
+            if response.is_file():
+                try:
+                    payload = json.loads(response.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise ValueError("The Windows repository picker returned an invalid response") from exc
+                if not isinstance(payload, dict):
+                    raise ValueError("The Windows repository picker returned an invalid response")
+                return payload
+            if not (directory / ".ready").is_file():
+                raise ValueError(
+                    "The Windows repository picker bridge stopped. Exit Dialectic and launch it again."
+                )
+            time.sleep(0.05)
+    finally:
+        for path in (request, response):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    raise ValueError("The Windows repository picker timed out after five minutes")
+
+
+def _resolve_repository_path(raw_repository: str) -> Path:
+    candidate = raw_repository
+    if _is_wsl() and re.match(r"^[A-Za-z]:[\\/]", raw_repository):
+        try:
+            translated = subprocess.run(
+                ["wslpath", "-a", "-u", raw_repository],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ValueError("Could not translate the selected Windows repository path") from exc
+        if translated.returncode != 0:
+            diagnostic = translated.stderr.decode("utf-8", errors="replace").strip()
+            raise ValueError(
+                "Could not translate the selected Windows repository path"
+                + (f": {diagnostic}" if diagnostic else "")
+            )
+        candidate = translated.stdout.decode("utf-8", errors="strict").strip()
+        if not candidate:
+            raise ValueError("Could not translate the selected Windows repository path")
+    return Path(candidate).expanduser().resolve()
 
 
 class _UiState:
@@ -527,11 +614,18 @@ def _model_options() -> dict[str, object]:
     return {
         "models": models,
         "runtimes": runtimes,
-        "browseSupported": os.name == "nt",
+        "browseSupported": os.name == "nt" or _windows_bridge_config() is not None,
     }
 
 
 def _choose_repository() -> str:
+    if _is_wsl():
+        payload = _request_windows_bridge("browse")
+        if isinstance(payload.get("error"), str):
+            raise ValueError(f"Could not open the Windows repository picker: {payload['error']}")
+        if not isinstance(payload.get("path"), str):
+            raise ValueError("The Windows repository picker returned an invalid response")
+        return payload["path"]
     if os.name != "nt":
         raise ValueError("Native folder browsing is available on Windows; enter the path directly")
     import pythoncom
@@ -577,6 +671,17 @@ def _find_windows_app_browser() -> Path | None:
         if discovered:
             return Path(discovered)
 
+    if _is_wsl():
+        for candidate in (
+            Path("/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"),
+            Path("/mnt/c/Program Files/Microsoft/Edge/Application/msedge.exe"),
+            Path("/mnt/c/Program Files/Google/Chrome/Application/chrome.exe"),
+            Path("/mnt/c/Program Files (x86)/Google/Chrome/Application/chrome.exe"),
+        ):
+            if candidate.is_file():
+                return candidate
+        return None
+
     locations = (
         ("ProgramFiles(x86)", "Microsoft/Edge/Application/msedge.exe"),
         ("ProgramFiles", "Microsoft/Edge/Application/msedge.exe"),
@@ -615,7 +720,7 @@ def _launch_chromium_app(executable: Path, url: str) -> bool:
 
 
 def _open_ui(url: str) -> bool:
-    if os.name == "nt":
+    if os.name == "nt" or _is_wsl():
         executable = _find_windows_app_browser()
         if executable is not None and _launch_chromium_app(executable, url):
             return True
@@ -629,6 +734,18 @@ def _idle_monitor(server: _UiServer) -> None:
         if not snapshot["active"] and server.ui_state.idle_for() >= _IDLE_SHUTDOWN_SECONDS:
             server.shutdown()
             return
+
+
+def _shutdown_windows_bridge() -> None:
+    bridge = _windows_bridge_config()
+    if bridge is None:
+        return
+    directory, token = bridge
+    shutdown = directory / f"shutdown-{secrets.token_hex(16)}.json"
+    try:
+        _write_bridge_message(shutdown, {"token": token})
+    except OSError:
+        return
 
 
 def main() -> None:
@@ -658,6 +775,7 @@ def main() -> None:
         pass
     finally:
         server.server_close()
+        _shutdown_windows_bridge()
         if log_path is not None:
             log_event(_LOGGER, logging.INFO, "application.stopped")
             close_structured_logging()

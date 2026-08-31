@@ -33,10 +33,14 @@ dialectic --help
 ```
 
 For the fast local interface, double-click `Launch Dialectic UI.cmd` on Windows
-or run `dialectic-ui` on either release platform. On Windows it opens the
-localhost-only interface in a dedicated Edge or Chrome app window without tabs
+or run `dialectic-ui` on either release platform. When Ubuntu WSL has Dialectic
+installed at `~/.local/share/dialectic/venv`, the Windows launcher prefers that
+Linux runtime; otherwise it falls back to the checkout's Windows `.venv`. It opens
+the localhost-only interface in a dedicated Edge or Chrome app window without tabs
 or an address bar, falling back to the default browser only when neither is
-available. It calls
+available. The WSL path uses an authenticated, per-launch file bridge under `.git/`
+for the native Windows repository picker and removes that control directory on exit.
+The interface calls
 `DialecticService` directly; it does not shell out to the command-line interface.
 It provides Code/Council mode selection, an implementation or deliberation prompt,
 a repository browser for Code Once, friendly model dropdowns with installed-CLI
@@ -54,11 +58,13 @@ and `1` respectively.
 ## Native prerequisites
 
 Install and authenticate every CLI named by the selected workflow. The v0.1.0
-fixtures accept only these independently qualified versions:
+fixtures recognize only these version-eligible builds; Gate A still runs the
+current host's native capability probe before any model turn:
 
 | Runtime | Executable | Accepted version |
 |---|---|---|
-| Codex | `codex` | `0.150.0-alpha.12.2`, `0.151.0-alpha.7.1` |
+| Codex on Linux/WSL | `codex` | `0.150.0-alpha.12.2`, `0.151.0-alpha.7.1`, `0.151.0` |
+| Codex on native Windows | `codex` | `0.150.0-alpha.12.2`, `0.151.0-alpha.7.1` |
 | Claude Code | `claude` | `2.1.177` |
 | Grok Build | `grok` | `0.1.220` |
 
@@ -67,12 +73,16 @@ fixture-declared credential environment (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
 or `XAI_API_KEY`). Credentials are not accepted in Dialectic YAML. Unsupported
 versions and unverified permission shapes fail closed during preflight.
 
-Native-Windows Codex CLI `0.151.0` is detected but deliberately rejected with an
-actionable preflight error. Live qualification found that its elevated command runner
-did not preserve the isolated-worktree CWD and could not express Dialectic's protected
-`control/` plus writable `tmp/` split without weakening denied-read boundaries. A
-stable version label does not override the permission matrix; support can be added
-after a Codex sandbox fix passes the complete live probe.
+Native-Windows Codex CLI `0.151.0` is detected but deliberately rejected. Live
+qualification failed both profiles: its elevated runner did not preserve the
+isolated-worktree CWD or the driver `control/` plus writable `tmp/` split, while its
+packet-only path either rejected the split read policy or failed the private neutral
+CWD/read probe. A stable version label does not override either permission matrix.
+The version allowlist is only Gate A eligibility: every listed build must still pass
+the current host's native capability probe before a model turn is allowed.
+Dialectic therefore runs stable Codex `0.151.0` through WSL2 on Windows. This moves
+Codex onto its Linux `bubblewrap` sandbox while preserving Windows repository
+selection and translating selected `C:\...` paths to `/mnt/c/...` before a run.
 
 ## Configure and run
 
