@@ -599,7 +599,12 @@ def take_native_invocation_evidence(
 
 
 def bounded_preflight_diagnostic(error: BaseException) -> str:
-    detail = str(error) if isinstance(error, NativePreflightError) else type(error).__name__
+    if isinstance(error, TimeoutError):
+        detail = "native preflight exceeded its configured timeout"
+    elif isinstance(error, NativePreflightError):
+        detail = str(error)
+    else:
+        detail = f"unexpected {type(error).__name__}"
     encoded = detail.encode("utf-8", errors="replace")[:1024]
     return encoded.decode("utf-8", errors="ignore") or "native preflight failed"
 

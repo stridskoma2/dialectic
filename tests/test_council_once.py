@@ -19,7 +19,7 @@ from dialectic.council_once import (
     _cross_prompt,
     _opening_prompt,
 )
-from dialectic.native_adapters import NativeTurnError
+from dialectic.native_adapters import NativePreflightError, NativeTurnError
 from dialectic.schemas import (
     AgentResponse,
     AgentTarget,
@@ -405,6 +405,25 @@ async def test_council_001_complete_three_participant_artifact_and_persistent_li
     assert not (
         changed_handle.path / "council/cross-examination/participant-c.json"
     ).exists()
+
+    def reject_unqualified_cli(adapters: list[ScriptedAgentAdapter]) -> None:
+        async def fail_preflight(_target: AgentTarget) -> Any:
+            raise NativePreflightError(
+                "Codex CLI 0.152.0 is installed but has not been qualified by Dialectic 0.1.0"
+            )
+
+        adapters[0].preflight = fail_preflight  # type: ignore[method-assign]
+
+    failed, *_ = await _scenario(
+        tmp_path / "preflight-diagnostic",
+        limits,
+        adapter_mutator=reject_unqualified_cli,
+    )
+    assert (failed.status, failed.failure_kind) == ("FAILED", "PREFLIGHT_FAILED")
+    assert failed.failure_detail == (
+        "target preflight failed for member-1: Codex CLI 0.152.0 is installed but "
+        "has not been qualified by Dialectic 0.1.0"
+    )
 
 
 @pytest.mark.asyncio

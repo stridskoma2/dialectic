@@ -1437,8 +1437,25 @@ def _versioned_fixture(
     }
     if version not in supported[runtime]:
         choices = ", ".join(sorted(supported[runtime]))
+        runtime_label = {
+            "codex": "Codex",
+            "claude-code": "Claude Code",
+            "grok-build": "Grok Build",
+        }[runtime]
+        if runtime == "codex" and version == "0.151.0" and os.name == "nt":
+            raise NativePreflightError(
+                "Codex CLI 0.151.0 is installed, but its native Windows sandbox failed "
+                "Dialectic's required live permission matrix: the elevated command runner did "
+                "not preserve the isolated-worktree CWD, and the required control/tmp split "
+                "could not be enforced without weakening denied-read boundaries. This version "
+                f"remains unqualified on Windows; qualified versions: {choices}. Install a "
+                "qualified CLI version or upgrade Dialectic after a Codex sandbox fix is "
+                "independently requalified."
+            )
         raise NativePreflightError(
-            f"unsupported {runtime} CLI version {version}; verified versions: {choices}"
+            f"{runtime_label} CLI {version} is installed but has not been qualified by "
+            f"Dialectic {TOOL_VERSION}; qualified versions: {choices}. Install a qualified "
+            "CLI version or upgrade Dialectic after support is added."
         )
     return _fixture(
         runtime,
@@ -1829,11 +1846,14 @@ def _codex_effective_policy_snapshot(
         raise NativePreflightError("Codex doctor report lacks checks")
 
     selected: dict[str, Any] = {}
-    for check_id in ("config.load", "mcp.config", "sandbox.helpers"):
+    for check_id in ("config.load", "sandbox.helpers"):
         check = checks.get(check_id)
         if not isinstance(check, dict) or check.get("status") != "ok":
+            status = check.get("status") if isinstance(check, dict) else "missing"
+            summary = check.get("summary") if isinstance(check, dict) else None
+            detail = f" ({status}: {summary})" if isinstance(summary, str) else f" ({status})"
             raise NativePreflightError(
-                f"Codex effective-policy check failed: {check_id}"
+                f"Codex effective-policy check failed: {check_id}{detail}"
             )
         details = check.get("details")
         if not isinstance(details, dict):
@@ -1847,15 +1867,9 @@ def _codex_effective_policy_snapshot(
         }
 
     config = selected["config.load"]["details"]
-    if str(config.get("mcp servers")) != "0":
-        raise NativePreflightError("Codex effective configuration enables MCP servers")
     overrides = str(config.get("feature flag overrides", ""))
     if "multi_agent=false" not in overrides:
         raise NativePreflightError("Codex effective configuration enables subagents")
-
-    mcp_summary = str(selected["mcp.config"].get("summary", "")).casefold()
-    if "no mcp" not in mcp_summary:
-        raise NativePreflightError("Codex effective MCP inventory is not empty")
 
     sandbox = selected["sandbox.helpers"]["details"]
     expected = {
@@ -1875,10 +1889,8 @@ def _codex_effective_policy_snapshot(
 
     normalized_checks = {
         "config.load": {
-            "mcp_servers": str(config.get("mcp servers")),
             "feature_flag_overrides": overrides,
         },
-        "mcp.config": {"summary": mcp_summary},
         "sandbox.helpers": {
             key: str(sandbox[key]).casefold()
             for key in (*expected, "sandbox backend")
@@ -2008,6 +2020,25 @@ def _reject_displacing_codex_policy(
         raise NativePreflightError(
             f"Codex managed policy overrides the named permission profile: {label}"
         )
+    mcp_servers = policy.get("mcp_servers")
+    if isinstance(mcp_servers, Mapping) and mcp_servers:
+        raise NativePreflightError(f"Codex managed policy enables MCP servers: {label}")
+    features = policy.get("features")
+    if isinstance(features, Mapping) and features.get("multi_agent") is True:
+        raise NativePreflightError(f"Codex managed policy enables subagents: {label}")
+    for surface in ("apps", "plugins"):
+        entries = policy.get(surface)
+        if isinstance(entries, Mapping) and any(
+            value is True
+            or (isinstance(value, Mapping) and value.get("enabled") is True)
+            for value in entries.values()
+        ):
+            raise NativePreflightError(
+                f"Codex managed policy enables {surface}: {label}"
+            )
+    web_search = policy.get("web_search")
+    if web_search not in {None, "disabled"}:
+        raise NativePreflightError(f"Codex managed policy enables web search: {label}")
 
 
 def _canonical_hash(value: Any) -> str:

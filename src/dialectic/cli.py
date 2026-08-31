@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Callable
 
 import typer
 from rich.console import Console
 
+from .app_logging import (
+    close_structured_logging,
+    configure_structured_logging,
+    current_structured_log_path,
+    log_event,
+)
 from .contracts import exit_code_for
 from .ingress import InputAcquisitionError, acquire_named_file
 from .runtime import build_service
@@ -17,6 +24,7 @@ from .service import DialecticService
 from .store import BootstrapError, InvalidRunIdError, RunNotFoundError, StateCorruptError
 
 ServiceFactory = Callable[[], DialecticService]
+_LOGGER = logging.getLogger(__name__)
 
 
 def create_app(service_factory: ServiceFactory = build_service) -> typer.Typer:
@@ -115,7 +123,22 @@ app = create_app()
 
 
 def main() -> None:
-    app()
+    try:
+        log_path = configure_structured_logging("cli")
+    except Exception as exc:
+        typer.echo(
+            f"warning: structured application log is unavailable ({type(exc).__name__})",
+            err=True,
+        )
+        log_path = None
+    if log_path is not None:
+        log_event(_LOGGER, logging.INFO, "application.started", log_path=str(log_path))
+    try:
+        app()
+    finally:
+        if log_path is not None:
+            log_event(_LOGGER, logging.INFO, "application.stopped")
+            close_structured_logging()
 
 
 def _print_progress(console: Console, record: RunRecord) -> None:
@@ -133,6 +156,9 @@ def _print_record(
     if record.failure_kind is not None:
         console.print(f"failure: {record.failure_kind}: {record.failure_detail}")
     console.print(f"artifacts: {artifact_dir}", soft_wrap=True)
+    log_path = current_structured_log_path()
+    if log_path is not None:
+        console.print(f"application log: {log_path}", soft_wrap=True)
     if workspace is not None and workspace.dialectic_worktree is not None:
         console.print(f"isolated worktree: {workspace.dialectic_worktree}", soft_wrap=True)
         console.print(f"branch: {workspace.dialectic_branch}")

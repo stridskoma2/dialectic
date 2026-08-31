@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
 
+from .app_logging import log_event
 from .config import ConfigError, ConfigLoader, decode_scalar_utf8, validate_mode
 from .contracts import (
     ARTIFACT_SCHEMA_VERSION,
@@ -84,7 +85,16 @@ class DialecticService:
         self._progress_observer = observer
 
     def create_run(self, mode: RunMode) -> RunHandle:
-        return self.store.bootstrap_run(mode)
+        handle = self.store.bootstrap_run(mode)
+        log_event(
+            _LOGGER,
+            logging.INFO,
+            "run.created",
+            run_id=handle.run_id,
+            mode=mode,
+            status="CREATED",
+        )
+        return handle
 
     def fail_invalid_input(self, handle: RunHandle, bounded_error: str) -> RunRecord:
         if len(bounded_error.encode("utf-8")) > MAX_DIAGNOSTIC_BYTES:
@@ -235,6 +245,15 @@ class DialecticService:
         record = previous.model_copy(update={"started_model_work_at": now, "updated_at": now})
         record = RunRecord.model_validate(record.model_dump())
         self.store.write_run(handle, record)
+        log_event(
+            _LOGGER,
+            logging.INFO,
+            "run.model_work_started",
+            run_id=record.run_id,
+            mode=record.mode,
+            phase=record.phase,
+            status=record.status,
+        )
         return record
 
     def finalize_code(
@@ -411,6 +430,22 @@ class DialecticService:
                 event_type=event_type,
                 payload=payload,
             ),
+        )
+        fields: dict[str, str | None] = {
+            "run_id": record.run_id,
+            "mode": record.mode,
+            "phase": record.phase,
+            "status": record.status,
+        }
+        if record.failure_kind is not None:
+            fields["failure_kind"] = record.failure_kind
+        if record.failure_detail is not None:
+            fields["failure_detail"] = record.failure_detail
+        log_event(
+            _LOGGER,
+            logging.WARNING if record.status in {"FAILED", "TIMED_OUT"} else logging.INFO,
+            event_type.replace("-", "."),
+            **fields,
         )
         observer = self._progress_observer
         if observer is not None:

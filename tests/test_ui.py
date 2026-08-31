@@ -34,6 +34,7 @@ def test_desktop_ui_contains_the_primary_workflow_controls() -> None:
         "Council participants",
         "Allowed dissenters",
         "Run Code Once",
+        "App log",
     )
     assert all(item in html for item in required)
     assert "Model ID" not in html

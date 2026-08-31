@@ -42,10 +42,10 @@ It provides Code/Council mode selection, an implementation or deliberation promp
 a repository browser for Code Once, friendly model dropdowns with installed-CLI
 status, effort selection, one to five reviewers or two to five council participants,
 reviewer focus, consensus tolerance, live phase/status, and direct access to final
-summaries, artifacts, and isolated worktrees. The catalog includes locally configured
-selectors, while authentication and account-specific model access remain verified by
-native preflight. Council Once remains prompt-only, so a repository selected for Code
-Once is visibly disabled and is not disclosed to council participants.
+summaries, artifacts, application logs, and isolated worktrees. The catalog includes
+locally configured selectors, while authentication and account-specific model access
+remain verified by native preflight. Council Once remains prompt-only, so a repository
+selected for Code Once is visibly disabled and is not disclosed to council participants.
 
 For a release build, install `.[release]` and run `python -m build`. The package
 version, controller version, and artifact version are pinned to `0.1.0`, `0.1.0`,
@@ -66,6 +66,13 @@ Authentication may come from the native CLI's saved authentication or its
 fixture-declared credential environment (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
 or `XAI_API_KEY`). Credentials are not accepted in Dialectic YAML. Unsupported
 versions and unverified permission shapes fail closed during preflight.
+
+Native-Windows Codex CLI `0.151.0` is detected but deliberately rejected with an
+actionable preflight error. Live qualification found that its elevated command runner
+did not preserve the isolated-worktree CWD and could not express Dialectic's protected
+`control/` plus writable `tmp/` split without weakening denied-read boundaries. A
+stable version label does not override the permission matrix; support can be added
+after a Codex sandbox fix passes the complete live probe.
 
 ## Configure and run
 
@@ -103,6 +110,15 @@ include `run.json`, `events.jsonl`, redacted inputs, bounded turn evidence, and
 diff/review evidence. Failed and cancelled runs are deliberately retained and are
 sensitive. Remove a terminal run directory manually only after confirming that no
 Dialectic process owns it; the MVP has no run-cleanup command.
+
+The CLI and UI also write private, rotating JSONL application logs under
+`%LOCALAPPDATA%\dialectic\logs\` on Windows or the corresponding
+`${XDG_STATE_HOME:-~/.local/state}/dialectic/logs/` directory on Linux. Each frontend
+process gets its own timestamped file, capped at 5 MiB with three backups. These logs
+record application lifecycle, run identifiers and state transitions, and bounded
+controller diagnostics; they do not record prompts, configuration bodies, model output,
+credentials, or HTTP session tokens. The CLI prints its log path, and the UI exposes it
+through **App log**. Treat application logs as sensitive operational evidence.
 
 Code Once leaves its isolated worktree and `dialectic/<run-id>` branch in place.
 The original checked-out files, index, checked-out branch, `HEAD`, pre-existing

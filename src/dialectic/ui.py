@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import secrets
 import shutil
@@ -20,12 +21,18 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import parse_qs, urlsplit
 
+from .app_logging import (
+    close_structured_logging,
+    configure_structured_logging,
+    log_event,
+)
 from .contracts import RunMode
 from .runtime import build_service
 from .ui_config import RuntimeName, UiAgentChoice, UiRunConfig, build_config_bytes
 
 _MAX_REQUEST_BYTES = 262_144
 _IDLE_SHUTDOWN_SECONDS = 30 * 60
+_LOGGER = logging.getLogger(__name__)
 
 _MODEL_CATALOG: dict[RuntimeName, tuple[tuple[str, str, str], ...]] = {
     "codex": (
@@ -157,7 +164,7 @@ def _optional_string(value: object, label: str) -> str:
 
 
 class _UiState:
-    def __init__(self) -> None:
+    def __init__(self, log_path: Path | None = None) -> None:
         self._lock = threading.RLock()
         self._active = False
         self._last_seen = time.monotonic()
@@ -170,6 +177,7 @@ class _UiState:
             "failure": "",
             "artifactDir": "",
             "summaryPath": "",
+            "logPath": str(log_path) if log_path is not None else "",
             "worktree": "",
             "branch": "",
             "unresolvedCount": 0,
@@ -218,6 +226,7 @@ class _UiState:
         key = {
             "artifacts": "artifactDir",
             "summary": "summaryPath",
+            "log": "logPath",
             "worktree": "worktree",
         }.get(target)
         if key is None:
@@ -238,12 +247,20 @@ class _UiState:
             )
 
     def _run(self, prepared: _PreparedRun) -> None:
+        log_event(_LOGGER, logging.INFO, "ui.run_requested", mode=prepared.mode)
         try:
             service = build_service()
             service.set_progress_observer(self._progress)
             handle = service.create_run(prepared.mode)
             with self._lock:
                 self._snapshot["runId"] = handle.run_id
+            log_event(
+                _LOGGER,
+                logging.INFO,
+                "ui.run_created",
+                run_id=handle.run_id,
+                mode=prepared.mode,
+            )
             if prepared.mode == "code":
                 assert prepared.repository is not None
                 record = asyncio.run(
@@ -292,7 +309,25 @@ class _UiState:
                         "unresolvedCount": len(summary.unresolved_items),
                     }
                 )
+            log_event(
+                _LOGGER,
+                logging.INFO if record.status == "FINALIZED" else logging.WARNING,
+                "ui.run_completed",
+                run_id=record.run_id,
+                mode=record.mode,
+                status=record.status,
+                failure_kind=record.failure_kind,
+                failure_detail=record.failure_detail,
+            )
         except Exception as exc:
+            run_id = self.snapshot().get("runId")
+            log_event(
+                _LOGGER,
+                logging.ERROR,
+                "ui.run_error",
+                run_id=run_id if isinstance(run_id, str) else None,
+                exception_type=type(exc).__name__,
+            )
             with self._lock:
                 self._snapshot.update(
                     {
@@ -597,11 +632,24 @@ def _idle_monitor(server: _UiServer) -> None:
 
 
 def main() -> None:
-    state = _UiState()
+    try:
+        log_path = configure_structured_logging("ui")
+    except Exception as exc:
+        print(f"Warning: structured application log is unavailable ({type(exc).__name__})")
+        log_path = None
+    state = _UiState(log_path)
     token = secrets.token_urlsafe(32)
     server = _UiServer(("127.0.0.1", 0), token, state)
     threading.Thread(target=_idle_monitor, args=(server,), daemon=True).start()
     url = f"{server.origin}/?token={token}"
+    if log_path is not None:
+        log_event(
+            _LOGGER,
+            logging.INFO,
+            "application.started",
+            origin=server.origin,
+            log_path=str(log_path),
+        )
     if not _open_ui(url):
         print(f"Open {url}")
     try:
@@ -610,6 +658,9 @@ def main() -> None:
         pass
     finally:
         server.server_close()
+        if log_path is not None:
+            log_event(_LOGGER, logging.INFO, "application.stopped")
+            close_structured_logging()
 
 
 if __name__ == "__main__":

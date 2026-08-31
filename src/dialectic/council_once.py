@@ -49,6 +49,7 @@ from .workflow_evidence import (
     GateAEvidence as _GateAEvidence,
     WorkflowEvidenceSupport,
     authorize_native_binding as _authorize_native_binding,
+    bounded_preflight_diagnostic as _bounded_preflight_diagnostic,
     canonical_mapping_bytes as _canonical_dict_bytes,
     concrete_profile as _concrete_profile,
     empty_stream as _empty_stream,
@@ -225,11 +226,18 @@ class CouncilOnceOrchestrator:
             except Exception as exc:
                 raise DialecticFailure(
                     "PREFLIGHT_FAILED",
-                    f"target preflight failed for {configured_id}: {type(exc).__name__}",
+                    f"target preflight failed for {configured_id}: "
+                    f"{_bounded_preflight_diagnostic(exc)}",
                 ) from exc
             if not result.authentication_verified or result.target != target:
+                detail = (
+                    "authentication was not verified"
+                    if not result.authentication_verified
+                    else "adapter returned a mismatched target"
+                )
                 raise DialecticFailure(
-                    "PREFLIGHT_FAILED", f"target preflight failed for {configured_id}"
+                    "PREFLIGHT_FAILED",
+                    f"target preflight failed for {configured_id}: {detail}",
                 )
             evidence = self._evidence.persist_gate_a(
                 context,

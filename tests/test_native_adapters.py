@@ -29,6 +29,7 @@ from dialectic.native_adapters import (
     NativePreflightError,
     NativeProcessResult,
     NativeTurnError,
+    _versioned_fixture,
     recorded_probe_provider,
 )
 from dialectic.launcher import DirectLaunchSpec
@@ -68,14 +69,14 @@ def _codex_doctor_report() -> bytes:
                 "status": "ok",
                 "summary": "config loaded",
                 "details": {
-                    "mcp servers": "0",
+                    "mcp servers": "2",
                     "feature flag overrides": "multi_agent=false",
                 },
             },
             "mcp.config": {
                 "status": "ok",
-                "summary": "no MCP servers configured",
-                "details": {},
+                "summary": "MCP configuration is locally consistent",
+                "details": {"configured servers": "2"},
             },
             "sandbox.helpers": {
                 "status": "ok",
@@ -304,6 +305,41 @@ def _request(
     )
 
 
+def test_unqualified_native_version_error_names_the_installed_and_qualified_versions() -> None:
+    with pytest.raises(NativePreflightError) as rejected:
+        _versioned_fixture(
+            "codex",
+            "0.152.0",
+            role="participant",
+            access_mode="packet-only",
+            source_environment={},
+        )
+
+    assert str(rejected.value) == (
+        "Codex CLI 0.152.0 is installed but has not been qualified by Dialectic 0.1.0; "
+        "qualified versions: 0.150.0-alpha.12.2, 0.151.0-alpha.7.1. Install a qualified "
+        "CLI version or upgrade Dialectic after support is added."
+    )
+
+
+def test_stable_codex_windows_rejection_explains_failed_permission_matrix() -> None:
+    if os.name != "nt":
+        pytest.skip("the explicit incompatibility is native-Windows-specific")
+
+    with pytest.raises(NativePreflightError) as rejected:
+        _versioned_fixture(
+            "codex",
+            "0.151.0",
+            role="driver",
+            access_mode="driver-write",
+            source_environment={},
+        )
+
+    assert "failed Dialectic's required live permission matrix" in str(rejected.value)
+    assert "did not preserve the isolated-worktree CWD" in str(rejected.value)
+    assert "remains unqualified on Windows" in str(rejected.value)
+
+
 @pytest.mark.asyncio
 async def test_native_codex_start_structured_and_resume_are_stdin_only(tmp_path: Path) -> None:
     executable = tmp_path / ("codex.exe" if os.name == "nt" else "codex")
@@ -424,8 +460,17 @@ async def test_native_codex_start_structured_and_resume_are_stdin_only(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_native_codex_preflight_rejects_legacy_managed_sandbox(
+@pytest.mark.parametrize(
+    ("managed_content", "diagnostic"),
+    [
+        ('sandbox_mode = "workspace-write"\n', "legacy sandbox"),
+        ('[mcp_servers.managed]\ncommand = "forbidden"\n', "enables MCP servers"),
+    ],
+)
+async def test_native_codex_preflight_rejects_displacing_managed_policy(
     tmp_path: Path,
+    managed_content: str,
+    diagnostic: str,
 ) -> None:
     executable = tmp_path / ("codex.exe" if os.name == "nt" else "codex")
     executable.write_bytes(b"fixture executable")
@@ -436,7 +481,7 @@ async def test_native_codex_preflight_rejects_legacy_managed_sandbox(
         managed = codex_home / "managed_config.toml"
     else:
         pytest.skip("the POSIX managed defaults path is system-owned")
-    managed.write_text('sandbox_mode = "workspace-write"\n', encoding="utf-8")
+    managed.write_text(managed_content, encoding="utf-8")
     source = _source_environment()
     source["CODEX_HOME"] = str(codex_home)
     transport = FakeNativeTransport([
@@ -462,7 +507,7 @@ async def test_native_codex_preflight_rejects_legacy_managed_sandbox(
         transport=transport,
         which=lambda _: str(executable),
     )
-    with pytest.raises(NativePreflightError, match="legacy sandbox"):
+    with pytest.raises(NativePreflightError, match=diagnostic):
         await adapter.preflight(target)
     assert len(transport.calls) == 5
 
