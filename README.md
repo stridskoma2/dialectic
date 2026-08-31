@@ -64,7 +64,8 @@ current host's native capability probe before any model turn:
 | Runtime | Executable | Accepted version |
 |---|---|---|
 | Codex on Linux/WSL | `codex` | `0.150.0-alpha.12.2`, `0.151.0-alpha.7.1` |
-| Codex on native Windows | `codex` | `0.150.0-alpha.12.2`, `0.151.0-alpha.7.1` |
+| Codex driver on native Windows | `codex` | `0.150.0-alpha.12.2` |
+| Codex packet roles on native Windows | `codex` | `0.150.0-alpha.12.2`, `0.151.0-alpha.7.1` |
 | Claude Code | `claude` | `2.1.177` |
 | Grok Build | `grok` | `0.1.220` |
 
@@ -84,6 +85,20 @@ exceeded the qualified fixture. A stable version label does not override either
 permission matrix.
 The version allowlist is only Gate A eligibility: every listed build must still pass
 the current host's native capability probe before a model turn is allowed.
+On native Windows, Dialectic explicitly selects Codex's `elevated` sandbox backend
+for both effective-policy inspection and every isolated turn; this does not rely on
+the user's ignored `config.toml`. Private packet-only role directories live under
+protected per-run directories created directly beneath `%PUBLIC%`, outside Windows'
+virtualized per-user `AppData\Local` tree. Their public parent is only the traversal
+root; each role directory receives Dialectic's private user-and-system DACL. The
+trusted CLI can consume its controller-owned schema there, while model-generated
+Windows child commands can enter the CWD but cannot read or write its files. Run
+artifacts and structured logs remain in their documented platform state/log locations.
+Native-Windows live v3 evidence qualifies `0.151.0-alpha.7.1` for packet-only
+Council/reviewer/moderator roles. Its driver-write matrix still denies required
+`tmp/` writes and read-only Git inspection, so Code mode requires the separately
+qualified `0.150.0-alpha.12.2`; Dialectic rejects the newer alpha as a driver before
+incurring a model turn.
 
 ## Configure and run
 

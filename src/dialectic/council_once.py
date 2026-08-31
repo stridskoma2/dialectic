@@ -265,16 +265,15 @@ class CouncilOnceOrchestrator:
             ),
         )
 
-        role_root = context.handle.path / "council-role-directories"
-        role_root.mkdir(mode=0o700)
         barrier = BindingBarrier(_target_id(index) for index in range(len(specs)))
         participants: list[_Participant] = []
         for index, (configured_id, target) in enumerate(specs):
             target_id = _target_id(index)
             alias = _alias(index)
             adapter = self.participant_adapters[configured_id]
-            neutral = role_root / target_id
-            neutral.mkdir(mode=0o700)
+            neutral = context.service.store.create_role_directory(
+                context.handle, "council-role-directories", target_id
+            )
             gate = gates[("participant", configured_id)]
             binding, binding_sha, relative = self._bind_packet_role(
                 context,
@@ -463,8 +462,9 @@ class CouncilOnceOrchestrator:
             context.input_text, ledger, _revision_ledger(participants)
         )
         self._require_all_packets(context, [("moderator", moderation_prompt)], CandidateConclusion)
-        moderator_directory = context.handle.path / "council-role-directories" / "moderator"
-        moderator_directory.mkdir(mode=0o700)
+        moderator_directory = context.service.store.create_role_directory(
+            context.handle, "council-role-directories", "moderator"
+        )
         moderator_binding, moderator_binding_sha, moderator_relative = self._bind_packet_role(
             context,
             role="moderator",

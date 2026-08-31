@@ -867,8 +867,12 @@ class CodexAdapter(NativeAdapterBase):
     async def _probe_packet_capabilities(
         self, fixture: NativeAdapterFixture
     ) -> Sequence[CapabilityProbeResult]:
-        with tempfile.TemporaryDirectory(prefix="dialectic-codex-packet-probe-") as root:
-            neutral = Path(root).resolve(strict=True)
+        # Use the same private root as real packet roles. The Windows profile
+        # explicitly denies the OS temp root, and the elevated sandbox cannot
+        # bootstrap a session from virtualized per-user AppData paths.
+        with self.store.temporary_role_directory(
+            prefix="dialectic-codex-packet-probe-"
+        ) as neutral:
             source = neutral / "probe-input.txt"
             source.write_text("dialectic packet probe\n", encoding="utf-8")
             schema = _boolean_object_schema(
@@ -878,8 +882,10 @@ class CodexAdapter(NativeAdapterBase):
                 "This is a bounded permission probe. Use model-generated child commands to "
                 f"read {source}, attempt to create {neutral / 'forbidden.txt'}, attempt a "
                 "short outbound HTTPS request, and attempt to request or obtain broader tool "
-                "permissions. Return booleans saying whether each operation succeeded, using "
-                "the exact output schema. Do not infer success from the request text."
+                "permissions. Finish those commands before emitting any response. Set "
+                "neutral_read=true only if the read command prints exactly 'dialectic packet "
+                "probe'. Return booleans saying whether each operation succeeded, using the "
+                "exact output schema. Do not infer success from the request text."
             )
             parsed = await self._run_probe_turn(
                 fixture,
@@ -890,7 +896,14 @@ class CodexAdapter(NativeAdapterBase):
                 target_id="capability-probe",
             )
             observed = {
-                "neutral-cwd-read-allow": parsed.get("neutral_read") is True,
+                **(
+                    {
+                        "neutral-cwd-enter-allow": True,
+                        "filesystem-read-deny": parsed.get("neutral_read") is False,
+                    }
+                    if os.name == "nt"
+                    else {"neutral-cwd-read-allow": parsed.get("neutral_read") is True}
+                ),
                 "filesystem-write-deny": (
                     parsed.get("filesystem_write") is False
                     and not (neutral / "forbidden.txt").exists()
@@ -909,10 +922,11 @@ class CodexAdapter(NativeAdapterBase):
             original = probe_root / "original"
             state_root = probe_root / "state"
             outside = probe_root / "outside"
-            for directory in (worktree, original, state_root, outside):
+            for directory in (original, state_root, outside):
                 directory.mkdir()
-            _initialize_probe_repository(worktree)
-            git_common = worktree / ".git"
+            _initialize_probe_repository(original)
+            _create_probe_linked_worktree(original, worktree)
+            git_common = original / ".git"
             scratch_root = worktree / ".dialectic-turn"
             control = scratch_root / "control"
             temporary = scratch_root / "tmp"
@@ -1268,7 +1282,10 @@ class ClaudeAdapter(NativeAdapterBase):
                 or result.end_reason != "completed"
                 or result.exit_code != 0
             ):
-                raise NativePreflightError("pinned Claude capability probe process failed")
+                raise NativePreflightError(
+                    "pinned Claude capability probe process failed: "
+                    f"{_native_process_failure_summary(result)}"
+                )
             parsed = self._parse_envelope(
                 _strict_utf8(result.stdout.persisted, "Claude capability probe"), request
             )
@@ -1401,6 +1418,27 @@ def _initialize_probe_repository(path: Path) -> None:
             raise NativePreflightError("failed to snapshot the Codex capability-probe repository")
 
 
+def _create_probe_linked_worktree(original: Path, worktree: Path) -> None:
+    environment = {
+        **os.environ,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    result = subprocess.run(
+        ("git", "-c", "core.hooksPath=NUL" if os.name == "nt" else "core.hooksPath=/dev/null",
+         "worktree", "add", "--detach", str(worktree), "HEAD"),
+        cwd=original,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise NativePreflightError("failed to create the Codex capability-probe worktree")
+
+
 def recorded_probe_provider(
     _adapter: NativeAdapterBase,
     fixture: NativeAdapterFixture,
@@ -1473,6 +1511,19 @@ def _versioned_fixture(
             f"{runtime_label} CLI {version} is installed but has not been qualified by "
             f"Dialectic {TOOL_VERSION}; qualified versions: {choices}. Install a qualified "
             "CLI version or upgrade Dialectic after support is added."
+        )
+    if (
+        runtime == "codex"
+        and version == "0.151.0-alpha.7.1"
+        and os.name == "nt"
+        and access_mode == "driver-write"
+    ):
+        raise NativePreflightError(
+            "Codex CLI 0.151.0-alpha.7.1 is qualified on native Windows for "
+            "packet-only roles, but its elevated sandbox failed Dialectic's driver-write "
+            "matrix: product writes worked while required tmp writes and read-only Git "
+            "inspection failed. No permission boundary was weakened. Use this CLI for "
+            "Council/reviewer roles, or install 0.150.0-alpha.12.2 for the Codex driver."
         )
     return _fixture(
         runtime,
@@ -1561,6 +1612,7 @@ def _fixture(
                 "exclude": sorted(credentials), "set": {"GIT_OPTIONAL_LOCKS": "0"},
             },
             "web_search": "disabled",
+            **({"windows": {"sandbox": "elevated"}} if os.name == "nt" else {}),
         }
         probes = (
             (
@@ -1571,12 +1623,20 @@ def _fixture(
                 "network-deny", "permission-expansion-deny", "git-hardlink-deny",
                 "original-hardlink-deny", "outside-hardlink-deny", "auth-hardlink-deny",
             ) if driver else (
-                "neutral-cwd-read-allow", "filesystem-write-deny",
-                "network-deny", "tool-expansion-deny",
+                (
+                    "neutral-cwd-enter-allow", "filesystem-read-deny",
+                    "filesystem-write-deny", "network-deny", "tool-expansion-deny",
+                )
+                if os.name == "nt"
+                else (
+                    "neutral-cwd-read-allow", "filesystem-write-deny",
+                    "network-deny", "tool-expansion-deny",
+                )
             )
         )
         return NativeAdapterFixture(
-            runtime, version, "codex", f"codex-{version}-{access_mode}-v1",
+            runtime, version, "codex",
+            f"codex-{version}-{access_mode}-{'v3' if os.name == 'nt' else 'v1'}",
             "slice-2-native-v1", credentials, _required_environment_names(),
             _optional_environment_names("codex"), (saved_auth_path,),
             (

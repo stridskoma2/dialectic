@@ -11,6 +11,9 @@ import os
 import secrets
 import stat
 import sys
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -71,6 +74,17 @@ def default_state_root() -> Path:
     return Path(user_state_path("dialectic", appauthor=False))
 
 
+def default_role_directories_root() -> Path:
+    if os.name != "nt":
+        return default_state_root() / "role-directories"
+    from win32com.shell import shell, shellcon
+
+    public_documents = Path(
+        shell.SHGetFolderPath(0, shellcon.CSIDL_COMMON_DOCUMENTS, None, 0)
+    ).resolve(strict=True)
+    return public_documents.parent.resolve(strict=True)
+
+
 def generate_run_id(now: datetime | None = None) -> str:
     timestamp = (now or datetime.now(UTC)).astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
     suffix = base64.b32encode(secrets.token_bytes(7)).decode("ascii").lower()[:10]
@@ -104,10 +118,21 @@ class RunStore:
         bootstrap_suffix_factory: Callable[[], str] | None = None,
         publisher: Callable[[Path, Path], None] | None = None,
         privacy_verifier: Callable[[Path, Path], None] | None = None,
+        role_directories_root: Path | str | None = None,
     ) -> None:
+        using_default_state_root = state_root is None
         self.state_root = Path(state_root) if state_root is not None else default_state_root()
         self.runs_root = self.state_root / "runs"
         self.capability_attestations_root = self.state_root / "capability-attestations"
+        self._flat_role_directories = (
+            role_directories_root is None and os.name == "nt" and using_default_state_root
+        )
+        configured_role_root = role_directories_root
+        if self._flat_role_directories:
+            configured_role_root = default_role_directories_root()
+        self.role_directories_root = (
+            Path(configured_role_root) if configured_role_root is not None else None
+        )
         self._run_id_factory = run_id_factory
         self._suffix_factory = bootstrap_suffix_factory or (lambda: secrets.token_hex(6))
         self._publisher = publisher or _publish_directory_no_replace
@@ -116,6 +141,54 @@ class RunStore:
         _ensure_private_directory(self.state_root)
         _ensure_private_directory(self.runs_root)
         _ensure_private_directory(self.capability_attestations_root)
+        if self.role_directories_root is not None and not self._flat_role_directories:
+            _ensure_private_directory(self.role_directories_root)
+
+    def create_role_directory(self, handle: RunHandle, *components: str) -> Path:
+        """Create one private packet-only CWD without exposing a repository path."""
+        self.assert_handle(handle)
+        if not components or any(
+            re.fullmatch(r"[a-z0-9][a-z0-9-]*", component) is None
+            for component in components
+        ):
+            raise ValueError("role directory components violate the closed grammar")
+        if self._flat_role_directories:
+            assert self.role_directories_root is not None
+            leaf = "-".join((".dialectic-role", handle.run_id, *components))
+            current = self.role_directories_root / leaf
+            if current.exists():
+                raise FileExistsError(f"role directory already exists: {components[-1]}")
+            os.mkdir(current, mode=0o700)
+            _apply_private_directory_security(current)
+            _verify_private_directory(current, current.parent)
+            return current.resolve(strict=True)
+        if self.role_directories_root is None:
+            base = handle.path
+        else:
+            base = self.role_directories_root / handle.run_id
+            _ensure_private_directory(base)
+        current = base
+        for index, component in enumerate(components):
+            current = current / component
+            final = index == len(components) - 1
+            if current.exists():
+                if final:
+                    raise FileExistsError(f"role directory already exists: {component}")
+                _verify_private_directory(current, current.parent)
+                continue
+            os.mkdir(current, mode=0o700)
+            _apply_private_directory_security(current)
+            _verify_private_directory(current, current.parent)
+        return current.resolve(strict=True)
+
+    @contextmanager
+    def temporary_role_directory(self, *, prefix: str) -> Iterator[Path]:
+        parent = self.role_directories_root or self.state_root
+        with tempfile.TemporaryDirectory(prefix=prefix, dir=parent) as root:
+            path = Path(root).resolve(strict=True)
+            _apply_private_directory_security(path)
+            _verify_private_directory(path, parent.resolve(strict=True))
+            yield path
 
     def bootstrap_run(self, mode: RunMode) -> RunHandle:
         last_error: Exception | None = None

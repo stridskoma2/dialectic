@@ -706,6 +706,27 @@ def test_core_017_secure_bootstrap_failure_and_collision_bound(tmp_path: Path) -
     second.acquire()
     second.release()
 
+    role_store = RunStore(
+        tmp_path / "role-state",
+        role_directories_root=tmp_path / "external-role-directories",
+        run_id_factory=lambda: "20260828T020206Z-aaaaaaaaaa",
+    )
+    role_handle = role_store.bootstrap_run("council")
+    role_directory = role_store.create_role_directory(
+        role_handle, "council-role-directories", "participant-a"
+    )
+    assert role_directory == (
+        role_store.role_directories_root
+        / role_handle.run_id
+        / "council-role-directories"
+        / "participant-a"
+    ).resolve(strict=True)
+    assert not role_directory.is_relative_to(role_handle.path)
+    with pytest.raises(FileExistsError, match="already exists"):
+        role_store.create_role_directory(
+            role_handle, "council-role-directories", "participant-a"
+        )
+
 
 def test_core_018_strict_output_extraction_accepts_only_two_forms() -> None:
     class Payload(BaseModel):

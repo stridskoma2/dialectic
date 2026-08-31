@@ -505,8 +505,6 @@ class CodeOnceOrchestrator:
             "reviews/core.sha256",
             (hashlib.sha256(core_bytes).hexdigest() + "\n").encode("ascii"),
         )
-        reviewers_root = context.handle.path / "reviewer-workspaces"
-        reviewers_root.mkdir(mode=0o700)
         barrier = BindingBarrier(
             f"reviewer-{chr(ord('a') + index)}"
             for index in range(len(reviewer_specs))
@@ -524,8 +522,9 @@ class CodeOnceOrchestrator:
                 output_schema=review_schema,
                 target_id=alias,
             )
-            neutral = reviewers_root / alias
-            neutral.mkdir(mode=0o700)
+            neutral = context.service.store.create_role_directory(
+                context.handle, "reviewer-workspaces", alias
+            )
             evidence = gate_a[("reviewer", reviewer_id)]
             adapter = self.reviewer_adapters.get(reviewer_id)
             if adapter is None:

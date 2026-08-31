@@ -60,10 +60,10 @@ class FakeNativeTransport:
         )
 
 
-def _codex_doctor_report() -> bytes:
+def _codex_doctor_report(version: str = "0.151.0-alpha.7.1") -> bytes:
     return json.dumps({
         "schemaVersion": 1,
-        "codexVersion": "0.151.0-alpha.7.1",
+        "codexVersion": version,
         "checks": {
             "config.load": {
                 "status": "ok",
@@ -96,11 +96,11 @@ def _codex_doctor_report() -> bytes:
 class CodeOnceNativeTransport(FakeNativeTransport):
     def __init__(self, *, driver: bool) -> None:
         super().__init__([
-            (b"codex-cli 0.151.0-alpha.7.1\n", b"", 0),
+            (b"codex-cli 0.150.0-alpha.12.2\n", b"", 0),
             (b"--json --output-schema --ignore-user-config --ignore-rules --strict-config --skip-git-repo-check\n", b"", 0),
             (b"SESSION_ID --json --output-schema --ignore-user-config --ignore-rules --strict-config --skip-git-repo-check\n", b"", 0),
             (b"Logged in\n", b"", 0),
-            (_codex_doctor_report(), b"", 1),
+            (_codex_doctor_report("0.150.0-alpha.12.2"), b"", 1),
         ])
         self.driver = driver
 
@@ -333,6 +333,20 @@ def test_stable_codex_is_not_fixture_eligible() -> None:
             source_environment={},
         )
 
+    if os.name == "nt":
+        with pytest.raises(NativePreflightError, match="qualified.*packet-only") as rejected:
+            _versioned_fixture(
+                "codex",
+                "0.151.0-alpha.7.1",
+                role="driver",
+                access_mode="driver-write",
+                source_environment={},
+            )
+        assert "required tmp writes and read-only Git inspection failed" in str(
+            rejected.value
+        )
+        assert "0.150.0-alpha.12.2" in str(rejected.value)
+
 
 def test_stable_codex_rejection_explains_failed_permission_matrix() -> None:
     for role, access_mode in (
@@ -385,7 +399,7 @@ async def test_native_codex_start_structured_and_resume_are_stdin_only(tmp_path:
                 "probe-session",
                 json.dumps(
                     {
-                        "neutral_read": True,
+                        "neutral_read": os.name != "nt",
                         "filesystem_write": False,
                         "network": False,
                         "tool_expansion": False,
@@ -417,6 +431,10 @@ async def test_native_codex_start_structured_and_resume_are_stdin_only(tmp_path:
         which=lambda _: str(executable),
     )
     await adapter.preflight(target)
+    packet_probe_call = transport.calls[-1]
+    assert packet_probe_call["plan"].arguments[0] == "exec"
+    probe_parent = adapter.store.role_directories_root or adapter.store.state_root
+    assert Path(packet_probe_call["cwd"]).is_relative_to(probe_parent)
     neutral = tmp_path / "neutral"
     neutral.mkdir()
     concrete = instantiate_capability_template(
@@ -459,10 +477,25 @@ async def test_native_codex_start_structured_and_resume_are_stdin_only(tmp_path:
     assert 'default_permissions="dialectic-packet"' in overrides
     assert any(value.startswith("permissions=") for value in overrides)
     assert not any(value.startswith("profile=") for value in overrides)
-    assert sum(
-        call["plan"].arguments[0:2] == ("doctor", "--json")
-        for call in transport.calls
-    ) == 1
+    doctor_calls = [
+        call for call in transport.calls
+        if call["plan"].arguments[0:2] == ("doctor", "--json")
+    ]
+    assert len(doctor_calls) == 1
+    doctor_arguments = doctor_calls[0]["plan"].arguments
+    doctor_overrides = [
+        doctor_arguments[index + 1]
+        for index, value in enumerate(doctor_arguments[:-1])
+        if value == "-c"
+    ]
+    if os.name == "nt":
+        expected_windows_backend = 'windows={"sandbox"="elevated"}'
+        assert expected_windows_backend in overrides
+        assert expected_windows_backend in doctor_overrides
+        assert adapter.fixture.adapter_fixture_version.endswith("-v3")
+    else:
+        assert not any(value.startswith("windows=") for value in overrides)
+        assert not any(value.startswith("windows=") for value in doctor_overrides)
     assert adapter.preflight_material().attestation.managed_policy_sha256 != hashlib.sha256(
         b"{}\n"
     ).hexdigest()
@@ -590,6 +623,57 @@ async def test_native_claude_fresh_structured_turn_uses_safe_empty_surfaces(tmp_
     assert resumed.session_id == "claude-session"
     resume_arguments = transport.calls[-1]["plan"].arguments
     assert resume_arguments[resume_arguments.index("--resume") + 1] == "claude-session"
+
+
+@pytest.mark.asyncio
+async def test_native_claude_capability_probe_preserves_bounded_failure_detail(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / ("claude.exe" if os.name == "nt" else "claude")
+    executable.write_bytes(b"fixture executable")
+    executable.chmod(0o700)
+    secret = "test-anthropic-secret"
+    credentials = KnownCredentials([KnownCredential("ANTHROPIC_API_KEY", secret)])
+    help_output = (
+        b"--print --output-format --json-schema --resume --safe-mode --tools "
+        b"--mcp-config --strict-mcp-config --setting-sources\n"
+    )
+    transport = FakeNativeTransport([
+        (b"2.1.177 (Claude Code)\n", b"", 0),
+        (help_output, b"", 0),
+        (b'{"loggedIn":true}\n', b"", 0),
+        (
+            b"",
+            f"API Error: 401 OAuth access token has expired: {secret}".encode(),
+            1,
+        ),
+    ])
+    source = _source_environment()
+    source["ANTHROPIC_API_KEY"] = secret
+    adapter = ClaudeAdapter(
+        AgentTarget(runtime="claude-code", model="claude-model", effort=None),
+        role="participant",
+        access_mode="packet-only",
+        store=RunStore(tmp_path / "state"),
+        credentials=credentials,
+        preflight_seconds=10,
+        capability_probe_seconds=10,
+        stdout_limit=4096,
+        stderr_limit=4096,
+        graceful_kill_seconds=1,
+        source_environment=source,
+        transport=transport,
+        which=lambda _: str(executable),
+    )
+
+    with pytest.raises(NativePreflightError) as rejected:
+        await adapter.preflight(adapter.target)
+
+    message = str(rejected.value)
+    assert "pinned Claude capability probe process failed" in message
+    assert "end_reason=completed, exit_code=1, cleanup_confirmed=True" in message
+    assert "401 OAuth access token has expired" in message
+    assert secret not in message
 
 
 @pytest.mark.asyncio
@@ -1156,7 +1240,7 @@ async def test_native_adapters_persist_gate_a_binding_and_real_stream_evidence(
     target_evidence = json.loads(
         (handle.path / "audit/targets/driver/driver.json").read_text(encoding="utf-8")
     )
-    assert target_evidence["cli_version"] == "0.151.0-alpha.7.1"
+    assert target_evidence["cli_version"] == "0.150.0-alpha.12.2"
     assert target_evidence["resolved_executable"] == str(executable.resolve())
     attempt_path = handle.path / "turns/driver/driver/initial.attempt.json"
     attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
