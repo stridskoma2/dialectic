@@ -160,6 +160,7 @@ class ConsensusSpec(ClosedModel):
 class CouncilSpec(ClosedModel):
     participants: list[ParticipantSpec] = Field(min_length=2, max_length=5)
     moderator: ModeratorSpec
+    moderator_mode: Literal["fresh", "independent-opening"] = "fresh"
     consensus: ConsensusSpec
 
     @model_validator(mode="after")
@@ -1082,6 +1083,12 @@ class DerivedBallot(ControllerArtifact):
 
 class OpeningPositionArtifact(ControllerArtifact):
     participant_alias: str
+    packet_sha256: str
+    position: OpeningPosition
+
+
+class ModeratorOpeningArtifact(ControllerArtifact):
+    moderator_target: AgentTarget
     packet_sha256: str
     position: OpeningPosition
 

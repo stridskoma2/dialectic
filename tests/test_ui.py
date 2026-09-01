@@ -21,6 +21,7 @@ from dialectic.ui import (
     _prepare_run,
     _response_excerpts,
     _resolve_repository_path,
+    _summary_brief,
     _shutdown_windows_bridge,
     _ui_html,
     _windows_bridge_config,
@@ -36,6 +37,10 @@ def test_desktop_ui_contains_the_primary_workflow_controls(tmp_path: Path) -> No
         "Repository",
         "Browse",
         "Main model",
+        "Moderator",
+        "Moderator behavior",
+        "Fresh synthesis only",
+        "Independent opening + synthesis",
         "mainModel",
         "Review models",
         "Council participants",
@@ -43,6 +48,9 @@ def test_desktop_ui_contains_the_primary_workflow_controls(tmp_path: Path) -> No
         "Run Code Once",
         "App log",
         "Model responses",
+        "outcomePanel",
+        "Outcome / summary",
+        "summaryBrief",
         "previewDialog",
         "/api/content",
         "contextmenu",
@@ -85,6 +93,23 @@ def test_desktop_ui_contains_the_primary_workflow_controls(tmp_path: Path) -> No
     assert responses[0]["excerpt"].startswith("First line Second line")
     assert len(responses[0]["excerpt"]) == 280
     assert responses[0]["excerpt"].endswith("…")
+
+    summary = tmp_path / "summary.md"
+    summary.write_text(
+        "# Dialectic run test\n\nStatus: FINALIZED\nOutcome: UNANIMOUS\n\n"
+        "## Council answer\n\nUse the bounded final answer.\n\n## Vote matrix\n\nignored\n",
+        encoding="utf-8",
+    )
+    assert _summary_brief(summary) == "Use the bounded final answer."
+    summary.write_text(
+        "# Dialectic run test\n\nStatus: FINALIZED\n"
+        "Outcome: COMPLETED_NO_FINDINGS\n\n"
+        "Repair turn: not performed.\nRe-review: not applicable.\n",
+        encoding="utf-8",
+    )
+    assert _summary_brief(summary) == (
+        "Repair turn: not performed.\nRe-review: not applicable."
+    )
 
 
 def test_desktop_model_options_use_friendly_names_and_report_installed_clis(
@@ -273,11 +298,16 @@ def test_desktop_council_request_does_not_disclose_repository() -> None:
                 },
             ],
             "maxDissenters": 0,
+            "moderatorMode": "independent-opening",
         }
     )
 
     assert prepared.repository is None
-    assert ConfigLoader({}).load(prepared.config_bytes, mode="council").config.council is not None
+    council = ConfigLoader({}).load(
+        prepared.config_bytes, mode="council"
+    ).config.council
+    assert council is not None
+    assert council.moderator_mode == "independent-opening"
 
 
 @pytest.mark.parametrize(
@@ -335,6 +365,7 @@ def test_desktop_server_requires_its_session_cookie_and_same_origin(
             assert b"Dialectic" in response.read()
         with opener.open(f"{server.origin}/api/status", timeout=5) as response:
             assert response.status == 200
+            assert json.load(response)["summaryBrief"] == ""
 
         preview_request = urllib.request.Request(
             f"{server.origin}/api/content",

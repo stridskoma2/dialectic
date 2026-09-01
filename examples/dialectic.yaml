@@ -32,6 +32,7 @@ council:
   moderator:
     runtime: codex
     model: ${CODEX_COUNCIL_MODEL}
+  moderator_mode: fresh
   consensus:
     max_dissenters: 1
 

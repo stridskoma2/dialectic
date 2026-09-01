@@ -29,11 +29,18 @@ from .app_logging import (
 )
 from .contracts import RunMode
 from .runtime import build_service
-from .ui_config import RuntimeName, UiAgentChoice, UiRunConfig, build_config_bytes
+from .ui_config import (
+    ModeratorMode,
+    RuntimeName,
+    UiAgentChoice,
+    UiRunConfig,
+    build_config_bytes,
+)
 
 _MAX_REQUEST_BYTES = 262_144
 _MAX_PREVIEW_BYTES = 1_048_576
 _MAX_RESPONSE_EXCERPT_CHARS = 280
+_MAX_SUMMARY_BRIEF_CHARS = 4_000
 _IDLE_SHUTDOWN_SECONDS = 30 * 60
 _LOGGER = logging.getLogger("dialectic.ui")
 
@@ -126,6 +133,11 @@ def _prepare_run(payload: object) -> _PreparedRun:
     max_dissenters = payload.get("maxDissenters", 0)
     if type(max_dissenters) is not int:
         raise ValueError("Allowed dissenters must be an integer")
+    moderator_mode = "fresh"
+    if mode == "council":
+        moderator_mode = _string(
+            payload.get("moderatorMode", "fresh"), "moderator mode"
+        )
     config_bytes = build_config_bytes(
         UiRunConfig(
             mode=cast(RunMode, mode),
@@ -134,6 +146,7 @@ def _prepare_run(payload: object) -> _PreparedRun:
             main_effort=main_effort,
             agents=tuple(agents),
             max_dissenters=max_dissenters,
+            moderator_mode=cast(ModeratorMode, moderator_mode),
         )
     )
 
@@ -266,6 +279,7 @@ class _UiState:
             "failure": "",
             "artifactDir": "",
             "summaryPath": "",
+            "summaryBrief": "",
             "logPath": str(log_path) if log_path is not None else "",
             "worktree": "",
             "branch": "",
@@ -306,6 +320,7 @@ class _UiState:
                     "failure": "",
                     "artifactDir": "",
                     "summaryPath": "",
+                    "summaryBrief": "",
                     "worktree": "",
                     "branch": "",
                     "unresolvedCount": 0,
@@ -398,6 +413,8 @@ class _UiState:
             failure = ""
             if record.failure_kind:
                 failure = f"{record.failure_kind}: {record.failure_detail or ''}".strip()
+            summary_path = artifact_dir / "summary.md"
+            summary_brief = _summary_brief(summary_path) or failure
             with self._lock:
                 self._snapshot.update(
                     {
@@ -408,7 +425,8 @@ class _UiState:
                         "outcome": record.code_outcome or record.consensus_outcome or "",
                         "failure": failure,
                         "artifactDir": str(artifact_dir),
-                        "summaryPath": str(artifact_dir / "summary.md"),
+                        "summaryPath": str(summary_path),
+                        "summaryBrief": summary_brief,
                         "worktree": (
                             workspace.dialectic_worktree
                             if workspace is not None and workspace.dialectic_worktree is not None
@@ -442,12 +460,14 @@ class _UiState:
                 exception_type=type(exc).__name__,
             )
             with self._lock:
+                failure = f"{type(exc).__name__}: {exc}"
                 self._snapshot.update(
                     {
                         "active": False,
                         "phase": "-",
                         "status": "UI_ERROR",
-                        "failure": f"{type(exc).__name__}: {exc}",
+                        "failure": failure,
+                        "summaryBrief": failure,
                     }
                 )
         finally:
@@ -706,6 +726,43 @@ def _text_preview(path: Path, *, tail: bool) -> tuple[str, bool]:
         marker = "… earlier content omitted …\n" if tail else "\n… later content omitted …"
         text = marker + text if tail else text + marker
     return text, truncated
+
+
+def _summary_brief(path: Path) -> str:
+    """Return the final answer or concise terminal notes from a persisted summary."""
+    try:
+        text, _truncated = _text_preview(path, tail=False)
+    except (OSError, ValueError):
+        return ""
+    lines = text.splitlines()
+    try:
+        answer_start = next(
+            index + 1
+            for index, line in enumerate(lines)
+            if line.strip() == "## Council answer"
+        )
+    except StopIteration:
+        answer_start = -1
+    if answer_start >= 0:
+        answer_lines: list[str] = []
+        for line in lines[answer_start:]:
+            if line.startswith("## "):
+                break
+            answer_lines.append(line)
+        brief = "\n".join(answer_lines).strip()
+    else:
+        notes = [
+            line
+            for line in lines
+            if not line.startswith("# ")
+            and not line.startswith("Status: ")
+            and not line.startswith("Outcome: ")
+            and not line.startswith("Failure: ")
+        ]
+        brief = "\n".join(notes).strip()
+    if len(brief) > _MAX_SUMMARY_BRIEF_CHARS:
+        return brief[: _MAX_SUMMARY_BRIEF_CHARS - 1].rstrip() + "…"
+    return brief
 
 
 def _response_excerpts(artifact_dir: Path) -> list[dict[str, str]]:

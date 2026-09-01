@@ -38,6 +38,7 @@ from .schemas import (
     CouncilRevisionArtifact,
     DerivedBallot,
     EventRecord,
+    ModeratorOpeningArtifact,
     OpeningPosition,
     OpeningPositionArtifact,
     RunRecord,
@@ -312,10 +313,86 @@ class CouncilOnceOrchestrator:
         moderator_target: AgentTarget,
         moderator_gate: _GateAEvidence,
     ) -> RunRecord:
+        council = context.config.council
+        if council is None:
+            raise DialecticFailure("INTERNAL_ERROR", "validated council configuration vanished")
         opening_prompt = _opening_prompt(context.input_text)
-        self._require_all_packets(context, [(item.target_id, opening_prompt) for item in participants], OpeningPosition)
+        moderator_opening_prompt = (
+            _moderator_opening_prompt(context.input_text)
+            if council.moderator_mode == "independent-opening"
+            else None
+        )
+        opening_packets = [(item.target_id, opening_prompt) for item in participants]
+        if moderator_opening_prompt is not None:
+            opening_packets.append(("moderator", moderator_opening_prompt))
+        self._require_all_packets(context, opening_packets, OpeningPosition)
         context.service.advance_phase(context.handle, "OPENING_POSITIONS")
         context.service.mark_model_work_started(context.handle)
+
+        moderator_opening: OpeningPosition | None = None
+        moderator_directory: Path | None = None
+        if moderator_opening_prompt is not None:
+            moderator_directory = context.service.store.create_role_directory(
+                context.handle, "council-role-directories", "moderator"
+            )
+            opening_binding, opening_binding_sha, opening_relative = self._bind_packet_role(
+                context,
+                role="moderator",
+                target_id="moderator",
+                phase="opening",
+                neutral=moderator_directory,
+                gate=moderator_gate,
+                adapter=self.moderator_adapter,
+            )
+            self._evidence.validate_launch_evidence(
+                context,
+                gate_a=moderator_gate,
+                binding=opening_binding,
+                binding_sha256=opening_binding_sha,
+                binding_relative_path=opening_relative,
+                dynamic_paths={"neutral_role_dir": moderator_directory},
+            )
+            moderator_opening_turn = await self._evidence.invoke_turn(
+                context,
+                adapter=self.moderator_adapter,
+                target=moderator_target,
+                gate_a=moderator_gate,
+                binding_sha256=opening_binding_sha,
+                role="moderator",
+                target_id="moderator",
+                phase="opening",
+                operation="start",
+                prompt=moderator_opening_prompt,
+                output_schema=OpeningPosition.model_json_schema(),
+                working_directory=moderator_directory,
+                access_mode="packet-only",
+                failure_kind="MODERATOR_FAILED",
+                workflow_timeout=self._workflow_timeout,
+            )
+            try:
+                moderator_opening = extract_model_payload(
+                    moderator_opening_turn.response.text,
+                    OpeningPosition,
+                    max_chars=context.config.limits.max_model_field_chars,
+                    max_items=context.config.limits.max_model_list_items,
+                )
+            except OutputError as exc:
+                raise DialecticFailure(
+                    "MODERATOR_FAILED", "moderator returned an invalid independent opening"
+                ) from exc
+            context.service.store.write_artifact(
+                context.handle,
+                "council/moderator-opening.json",
+                ModeratorOpeningArtifact(
+                    artifact_schema_version=ARTIFACT_SCHEMA_VERSION,
+                    tool_version=TOOL_VERSION,
+                    moderator_target=moderator_target,
+                    packet_sha256=hashlib.sha256(
+                        moderator_opening_prompt.encode("utf-8")
+                    ).hexdigest(),
+                    position=moderator_opening,
+                ),
+            )
 
         async def opening(item: _Participant) -> None:
             self._revalidate(context, item)
@@ -379,7 +456,7 @@ class CouncilOnceOrchestrator:
             )
 
         await self._participant_cohort(participants, opening)
-        ledger = _position_ledger(participants)
+        ledger = _position_ledger(participants, moderator_opening)
 
         cross_prompts = {
             item.target_id: _cross_prompt(context.input_text, ledger, item.alias)
@@ -462,12 +539,16 @@ class CouncilOnceOrchestrator:
         await self._participant_cohort(participants, cross)
 
         moderation_prompt = _moderator_prompt(
-            context.input_text, ledger, _revision_ledger(participants)
+            context.input_text,
+            ledger,
+            _revision_ledger(participants),
+            participant_aliases=[item.alias for item in participants],
         )
         self._require_all_packets(context, [("moderator", moderation_prompt)], CandidateConclusion)
-        moderator_directory = context.service.store.create_role_directory(
-            context.handle, "council-role-directories", "moderator"
-        )
+        if moderator_directory is None:
+            moderator_directory = context.service.store.create_role_directory(
+                context.handle, "council-role-directories", "moderator"
+            )
         moderator_binding, moderator_binding_sha, moderator_relative = self._bind_packet_role(
             context,
             role="moderator",
@@ -609,27 +690,32 @@ class CouncilOnceOrchestrator:
         if any(item.persistent and not item.closed for item in participants):
             raise DialecticFailure("INTERNAL_ERROR", "a retained council lease survived ballots")
 
-        council = context.config.council
-        if council is None:
-            raise DialecticFailure("INTERNAL_ERROR", "validated council configuration vanished")
         outcome = _consensus_outcome(
             derived,
             participant_count=len(participants),
             max_dissenters=council.consensus.max_dissenters,
         )
         context.service.advance_phase(context.handle, "REPORTING")
-        notes = _report_lines(candidate, derived, participants)
+        notes = _report_lines(
+            candidate,
+            derived,
+            participants,
+            moderator_opening=moderator_opening,
+        )
+        artifact_paths = {
+            "aliases": "council/aliases.json",
+            "candidate": "council/candidate.json",
+            "ballots": "council/ballots",
+            "openings": "council/opening",
+            "revisions": "council/cross-examination",
+        }
+        if moderator_opening is not None:
+            artifact_paths["moderator_opening"] = "council/moderator-opening.json"
         return context.service.finalize_council(
             context.handle,
             outcome,
             unresolved_items=candidate.unresolved_questions,
-            artifact_paths={
-                "aliases": "council/aliases.json",
-                "candidate": "council/candidate.json",
-                "ballots": "council/ballots",
-                "openings": "council/opening",
-                "revisions": "council/cross-examination",
-            },
+            artifact_paths=artifact_paths,
             markdown_notes=notes,
         )
 
@@ -1113,13 +1199,40 @@ def _opening_prompt(prompt: str) -> str:
     ).decode("utf-8")
 
 
-def _position_ledger(participants: Sequence[_Participant]) -> dict[str, Any]:
+def _moderator_opening_prompt(prompt: str) -> str:
+    return _canonical_dict_bytes(
+        {
+            "phase": "opening",
+            "prompt": prompt,
+            "instruction": (
+                "Give one independent answer before seeing any participant response. "
+                "You are non-voting, and a later fresh moderator session will synthesize "
+                "the council result."
+            ),
+            "output_schema": OpeningPosition.model_json_schema(),
+        }
+    ).decode("utf-8")
+
+
+def _position_ledger(
+    participants: Sequence[_Participant],
+    moderator_opening: OpeningPosition | None = None,
+) -> dict[str, Any]:
+    positions: list[dict[str, Any]] = []
+    if moderator_opening is not None:
+        positions.append(
+            {
+                "alias": "Moderator opening",
+                "position": moderator_opening.model_dump(mode="json"),
+            }
+        )
+    positions.extend(
+        {"alias": item.alias, "position": item.opening.model_dump(mode="json")}
+        for item in participants
+        if item.opening is not None
+    )
     return {
-        "positions": [
-            {"alias": item.alias, "position": item.opening.model_dump(mode="json")}
-            for item in participants
-            if item.opening is not None
-        ]
+        "positions": positions
     }
 
 
@@ -1150,7 +1263,11 @@ def _cross_prompt(prompt: str, ledger: Mapping[str, Any], alias: str) -> str:
 
 
 def _moderator_prompt(
-    prompt: str, positions: Mapping[str, Any], revisions: Mapping[str, Any]
+    prompt: str,
+    positions: Mapping[str, Any],
+    revisions: Mapping[str, Any],
+    *,
+    participant_aliases: Sequence[str],
 ) -> str:
     return _canonical_dict_bytes(
         {
@@ -1158,11 +1275,14 @@ def _moderator_prompt(
             "prompt": prompt,
             "position_ledger": positions,
             "revision_ledger": revisions,
+            "eligible_supporting_participants": list(participant_aliases),
             "instruction": (
                 "Act as a fresh non-voting moderator. Produce a concise candidate answer "
                 "split into independently ratifiable propositions. Proposition IDs must "
                 "match [a-z][a-z0-9-]{0,31} (for example p-1), and supporting_participants "
-                "may contain only aliases present in position_ledger."
+                "may contain only aliases listed in eligible_supporting_participants. "
+                "If a Moderator opening appears in position_ledger, treat it as a blind "
+                "non-voting position rather than an eligible supporting participant."
             ),
             "output_schema": CandidateConclusion.model_json_schema(),
         }
@@ -1197,9 +1317,21 @@ def _report_lines(
     candidate: CandidateConclusion,
     ballots: Sequence[DerivedBallot],
     participants: Sequence[_Participant],
+    *,
+    moderator_opening: OpeningPosition | None = None,
 ) -> list[str]:
     by_alias = {ballot.participant_alias: ballot for ballot in ballots}
-    lines = ["## Council answer", "", candidate.answer, "", "## Vote matrix", ""]
+    lines: list[str] = []
+    if moderator_opening is not None:
+        lines.extend(
+            [
+                "## Moderator independent opening",
+                "",
+                moderator_opening.conclusion,
+                "",
+            ]
+        )
+    lines.extend(["## Council answer", "", candidate.answer, "", "## Vote matrix", ""])
     header = "| Proposition | " + " | ".join(item.alias for item in participants) + " |"
     lines.extend([header, "|---|" + "---|" * len(participants)])
     for proposition in candidate.propositions:

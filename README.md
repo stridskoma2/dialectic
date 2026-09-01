@@ -4,8 +4,9 @@ Dialectic is a bounded local supervisor for two one-shot workflows:
 
 - **Code Once:** one Codex driver implementation, one concurrent immutable-diff
   review, at most one repair turn, then stop without re-review.
-- **Council Once:** blind openings, one anonymized cross-examination, a fresh
-  moderator, complete ballots, controller-derived consensus, then stop.
+- **Council Once:** parallel blind openings, one anonymized cross-examination, a
+  fresh moderator synthesis, complete ballots, controller-derived consensus, then
+  stop. An optional blind moderator opening can be added before participant work.
 
 Dialectic is alpha software for trusted local use. It launches installed native
 AI CLIs with narrow, version-qualified policies, but it does not claim to confine
@@ -50,6 +51,9 @@ summaries, artifacts, application logs, and isolated worktrees. The catalog incl
 locally configured selectors, while authentication and account-specific model access
 remain verified by native preflight. Council Once remains prompt-only, so a repository
 selected for Code Once is visibly disabled and is not disclosed to council participants.
+Its **Moderator behavior** selector chooses either fresh synthesis only or an
+independent blind moderator opening followed by fresh synthesis. Participant openings,
+cross-examinations, and ballots run in parallel within their respective phases.
 
 For a release build, install `.[release]` and run `python -m build`. The package
 version, controller version, and artifact version are pinned to `0.1.0`, `0.1.0`,
@@ -167,6 +171,9 @@ Cleanup is never automatic.
   Native commands use executable/argument arrays; prompts travel over stdin or ACP.
 - Codex is the only writable driver. Reviewers, council participants, and the
   moderator receive packet-only neutral directories.
+- Packet-only roles cannot browse: web search, MCP, apps, and built-in tools are
+  disabled by the qualified native profiles. They reason only from the supplied
+  prompt and controller-built ledgers.
 - The controller does not inject a repository/worktree path into packet-only
   prompts, argv, environment overrides, or packet artifacts. A bounded user task
   or driver-authored product diff may itself contain such a path; Dialectic neither

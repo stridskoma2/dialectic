@@ -63,6 +63,7 @@ def test_desktop_council_config_maps_moderator_participants_and_consensus() -> N
                 UiAgentChoice(runtime="grok-build", model="grok-participant"),
             ),
             max_dissenters=1,
+            moderator_mode="independent-opening",
         )
     )
 
@@ -72,6 +73,7 @@ def test_desktop_council_config_maps_moderator_participants_and_consensus() -> N
         "model": "codex-moderator",
         "effort": "xhigh",
     }
+    assert parsed["council"]["moderator_mode"] == "independent-opening"
     assert [item["id"] for item in parsed["council"]["participants"]] == [
         "participant-a",
         "participant-b",

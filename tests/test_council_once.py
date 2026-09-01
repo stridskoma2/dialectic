@@ -183,6 +183,7 @@ async def _scenario(
     ballot_payloads: list[dict[str, Any]] | None = None,
     openings: list[dict[str, Any]] | None = None,
     revisions: list[dict[str, Any]] | None = None,
+    moderator_opening: dict[str, Any] | None = None,
     candidate: dict[str, Any] | None = None,
     errors: dict[tuple[int, str], BaseException] | None = None,
     delays: dict[tuple[int, str], float] | None = None,
@@ -249,23 +250,35 @@ async def _scenario(
     if adapter_mutator is not None:
         adapter_mutator(adapters)
     moderator_target = _moderator_target(data)
+    moderator_steps: list[ScriptedStep] = []
+    if data["council"].get("moderator_mode", "fresh") == "independent-opening":
+        moderator_steps.append(
+            ScriptedStep(
+                response=_response(
+                    {"runtime": moderator_target.runtime, "model": moderator_target.model},
+                    "moderator-opening-session",
+                    moderator_opening or _opening(99),
+                )
+            )
+        )
+    moderator_steps.append(
+        ScriptedStep(
+            response=(
+                None
+                if moderator_error is not None
+                else _response(
+                    {"runtime": moderator_target.runtime, "model": moderator_target.model},
+                    "moderator-fresh-session",
+                    candidate_payload,
+                )
+            ),
+            error=moderator_error,
+            delay_seconds=moderator_delay,
+        )
+    )
     moderator = ScriptedAgentAdapter(
         moderator_target,
-        [
-            ScriptedStep(
-                response=(
-                    None
-                    if moderator_error is not None
-                    else _response(
-                        {"runtime": moderator_target.runtime, "model": moderator_target.model},
-                        "moderator-fresh-session",
-                        candidate_payload,
-                    )
-                ),
-                error=moderator_error,
-                delay_seconds=moderator_delay,
-            )
-        ],
+        moderator_steps,
     )
     store = RunStore(
         tmp_path / "state",
@@ -472,7 +485,9 @@ async def test_council_004_changed_mind_and_reason_are_retained(tmp_path: Path, 
 
 @pytest.mark.asyncio
 async def test_council_005_moderator_is_fresh_and_non_voting(tmp_path: Path, limits: dict[str, int]) -> None:
-    _record, handle, adapters, moderator, _store = await _scenario(tmp_path, limits)
+    _record, handle, adapters, moderator, _store = await _scenario(
+        tmp_path / "fresh", limits
+    )
     assert [(item.operation, item.session_id) for item in moderator.invocations] == [("start", None)]
     moderator_request = moderator.invocations[0]
     assert "[a-z][a-z0-9-]{0,31}" in moderator_request.prompt
@@ -481,6 +496,36 @@ async def test_council_005_moderator_is_fresh_and_non_voting(tmp_path: Path, lim
     assert proposition_schema["properties"]["id"]["pattern"] == "^[a-z][a-z0-9-]{0,31}$"
     assert moderator not in adapters
     assert not (handle.path / "council/ballots/moderator.json").exists()
+
+    opening = _opening(99, conclusion="A blind moderator opening marker.")
+
+    def independent_mode(data: dict[str, Any]) -> None:
+        data["council"]["moderator_mode"] = "independent-opening"
+
+    independent_record, independent_handle, independent_adapters, independent_moderator, _ = (
+        await _scenario(
+            tmp_path / "independent",
+            limits,
+            moderator_opening=opening,
+            config_mutator=independent_mode,
+        )
+    )
+    assert independent_record.status == "FINALIZED"
+    assert [
+        (item.operation, item.session_id, item.turn_phase)
+        for item in independent_moderator.invocations
+    ] == [
+        ("start", None, "opening"),
+        ("start", None, "candidate"),
+    ]
+    assert "A blind moderator opening marker." in independent_adapters[0].invocations[1].prompt
+    assert "Moderator opening" in independent_adapters[0].invocations[1].prompt
+    assert "A blind moderator opening marker." in independent_moderator.invocations[1].prompt
+    assert (independent_handle.path / "council/moderator-opening.json").is_file()
+    assert "## Moderator independent opening" in (
+        independent_handle.path / "summary.md"
+    ).read_text(encoding="utf-8")
+    assert not (independent_handle.path / "council/ballots/moderator.json").exists()
 
 
 @pytest.mark.asyncio

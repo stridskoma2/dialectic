@@ -12,6 +12,7 @@ from .contracts import RunMode
 
 RuntimeName: TypeAlias = Literal["codex", "claude-code", "grok-build"]
 ReviewRuntime: TypeAlias = RuntimeName | Literal["@driver"]
+ModeratorMode: TypeAlias = Literal["fresh", "independent-opening"]
 
 SUPPORTED_EFFORTS: dict[RuntimeName, tuple[str, ...]] = {
     "codex": ("", "low", "medium", "high", "xhigh", "max", "ultra"),
@@ -70,6 +71,7 @@ class UiRunConfig:
     main_effort: str
     agents: tuple[UiAgentChoice, ...]
     max_dissenters: int = 0
+    moderator_mode: ModeratorMode = "fresh"
 
 
 def build_config_bytes(request: UiRunConfig) -> bytes:
@@ -110,12 +112,15 @@ def build_config_bytes(request: UiRunConfig) -> bytes:
                 "Allowed dissenters must be at least zero and less than the "
                 "participant count"
             )
+        if request.moderator_mode not in {"fresh", "independent-opening"}:
+            raise ValueError("Unsupported moderator mode")
         data["council"] = {
             "participants": [
                 _participant_payload(choice, index)
                 for index, choice in enumerate(request.agents)
             ],
             "moderator": main_target,
+            "moderator_mode": request.moderator_mode,
             "consensus": {"max_dissenters": request.max_dissenters},
         }
 
