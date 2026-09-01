@@ -7,8 +7,8 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable
 
 import pytest
@@ -23,18 +23,21 @@ from dialectic.capabilities import (
     validate_binding_identities,
 )
 from dialectic.code_once import CodeOnceOrchestrator
-from dialectic.codex_policy import (
-    CodexConstructionFixture,
-    CodexPolicyError,
-    build_codex_driver_construction,
-)
 from dialectic.git_workspace import (
     ChangeValidator,
     GitRunner,
     GitWorkflowError,
     GitWorkspace,
+    _controller_git_environment,
 )
 from dialectic.locking import RepositoryBusyError, RepositoryLock, resolve_repository_identity
+from dialectic.native_adapters import (
+    NativePreflightError,
+    _fixture as _native_fixture,
+    _reject_displacing_codex_policy,
+    _trusted_environment,
+)
+from dialectic.redaction import KnownCredentials
 from dialectic.schemas import (
     AgentResponse,
     AgentTarget,
@@ -49,7 +52,7 @@ from dialectic.schemas import (
 )
 from dialectic.scratch import ScratchCleanupTimeout, ScratchContainmentError
 from dialectic.research import research_policy
-from dialectic.service import DialecticService
+from dialectic.service import DialecticFailure, DialecticService
 from dialectic.store import RunHandle, RunStore
 from dialectic.turn_workspace import TurnWorkspace
 
@@ -814,7 +817,9 @@ async def test_code_026_controller_git_disables_repository_hooks(
     assert not sentinel.exists()
 
 
-def test_code_027_git_runner_pins_external_command_and_signing_defenses(tmp_path: Path) -> None:
+def test_code_027_git_runner_pins_external_command_and_signing_defenses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     repo = _make_repo(tmp_path)
     hooks = tmp_path / "empty-hooks"
     hooks.mkdir()
@@ -825,6 +830,15 @@ def test_code_027_git_runner_pins_external_command_and_signing_defenses(tmp_path
     assert "core.fsmonitor=false" in command
     assert "commit.gpgSign=false" in command
     assert "core.pager=cat" in command
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "wrong.git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "wrong-worktree"))
+    monkeypatch.setenv("GIT_ASKPASS", "hostile-helper")
+    environment = _controller_git_environment(os.environ)
+    assert not {"GIT_DIR", "GIT_WORK_TREE", "GIT_ASKPASS"}.intersection(environment)
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
+    assert environment["GCM_INTERACTIVE"] == "Never"
+    top = runner.run(["rev-parse", "--show-toplevel"], cwd=repo).stdout
+    assert Path(top.decode().strip()).resolve() == repo.resolve()
 
 
 @pytest.mark.asyncio
@@ -1136,33 +1150,47 @@ async def test_code_038_ignored_bytecode_is_excluded_from_snapshot(
 
 
 def test_code_039_codex_environment_construction_withholds_credentials(tmp_path: Path) -> None:
-    for name in ("worktree", "git", "original", "state", "scratch", "control", "tmp"):
-        (tmp_path / name).mkdir()
-    fixture = CodexConstructionFixture(
-        credential_environment_names=("API_SECRET",),
-        non_secret_environment_names=("PATH", "TEMP"),
-        saved_auth_paths=(tmp_path / "auth.json",),
+    source = {
+        "CODEX_HOME": str(tmp_path / "codex-home"),
+        "OPENAI_API_KEY": "supersecret",
+        "OTHER": "not-declared",
+    }
+    required = (
+        ("SystemRoot", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PATH")
+        if os.name == "nt"
+        else ("HOME", "PATH")
     )
-    construction = build_codex_driver_construction(
-        fixture=fixture,
-        source_environment={"API_SECRET": "supersecret", "PATH": "bin", "TEMP": "temp", "OTHER": "no"},
-        worktree=tmp_path / "worktree",
-        git_common_dir=tmp_path / "git",
-        original_worktree=tmp_path / "original",
-        state_root=tmp_path / "state",
-        scratch_root=tmp_path / "scratch",
-        scratch_control=tmp_path / "control",
-        scratch_tmp=tmp_path / "tmp",
+    source.update({name: f"value-{name}" for name in required})
+    fixture = _native_fixture(
+        "codex",
+        "0.150.0-alpha.12.2",
+        role="driver",
+        access_mode="driver-write",
+        source_environment=source,
     )
-    assert set(construction.trusted_environment) == {"API_SECRET", "PATH", "TEMP"}
-    assert construction.child_environment_policy["exclude"] == ["API_SECRET"]
-    assert "--sandbox" not in construction.arguments
-    assert construction.arguments.count("-c") > 0
-    assert all(not item.startswith("-cprofile=") for item in construction.arguments)
-    serialized = json.dumps({"policy": construction.child_environment_policy, "profile": construction.concrete_profile})
+    credentials = KnownCredentials.from_environment(
+        fixture.credential_environment_names, source
+    )
+    trusted, used_credentials = _trusted_environment(fixture, source, credentials)
+    assert set(trusted) == {
+        *required,
+        "CODEX_HOME",
+        "OPENAI_API_KEY",
+        "TMP",
+        "TEMP",
+        "TMPDIR",
+    }
+    assert used_credentials == ("OPENAI_API_KEY",)
+    assert "OTHER" not in trusted
+
+    profile = fixture.capability_fixture.template
+    child_policy = profile["shell_environment_policy"]
+    assert set(child_policy["exclude"]) == set(fixture.credential_environment_names)
+    assert "--sandbox" not in fixture.static_flags
+    serialized = json.dumps(profile, sort_keys=True)
     assert "supersecret" not in serialized
-    filesystem = construction.concrete_profile["permissions"]["dialectic-driver"]["filesystem"]
-    assert filesystem[str((tmp_path / "auth.json").resolve())] == "deny"
+    filesystem = profile["permissions"]["dialectic-driver"]["filesystem"]
+    assert filesystem[str((tmp_path / "codex-home" / "auth.json").resolve())] == "deny"
 
 
 @pytest.mark.asyncio
@@ -1200,95 +1228,25 @@ async def test_code_040_driver_bindings_recreate_exact_scratch_roles_and_identit
     broken = initial.model_copy(update={"dynamic_filesystem_identities": [item for item in initial.dynamic_filesystem_identities if item.role != "turn_scratch_tmp"]})
     with pytest.raises(ValidationError):
         CapabilityBindingArtifact.model_validate(broken.model_dump())
-    with pytest.raises(CodexPolicyError):
-        build_codex_driver_construction(
-            fixture=CodexConstructionFixture((), (), ()),
-            source_environment={},
-            worktree=Path(_load_json(handle.path / "git/workspace.json")["dialectic_worktree"]),
-            git_common_dir=repo / ".git",
-            original_worktree=repo,
-            state_root=handle.path.parent.parent,
-            scratch_root=tmp_path,
-            scratch_control=tmp_path,
-            scratch_tmp=tmp_path,
-            managed_policy={"sandbox_mode": "workspace-write"},
+    with pytest.raises(NativePreflightError, match="legacy sandbox"):
+        _reject_displacing_codex_policy(
+            {"sandbox_mode": "workspace-write"},
+            profile_name="dialectic-driver",
+            web_search="disabled",
+            label="test policy",
         )
 
-    policy_root = tmp_path / "policy"
-    policy_paths = {
-        name: policy_root / name
-        for name in ("worktree", "git", "original", "state", "scratch", "control", "tmp")
-    }
-    for path in policy_paths.values():
-        path.mkdir(parents=True)
-    auth_path = policy_root / "saved-auth.json"
-    construction = build_codex_driver_construction(
-        fixture=CodexConstructionFixture((), (), (auth_path,)),
-        source_environment={},
-        worktree=policy_paths["worktree"],
-        git_common_dir=policy_paths["git"],
-        original_worktree=policy_paths["original"],
-        state_root=policy_paths["state"],
-        scratch_root=policy_paths["scratch"],
-        scratch_control=policy_paths["control"],
-        scratch_tmp=policy_paths["tmp"],
-    )
-    expected_filesystem = {
-        ":root": "deny",
-        ":minimal": "read",
-        ":tmpdir": "deny",
-        ":slash_tmp": "deny",
-        "<isolated_worktree>": "write",
-        "<isolated_worktree:.git>": "read",
-        "<isolated_worktree:.codex>": "read",
-        "<git_common_dir>": "read",
-        "<original_worktree>": "deny",
-        "<state_root>": "deny",
-        "<turn_scratch_root>": "read",
-        "<turn_scratch_control>": "read",
-        "<turn_scratch_tmp>": "write",
-        str(auth_path.resolve()): "deny",
-        str(Path(tempfile.gettempdir()).resolve()): "deny",
-    }
-    assert construction.profile_template == {
-        "approval_policy": "never",
-        "apps": {"_default": {"enabled": False}},
-        "default_permissions": "dialectic-driver",
-        "features": {"multi_agent": False},
-        "mcp_servers": {},
-        "permissions": {
-            "dialectic-driver": {
-                "filesystem": expected_filesystem,
-                "network": {"enabled": False},
-            }
-        },
-        "projects": {"<isolated_worktree>": {"trust_level": "untrusted"}},
-        "shell_environment_policy": {
-            "inherit": "core",
-            "ignore_default_excludes": False,
-            "experimental_use_profile": False,
-            "exclude": [],
-            "set": {"GIT_OPTIONAL_LOCKS": "0"},
-        },
-        "web_search": "disabled",
-    }
-    assert construction.arguments[:3] == ("exec", "--ignore-user-config", "--ignore-rules")
-    assert construction.arguments[3] == "--strict-config"
-    assert construction.arguments[-1] == "-"
-    override_keys = [
-        construction.arguments[index + 1].split("=", 1)[0]
-        for index, value in enumerate(construction.arguments[:-1])
-        if value == "-c"
-    ]
-    assert override_keys == sorted(construction.concrete_profile)
-    serialized_profile = json.dumps(construction.concrete_profile, sort_keys=True)
-    assert "sandbox_mode" not in serialized_profile and "--sandbox" not in construction.arguments
-    assert construction.concrete_profile["default_permissions"] == "dialectic-driver"
-    concrete_filesystem = construction.concrete_profile["permissions"]["dialectic-driver"]["filesystem"]
-    assert concrete_filesystem[str(auth_path.resolve())] == "deny"
-
     workspace = Path(_load_json(handle.path / "git/workspace.json")["dialectic_worktree"])
-    scratch = TurnWorkspace.create(workspace)
+    schema_bytes = (
+        json.dumps(
+            {"type": "object"},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
+    scratch = TurnWorkspace.create(workspace, output_schema_bytes=schema_bytes)
+    assert scratch.schema is not None and scratch.schema.read_bytes() == schema_bytes
     dynamic_paths = {
         "isolated_worktree": workspace,
         "git_common_dir": repo / ".git",
@@ -1395,6 +1353,22 @@ async def test_code_040_driver_bindings_recreate_exact_scratch_roles_and_identit
             platform_backend=attestation.platform_backend,
         )
     scratch.verify_and_cleanup(LimitsSpec.model_validate(config_data["limits"]))
+
+    invalid_scratch = TurnWorkspace.create(workspace)
+    (invalid_scratch.control / "unexpected.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(DialecticFailure) as cleanup_failure:
+        CodeOnceOrchestrator._cleanup_driver_scratch(
+            invalid_scratch,
+            SimpleNamespace(
+                config=SimpleNamespace(
+                    limits=LimitsSpec.model_validate(config_data["limits"])
+                )
+            ),
+            trigger=DialecticFailure("DRIVER_FAILED", "sensitive provider detail"),
+        )
+    assert cleanup_failure.value.kind == "INTERNAL_ERROR"
+    assert cleanup_failure.value.detail.endswith("initiating failure: DRIVER_FAILED")
+    assert "sensitive provider detail" not in cleanup_failure.value.detail
 
 
 def test_code_041_equivalent_repository_spellings_share_lock_identity(tmp_path: Path) -> None:

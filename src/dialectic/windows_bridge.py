@@ -16,6 +16,7 @@ from .ui import _choose_repository
 _IDLE_SECONDS = 1800
 _POLL_SECONDS = 0.05
 _REQUEST_PATTERN = re.compile(r"request-([0-9a-f]{32})\.json\Z")
+_TOKEN_ENVIRONMENT = "DIALECTIC_WINDOWS_BRIDGE_TOKEN"
 
 
 def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
@@ -99,14 +100,14 @@ def _run_bridge(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--directory", type=Path, required=True)
-    parser.add_argument("--token", required=True)
     arguments = parser.parse_args()
-    if len(arguments.token) < 16:
+    token = os.environ.get(_TOKEN_ENVIRONMENT, "")
+    if len(token) < 16:
         parser.error("token is invalid")
     if not arguments.directory.is_dir():
         parser.error("bridge directory does not exist")
 
-    _run_bridge(arguments.directory.resolve(), arguments.token)
+    _run_bridge(arguments.directory.resolve(), token)
 
 
 if __name__ == "__main__":

@@ -23,8 +23,8 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: python -m pip install -e ".[test]"
-      - run: python -m pytest -q
+      - run: python -m pip install -e ".[test,desktop]"
+      - run: python -m pytest -q -m "not integration"
       - run: python -m pytest -q -m integration
 
   package:

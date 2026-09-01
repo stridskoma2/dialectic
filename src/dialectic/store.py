@@ -295,14 +295,27 @@ class RunStore:
             replace_func=replace_func or os.replace,
         )
 
-    def append_event(self, handle: RunHandle, event: EventRecord) -> None:
+    def append_event(
+        self,
+        handle: RunHandle,
+        *,
+        phase: str,
+        event_type: str,
+        payload: dict[str, object],
+        timestamp: datetime | None = None,
+    ) -> EventRecord:
         run_dir = self.assert_handle(handle)
-        if event.run_id != handle.run_id:
-            raise ValueError("event run id does not match handle")
         path = run_dir / "events.jsonl"
-        expected = self._next_event_sequence(path)
-        if event.sequence != expected:
-            raise ValueError(f"event sequence must be {expected}")
+        event = EventRecord(
+            artifact_schema_version=ARTIFACT_SCHEMA_VERSION,
+            tool_version=TOOL_VERSION,
+            sequence=self._next_event_sequence(path),
+            timestamp=timestamp or datetime.now(UTC),
+            run_id=handle.run_id,
+            phase=phase,
+            event_type=event_type,
+            payload=payload,
+        )
         data = canonical_json_bytes(event)
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
         if hasattr(os, "O_CLOEXEC"):
@@ -316,6 +329,7 @@ class RunStore:
         finally:
             os.close(fd)
         _apply_private_file_security(path)
+        return event
 
     def write_artifact(
         self,
@@ -378,11 +392,6 @@ class RunStore:
                 if event.sequence != sequence:
                     raise StateCorruptError("events.jsonl sequence is not contiguous")
         return sequence + 1
-
-    def next_event_sequence(self, handle: RunHandle) -> int:
-        run_dir = self.assert_handle(handle)
-        return self._next_event_sequence(run_dir / "events.jsonl")
-
 
 def _created_record(run_id: str, mode: RunMode) -> RunRecord:
     now = datetime.now(UTC)

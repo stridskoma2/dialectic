@@ -541,6 +541,22 @@ async def test_council_005_moderator_is_fresh_and_non_voting(tmp_path: Path, lim
         ("start", None, "opening"),
         ("start", None, "candidate"),
     ]
+    opening_binding = CapabilityBindingArtifact.model_validate_json(
+        (
+            independent_handle.path
+            / "audit/capabilities/moderator/moderator/opening.binding.json"
+        ).read_bytes()
+    )
+    candidate_binding = CapabilityBindingArtifact.model_validate_json(
+        (
+            independent_handle.path
+            / "audit/capabilities/moderator/moderator/candidate.binding.json"
+        ).read_bytes()
+    )
+    assert (
+        opening_binding.dynamic_filesystem_identities[0].filesystem_identity
+        != candidate_binding.dynamic_filesystem_identities[0].filesystem_identity
+    )
     assert "A blind moderator opening marker." in independent_adapters[0].invocations[1].prompt
     assert "Moderator opening" in independent_adapters[0].invocations[1].prompt
     assert "A blind moderator opening marker." in independent_moderator.invocations[1].prompt
@@ -748,7 +764,10 @@ async def test_council_014_exact_round_count_and_no_retained_lease_survives(tmp_
 @pytest.mark.asyncio
 async def test_council_015_report_contains_required_user_facing_sections(tmp_path: Path, limits: dict[str, int]) -> None:
     _record, handle, *_ = await _scenario(
-        tmp_path, limits, ballot_kinds=["accept", "reject", "blocker"]
+        tmp_path,
+        limits,
+        ballot_kinds=["reject", "blocker", "accept"],
+        delays={(0, "ballot"): 0.2, (1, "ballot"): 0.1},
     )
     report = (handle.path / "summary.md").read_text(encoding="utf-8")
     for value in (
@@ -757,6 +776,9 @@ async def test_council_015_report_contains_required_user_facing_sections(tmp_pat
         "codex-model", "claude-model", "grok-model",
     ):
         assert value in report
+    assert report.index("Participant A minority report") < report.index(
+        "Participant B minority report"
+    )
 
 
 def test_council_016_negative_max_dissenters_is_rejected(limits: dict[str, int]) -> None:

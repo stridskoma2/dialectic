@@ -17,35 +17,49 @@ if ((Test-Path -LiteralPath $python) -and (Test-Path -LiteralPath $pythonw)) {
 if (Test-Path -LiteralPath $wsl) {
     & $wsl -d Ubuntu -- bash -lc 'test -x ~/.local/share/dialectic/venv/bin/python' 2>$null
     if ($LASTEXITCODE -eq 0) {
-        $bridgeEnvironment = ''
-        if (Test-Path -LiteralPath $pythonw) {
-            $bridgeDirectory = Join-Path $repositoryRoot ".git\dialectic-ui-bridge\$([Guid]::NewGuid().ToString('N'))"
-            New-Item -ItemType Directory -Path $bridgeDirectory -Force | Out-Null
-            if ($bridgeDirectory -notmatch '^([A-Za-z]):\\(.*)$') {
-                throw "Cannot translate the bridge directory for WSL: $bridgeDirectory"
-            }
-            $bridgeDirectoryWsl = "/mnt/$($Matches[1].ToLowerInvariant())/$($Matches[2].Replace('\', '/'))"
-            $bridgeToken = [Guid]::NewGuid().ToString('N')
-            $bridgeArguments = "-m dialectic.windows_bridge --directory `"$bridgeDirectory`" --token $bridgeToken"
-            $bridgeProcess = Start-Process -FilePath $pythonw -ArgumentList $bridgeArguments -WorkingDirectory $repositoryRoot -PassThru
+        $previousBridgeDirectory = [Environment]::GetEnvironmentVariable('DIALECTIC_WINDOWS_BRIDGE_DIR', 'Process')
+        $previousBridgeToken = [Environment]::GetEnvironmentVariable('DIALECTIC_WINDOWS_BRIDGE_TOKEN', 'Process')
+        $previousWslEnv = [Environment]::GetEnvironmentVariable('WSLENV', 'Process')
+        try {
             $bridgeReady = $false
-            for ($attempt = 0; $attempt -lt 30; $attempt++) {
-                if (Test-Path -LiteralPath (Join-Path $bridgeDirectory '.ready')) {
-                    $bridgeReady = $true
-                    break
+            if (Test-Path -LiteralPath $pythonw) {
+                $bridgeDirectory = Join-Path $repositoryRoot ".git\dialectic-ui-bridge\$([Guid]::NewGuid().ToString('N'))"
+                New-Item -ItemType Directory -Path $bridgeDirectory -Force | Out-Null
+                if ($bridgeDirectory -notmatch '^([A-Za-z]):\\(.*)$') {
+                    throw "Cannot translate the bridge directory for WSL: $bridgeDirectory"
                 }
-                Start-Sleep -Milliseconds 100
+                $bridgeDirectoryWsl = "/mnt/$($Matches[1].ToLowerInvariant())/$($Matches[2].Replace('\', '/'))"
+                $bridgeToken = [Guid]::NewGuid().ToString('N')
+                $env:DIALECTIC_WINDOWS_BRIDGE_TOKEN = $bridgeToken
+                $bridgeArguments = "-m dialectic.windows_bridge --directory `"$bridgeDirectory`""
+                $bridgeProcess = Start-Process -FilePath $pythonw -ArgumentList $bridgeArguments -WorkingDirectory $repositoryRoot -PassThru
+                for ($attempt = 0; $attempt -lt 30; $attempt++) {
+                    if (Test-Path -LiteralPath (Join-Path $bridgeDirectory '.ready')) {
+                        $bridgeReady = $true
+                        break
+                    }
+                    Start-Sleep -Milliseconds 100
+                }
+                if ($bridgeReady) {
+                    $env:DIALECTIC_WINDOWS_BRIDGE_DIR = $bridgeDirectoryWsl
+                    $bridgeWslEnv = 'DIALECTIC_WINDOWS_BRIDGE_DIR/u:DIALECTIC_WINDOWS_BRIDGE_TOKEN/u'
+                    $env:WSLENV = if ([string]::IsNullOrEmpty($previousWslEnv)) {
+                        $bridgeWslEnv
+                    } else {
+                        "$previousWslEnv`:$bridgeWslEnv"
+                    }
+                } else {
+                    Stop-Process -Id $bridgeProcess.Id -ErrorAction SilentlyContinue
+                    Remove-Item -LiteralPath $bridgeDirectory -ErrorAction SilentlyContinue
+                }
             }
-            if ($bridgeReady) {
-                $quotedBridgeDirectory = "'" + $bridgeDirectoryWsl.Replace("'", "'`"'`"'") + "'"
-                $bridgeEnvironment = "DIALECTIC_WINDOWS_BRIDGE_DIR=$quotedBridgeDirectory DIALECTIC_WINDOWS_BRIDGE_TOKEN=$bridgeToken "
-            } else {
-                Stop-Process -Id $bridgeProcess.Id -ErrorAction SilentlyContinue
-                Remove-Item -LiteralPath $bridgeDirectory -ErrorAction SilentlyContinue
-            }
+            $arguments = '-d Ubuntu -- bash -lc "exec ~/.local/share/dialectic/venv/bin/python -m dialectic.ui"'
+            Start-Process -FilePath $wsl -ArgumentList $arguments -WorkingDirectory $repositoryRoot -WindowStyle Hidden
+        } finally {
+            [Environment]::SetEnvironmentVariable('DIALECTIC_WINDOWS_BRIDGE_DIR', $previousBridgeDirectory, 'Process')
+            [Environment]::SetEnvironmentVariable('DIALECTIC_WINDOWS_BRIDGE_TOKEN', $previousBridgeToken, 'Process')
+            [Environment]::SetEnvironmentVariable('WSLENV', $previousWslEnv, 'Process')
         }
-        $arguments = "-d Ubuntu -- bash -lc `"exec env $bridgeEnvironment~/.local/share/dialectic/venv/bin/python -m dialectic.ui`""
-        Start-Process -FilePath $wsl -ArgumentList $arguments -WorkingDirectory $repositoryRoot -WindowStyle Hidden
         exit 0
     }
 }

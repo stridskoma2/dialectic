@@ -4,6 +4,7 @@ import http.cookiejar
 import json
 import os
 import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -27,7 +28,7 @@ from dialectic.ui import (
     _ui_html,
     _windows_bridge_config,
 )
-from dialectic.windows_bridge import _run_bridge
+from dialectic.windows_bridge import _run_bridge, main as windows_bridge_main
 
 
 def test_desktop_ui_contains_the_primary_workflow_controls(tmp_path: Path) -> None:
@@ -299,6 +300,18 @@ def test_windows_bridge_returns_the_selected_path_and_shuts_down(
     token = "test-bridge-token-1234567890"
     bridge_directory = tmp_path / "bridge"
     bridge_directory.mkdir()
+    main_call: list[tuple[Path, str]] = []
+    monkeypatch.setenv("DIALECTIC_WINDOWS_BRIDGE_TOKEN", token)
+    monkeypatch.setattr(
+        "dialectic.windows_bridge._run_bridge",
+        lambda directory, supplied: main_call.append((directory, supplied)),
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["dialectic.windows_bridge", "--directory", str(bridge_directory)]
+    )
+    windows_bridge_main()
+    assert main_call == [(bridge_directory.resolve(), token)]
+
     monkeypatch.setattr("dialectic.ui._is_wsl", lambda: True)
     monkeypatch.setenv("DIALECTIC_WINDOWS_BRIDGE_DIR", str(bridge_directory))
     monkeypatch.setenv("DIALECTIC_WINDOWS_BRIDGE_TOKEN", token)

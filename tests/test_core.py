@@ -6,12 +6,14 @@ import ctypes
 import hashlib
 import io
 import json
+import logging
 import os
 import socket
 import subprocess
 import sysconfig
 import threading
 import time
+from types import SimpleNamespace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -111,6 +113,7 @@ from dialectic.store import (
 from dialectic.turn_timing import TurnDeadlineController, TurnDeadlineExpired
 from dialectic.workflow_evidence import (
     bounded_preflight_diagnostic,
+    redacted_response,
     stage_preflight_requests,
 )
 
@@ -195,6 +198,10 @@ def test_core_004_expansion_mode_sections_and_redacted_paths(
     with pytest.raises(ConfigError, match="driver is required"):
         ConfigLoader().load(yaml.safe_dump(council_only).encode(), mode="code")
 
+    deeply_nested = ("limits: " + "{a:" * 70 + "0" + "}" * 70).encode()
+    with pytest.raises(ConfigError, match="configuration nesting exceeds 64"):
+        ConfigLoader().load(deeply_nested)
+
 
 def test_core_005_atomic_state_interruption_preserves_previous_record(store_factory) -> None:
     store = store_factory()
@@ -234,6 +241,20 @@ def test_core_006_known_value_redaction_and_short_credential_preflight(
     assert b"ordinary short word" in persisted
     with pytest.raises(CredentialBoundaryError, match="CODEX_TOKEN"):
         KnownCredentials([KnownCredential("CODEX_TOKEN", "short")])
+
+    response = make_response().model_copy(
+        update={
+            "structured_output": {"secretvalue": {"nested": "secretvalue"}},
+            "usage": {"secretvalue": 1},
+        }
+    )
+    persisted_response = redacted_response(
+        response, SimpleNamespace(credentials=credentials)
+    )
+    assert persisted_response.structured_output == {
+        "[REDACT]": {"nested": "[REDACT]"}
+    }
+    assert persisted_response.usage == {"[REDACT]": 1}
 
 
 @pytest.mark.asyncio
@@ -1040,7 +1061,10 @@ def test_core_025_status_phase_and_explicit_null_contracts() -> None:
 
 
 def test_core_026_failure_and_bounded_ingress_contracts(
-    tmp_path: Path, config_bytes: bytes, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_bytes: bytes,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     for index, kind in enumerate(FAILURE_KINDS, start=1):
         run_id = f"20260828T0606{index:02d}Z-aaaaaaaaaa"
@@ -1056,6 +1080,10 @@ def test_core_026_failure_and_bounded_ingress_contracts(
     missing = tmp_path / "missing"
     with pytest.raises(InputAcquisitionError):
         acquire_named_file(missing, label="input")
+    if os.name != "nt":
+        aux = tmp_path / "aux.md"
+        aux.write_bytes(b"ordinary POSIX file")
+        assert acquire_named_file(aux, label="input") == b"ordinary POSIX file"
     directory = tmp_path / "directory"
     directory.mkdir()
     with pytest.raises(InputAcquisitionError, match="regular"):
@@ -1160,6 +1188,35 @@ def test_core_026_failure_and_bounded_ingress_contracts(
         monkeypatch.setattr(ingress_module, "_read_fd_bounded", grow_during_posix_read)
     with pytest.raises(InputAcquisitionError, match="changed"):
         acquire_named_file(growing, label="input")
+
+    async def unexpected_executor(_context: object) -> RunRecord:
+        raise RuntimeError("private diagnostic detail")
+
+    caplog.set_level(logging.ERROR, logger="dialectic.service")
+    diagnostic_service = DialecticService(
+        RunStore(
+            tmp_path / "unexpected-state",
+            run_id_factory=lambda: "20260828T062659Z-aaaaaaaaaa",
+        ),
+        code_executor=unexpected_executor,
+    )
+    diagnostic_record = asyncio.run(
+        diagnostic_service.execute_code_once(
+            diagnostic_service.create_run("code"),
+            config_bytes=config_bytes,
+            task_bytes=b"trigger controller diagnostic",
+            repository_path=tmp_path,
+        )
+    )
+    assert diagnostic_record.failure_kind == "INTERNAL_ERROR"
+    diagnostic_log = next(
+        record
+        for record in caplog.records
+        if getattr(record, "dialectic_event", "") == "controller.unexpected_error"
+    )
+    assert diagnostic_log.dialectic_fields["exception_type"] == "RuntimeError"
+    assert "unexpected_executor" in diagnostic_log.dialectic_fields["stack"]
+    assert "private diagnostic detail" not in diagnostic_log.dialectic_fields["stack"]
 
     with pytest.raises(InputAcquisitionError, match="regular|device"):
         acquire_named_file(os.devnull, label="input")
@@ -1654,6 +1711,31 @@ async def test_core_028_windows_reader_handoff_is_byte_and_callback_bounded() ->
     assert overflow_result.cleanup_confirmed
     assert "terminate-job" in blocking_backend.calls
     assert len(blocking_backend.closed) == 10
+
+    class UndeliverableGracefulBackend(BlockingBackend):
+        def request_graceful_termination(self, process):
+            super().request_graceful_termination(process)
+            return False
+
+    undeliverable_backend = UndeliverableGracefulBackend()
+    undeliverable_unit = WindowsJobLauncher(undeliverable_backend).launch(
+        executable="agent.exe",
+        arguments=(),
+        cwd="C:\\neutral",
+        environment={"SystemRoot": "C:\\Windows"},
+    )
+    undeliverable_overflow = asyncio.Event()
+    undeliverable_overflow.set()
+    started = time.monotonic()
+    undeliverable_result = await ProcessSupervisor().supervise(
+        undeliverable_unit,
+        turn_timeout_seconds=1,
+        graceful_kill_seconds=0.5,
+        overflow=undeliverable_overflow,
+    )
+    assert time.monotonic() - started < 0.25
+    assert undeliverable_result.cleanup_confirmed
+    assert "terminate-job" in undeliverable_backend.calls
 
     class UnclosedJobBackend(BlockingBackend):
         def close_resource(self, resource):

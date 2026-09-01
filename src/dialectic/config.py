@@ -12,9 +12,20 @@ from typing import Any, Mapping
 import yaml
 from pydantic import ValidationError
 from yaml.events import AliasEvent
-from yaml.tokens import AliasToken, AnchorToken, TagToken
+from yaml.tokens import (
+    AliasToken,
+    AnchorToken,
+    BlockEndToken,
+    BlockMappingStartToken,
+    BlockSequenceStartToken,
+    FlowMappingEndToken,
+    FlowMappingStartToken,
+    FlowSequenceEndToken,
+    FlowSequenceStartToken,
+    TagToken,
+)
 
-from .contracts import MAX_NAMED_INPUT_BYTES, RunMode
+from .contracts import MAX_JSON_DEPTH, MAX_NAMED_INPUT_BYTES, RunMode
 from .schemas import DialecticConfig
 
 _ENV_REFERENCE = re.compile(r"^\$\{([A-Z_][A-Z0-9_]*)\}$")
@@ -81,9 +92,26 @@ class ConfigLoader:
 
     def _parse_yaml(self, text: str) -> Any:
         try:
+            depth = 0
             for token in yaml.scan(text):
                 if isinstance(token, (AnchorToken, AliasToken, TagToken)):
                     raise ConfigError("YAML tags, anchors, and aliases are not supported")
+                if isinstance(
+                    token,
+                    (
+                        BlockMappingStartToken,
+                        BlockSequenceStartToken,
+                        FlowMappingStartToken,
+                        FlowSequenceStartToken,
+                    ),
+                ):
+                    depth += 1
+                    if depth > MAX_JSON_DEPTH:
+                        raise ConfigError(f"configuration nesting exceeds {MAX_JSON_DEPTH}")
+                elif isinstance(
+                    token, (BlockEndToken, FlowMappingEndToken, FlowSequenceEndToken)
+                ):
+                    depth -= 1
             value = yaml.load(text, Loader=StrictSafeLoader)
         except ConfigError:
             raise
@@ -177,26 +205,37 @@ def validate_model_bounds(value: Any, *, max_chars: int, max_items: int) -> None
 def _validate_json_compatible(value: Any, *, path: str, root: bool = False) -> None:
     if root and not isinstance(value, dict):
         raise ConfigError("configuration root must be a mapping")
-    if value is None or type(value) in {str, int, bool}:  # bool is intentionally exact
-        if isinstance(value, str):
-            _reject_surrogates(value, path)
-        return
-    if type(value) is float:
-        if not math.isfinite(value):
-            raise ConfigError(f"non-finite number at {path}")
-        return
-    if isinstance(value, list):
-        for index, child in enumerate(value):
-            _validate_json_compatible(child, path=f"{path}[{index}]")
-        return
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if type(key) is not str:
-                raise ConfigError(f"mapping key at {path} must be a string")
-            _reject_surrogates(key, f"{path} key")
-            _validate_json_compatible(child, path=f"{path}/{key}")
-        return
-    raise ConfigError(f"non-JSON YAML value at {path}: {type(value).__name__}")
+    stack: list[tuple[str, Any, int]] = [(path, value, 1)]
+    while stack:
+        current_path, current, depth = stack.pop()
+        if depth > MAX_JSON_DEPTH:
+            raise ConfigError(f"configuration nesting exceeds {MAX_JSON_DEPTH}")
+        if current is None or type(current) in {str, int, bool}:
+            if isinstance(current, str):
+                _reject_surrogates(current, current_path)
+            continue
+        if type(current) is float:
+            if not math.isfinite(current):
+                raise ConfigError(f"non-finite number at {current_path}")
+            continue
+        if isinstance(current, list):
+            stack.extend(
+                (f"{current_path}[{index}]", child, depth + 1)
+                for index, child in enumerate(current)
+            )
+            continue
+        if isinstance(current, dict):
+            children: list[tuple[str, Any, int]] = []
+            for key, child in current.items():
+                if type(key) is not str:
+                    raise ConfigError(f"mapping key at {current_path} must be a string")
+                _reject_surrogates(key, f"{current_path} key")
+                children.append((f"{current_path}/{key}", child, depth + 1))
+            stack.extend(children)
+            continue
+        raise ConfigError(
+            f"non-JSON YAML value at {current_path}: {type(current).__name__}"
+        )
 
 
 def _reject_surrogates(value: str, label: str) -> None:

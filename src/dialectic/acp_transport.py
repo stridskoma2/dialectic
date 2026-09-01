@@ -11,16 +11,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
-from .launcher import DirectLaunchSpec, LaunchSpec, WindowsBatchLaunchSpec
+from .launcher import DirectLaunchSpec, LaunchSpec
 from .output import strict_json_loads
 from .process import (
     MAX_READER_CHUNK_BYTES,
     PosixProcessUnit,
     ProcessSupervisor,
     ReaderHandoffCoordinator,
+    WindowsPipeReader,
     WindowsJobLauncher,
     WindowsReaderHandoff,
     join_reader_threads,
+    root_command,
 )
 from .redaction import BoundedStreamCapture, CapturedStream, KnownCredentials
 from .windows_process import CtypesWindowsJobBackend
@@ -322,7 +324,7 @@ class _ManagedAcpLease:
 
     def _start_windows(self, loop: asyncio.AbstractEventLoop) -> None:
         backend = self.windows_backend or CtypesWindowsJobBackend()
-        executable, arguments = _root_command(self.plan)
+        executable, arguments = root_command(self.plan)
         unit = WindowsJobLauncher(backend).launch(
             executable=str(executable),
             arguments=arguments,
@@ -359,7 +361,7 @@ class _ManagedAcpLease:
         self._windows_readers = [
             threading.Thread(
                 target=self._windows_handoffs[name].read_pipe,
-                args=(_WindowsPipeReader(backend, pipes[name][0]),),
+                args=(WindowsPipeReader(backend, pipes[name][0]),),
                 daemon=True,
                 name=f"dialectic-acp-{name}-reader",
             )
@@ -632,20 +634,3 @@ class _ManagedAcpLease:
     def _set_fatal(self, error: BaseException) -> None:
         if self._fatal is not None and not self._fatal.done():
             self._fatal.set_result(error)
-
-
-class _WindowsPipeReader:
-    def __init__(self, backend: object, handle: object) -> None:
-        self._backend = backend
-        self._handle = handle
-
-    def read(self, maximum_bytes: int) -> bytes:
-        return self._backend.read_pipe(self._handle, maximum_bytes)
-
-
-def _root_command(plan: LaunchSpec) -> tuple[Path, tuple[str, ...]]:
-    if isinstance(plan, DirectLaunchSpec):
-        return plan.executable, plan.arguments
-    if isinstance(plan, WindowsBatchLaunchSpec):
-        return plan.spawned_root_executable, plan.root_arguments
-    raise TypeError("unknown launch plan")

@@ -34,8 +34,9 @@ from .capabilities import (
 from .contracts import (
     ARTIFACT_SCHEMA_VERSION,
     ResearchMode,
-    TOOL_VERSION,
     SessionCloseReason,
+    TOOL_VERSION,
+    TurnPhase,
 )
 from .filesystem import stable_filesystem_identity
 from .launcher import (
@@ -1412,12 +1413,12 @@ def _boolean_object_schema(*names: str) -> dict[str, Any]:
     }
 
 
-def _probe_turn_phase(role: Role) -> str:
+def _probe_turn_phase(role: Role) -> TurnPhase:
     return {
         "driver": "initial",
         "reviewer": "review",
         "participant": "opening",
-        "moderator": "moderation",
+        "moderator": "candidate",
     }[role]
 
 

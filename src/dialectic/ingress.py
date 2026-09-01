@@ -195,6 +195,8 @@ def _is_device_namespace(path: str) -> bool:
     upper = normalized.upper()
     if upper.startswith(("\\\\.\\", "\\\\?\\", "\\??\\")):
         return True
+    if os.name != "nt":
+        return False
     basename = Path(path).name.rstrip(" .").split(".", 1)[0].upper()
     reserved = {"CON", "PRN", "AUX", "NUL", "CLOCK$"}
     reserved.update(f"COM{index}" for index in range(1, 10))

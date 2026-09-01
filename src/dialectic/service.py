@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import traceback
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,9 +28,9 @@ from .redaction import (
     RedactionError,
     redact_config,
 )
-from .schemas import DialecticConfig, EventRecord, RunRecord, SummaryRecord, WorkspaceRecord
+from .schemas import DialecticConfig, RunRecord, SummaryRecord, WorkspaceRecord
 from .store import RunHandle, RunStore
-from .turn_timing import TURN_EXTENSION_SECONDS, TurnDeadlineController
+from .turn_timing import TurnDeadlineController
 
 
 class RunExecutor(Protocol):
@@ -107,18 +108,14 @@ class DialecticService:
             controller = self._active_deadlines.get(run_id)
         return controller.snapshot() if controller is not None else _empty_deadline_snapshot()
 
-    def extend_turn_deadlines(
-        self, run_id: str, seconds: float = TURN_EXTENSION_SECONDS
-    ) -> dict[str, object]:
+    def extend_turn_deadlines(self, run_id: str) -> dict[str, object]:
         """Extend active logical turns without weakening their hard ceiling."""
 
-        if seconds != TURN_EXTENSION_SECONDS:
-            raise ValueError("turn deadlines may be extended only in five-minute increments")
         with self._deadline_lock:
             controller = self._active_deadlines.get(run_id)
         if controller is None:
             raise ValueError("no active turn is available to extend")
-        snapshot = controller.extend_active(seconds)
+        snapshot = controller.extend_active()
         if snapshot["extendedTurns"] == 0:
             if snapshot["turnCount"] == 0:
                 raise ValueError("no active turn is available to extend")
@@ -257,6 +254,17 @@ class DialecticService:
         except asyncio.CancelledError:
             return self.cancel_run(handle, "user cancellation")
         except Exception as exc:
+            stack = " <- ".join(
+                f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+                for frame in traceback.extract_tb(exc.__traceback__)
+            )
+            log_event(
+                _LOGGER,
+                logging.ERROR,
+                "controller.unexpected_error",
+                exception_type=type(exc).__name__,
+                stack=stack,
+            )
             return self.fail_run(
                 handle,
                 "INTERNAL_ERROR",
@@ -474,19 +482,11 @@ class DialecticService:
         payload: dict[str, object],
     ) -> None:
         self.store.write_run(handle, record)
-        sequence = self.store.next_event_sequence(handle)
         self.store.append_event(
             handle,
-            EventRecord(
-                artifact_schema_version=ARTIFACT_SCHEMA_VERSION,
-                tool_version=TOOL_VERSION,
-                sequence=sequence,
-                timestamp=datetime.now(UTC),
-                run_id=handle.run_id,
-                phase=record.phase,
-                event_type=event_type,
-                payload=payload,
-            ),
+            phase=record.phase,
+            event_type=event_type,
+            payload=payload,
         )
         fields: dict[str, str | None] = {
             "run_id": record.run_id,

@@ -28,10 +28,9 @@ from .app_logging import (
     log_event,
 )
 from .contracts import ResearchMode, RunMode
-from .desktop import attempt_duration_seconds, load_desktop_web_sources
+from .desktop import load_desktop_responses, load_desktop_web_sources
 from .runtime import build_service
 from .service import DialecticService
-from .turn_timing import TURN_EXTENSION_SECONDS
 from .ui_config import (
     ModeratorMode,
     RuntimeName,
@@ -340,7 +339,7 @@ class _UiState:
             run_id = self._snapshot.get("runId")
         if service is None or not isinstance(run_id, str) or not run_id:
             raise ValueError("no active turn is available to extend")
-        return service.extend_turn_deadlines(run_id, TURN_EXTENSION_SECONDS)
+        return service.extend_turn_deadlines(run_id)
 
     def start(self, prepared: _PreparedRun) -> None:
         with self._lock:
@@ -815,53 +814,24 @@ def _summary_brief(path: Path) -> str:
 
 
 def _response_excerpts(artifact_dir: Path) -> list[dict[str, object]]:
-    turns = artifact_dir / "turns"
-    if not turns.is_dir():
-        return []
     responses: list[dict[str, object]] = []
-    for path in turns.glob("*/*/*.attempt.json"):
-        try:
-            if path.stat().st_size > _MAX_PREVIEW_BYTES:
-                continue
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        response = payload.get("response")
-        response_data = response if isinstance(response, dict) else {}
-        text = response_data.get("text")
-        status = "response"
-        if not isinstance(text, str) or not text.strip():
-            text = payload.get("bounded_diagnostic")
-            status = "failed"
-        if not isinstance(text, str) or not text.strip():
-            continue
-        compact = " ".join(text.split())
+    for response in load_desktop_responses(artifact_dir):
+        compact = " ".join(response.text.split())
         if len(compact) > _MAX_RESPONSE_EXCERPT_CHARS:
             compact = compact[: _MAX_RESPONSE_EXCERPT_CHARS - 1] + "…"
         responses.append(
             {
-                "role": str(payload.get("role", "agent")),
-                "targetId": str(payload.get("target_id", "agent")),
-                "phase": str(payload.get("turn_phase", "turn")),
-                "runtime": str(response_data.get("runtime", "")),
-                "model": str(response_data.get("requested_model", "")),
+                "role": response.role,
+                "targetId": response.target_id,
+                "phase": response.phase,
+                "runtime": response.runtime,
+                "model": response.model,
                 "excerpt": compact,
-                "status": status,
-                "completedAt": str(
-                    payload.get("response_completed_at")
-                    or payload.get("capture_completed_at")
-                    or ""
-                ),
-                "durationSeconds": attempt_duration_seconds(payload),
+                "status": response.status,
+                "completedAt": response.completed_at,
+                "durationSeconds": response.duration_seconds,
             }
         )
-    responses.sort(
-        key=lambda item: (
-            item["completedAt"], item["role"], item["targetId"], item["phase"]
-        )
-    )
     return responses
 
 

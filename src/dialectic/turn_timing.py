@@ -49,6 +49,8 @@ class _ActiveTurn:
     maximum_deadline_monotonic: float
     idle_seconds: float | None
     last_activity_monotonic: float
+    wakeup: asyncio.Event
+    loop: asyncio.AbstractEventLoop
 
 
 class TurnDeadlineController:
@@ -81,6 +83,7 @@ class TurnDeadlineController:
                 turn = self._active.get(key)
                 if turn is not None:
                     turn.last_activity_monotonic = self._monotonic()
+                    turn.loop.call_soon_threadsafe(turn.wakeup.set)
 
         return record
 
@@ -94,6 +97,7 @@ class TurnDeadlineController:
 
         key = self.key_for(request)
         now = self._monotonic()
+        loop = asyncio.get_running_loop()
         allotted = min(float(request.timeout_seconds), self._maximum_turn_seconds)
         idle = self._idle_seconds if runtime in _STREAMING_RUNTIMES else None
         turn = _ActiveTurn(
@@ -108,6 +112,8 @@ class TurnDeadlineController:
             maximum_deadline_monotonic=now + self._maximum_turn_seconds,
             idle_seconds=idle,
             last_activity_monotonic=now,
+            wakeup=asyncio.Event(),
+            loop=loop,
         )
         with self._lock:
             if key in self._active:
@@ -115,6 +121,7 @@ class TurnDeadlineController:
             self._active[key] = turn
 
         task = asyncio.ensure_future(invocation)
+        wakeup_task = asyncio.create_task(turn.wakeup.wait())
         try:
             while True:
                 reason, remaining = self._remaining(key)
@@ -124,17 +131,23 @@ class TurnDeadlineController:
                     seconds = idle if reason == "idle" else turn.allotted_seconds
                     raise TurnDeadlineExpired(reason, float(seconds or 0))
                 done, _ = await asyncio.wait(
-                    {task}, timeout=min(0.25, remaining),
+                    {task, wakeup_task}, timeout=remaining,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if task in done:
                     return task.result()
+                if wakeup_task in done:
+                    turn.wakeup.clear()
+                    wakeup_task = asyncio.create_task(turn.wakeup.wait())
         except BaseException:
             if not task.done():
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
             raise
         finally:
+            if not wakeup_task.done():
+                wakeup_task.cancel()
+            await asyncio.gather(wakeup_task, return_exceptions=True)
             with self._lock:
                 self._active.pop(key, None)
 
@@ -154,6 +167,7 @@ class TurnDeadlineController:
                 if turn.deadline_monotonic > previous:
                     turn.allotted_seconds += turn.deadline_monotonic - previous
                     extended += 1
+                    turn.loop.call_soon_threadsafe(turn.wakeup.set)
         snapshot = self.snapshot()
         snapshot["extendedTurns"] = extended
         return snapshot

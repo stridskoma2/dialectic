@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -77,6 +78,8 @@ class _ReviewerContext:
     neutral_directory: Path
     prompt: str
     packet_sha256: str
+    base_sha: str
+    review_sha: str
 
 
 class CodeOnceOrchestrator:
@@ -309,7 +312,9 @@ class CodeOnceOrchestrator:
                 failure_kind="DRIVER_FAILED",
             )
         finally:
-            self._cleanup_driver_scratch(initial_scratch, context)
+            self._cleanup_driver_scratch(
+                initial_scratch, context, trigger=sys.exception()
+            )
         if not initial_turn.response.session_id:
             raise DialecticFailure(
                 "DRIVER_FAILED", "initial driver response lacks a resumable session id"
@@ -336,7 +341,7 @@ class CodeOnceOrchestrator:
         reviewer_contexts = self._prepare_reviewers(
             context, workspace, reviewer_specs, gate_a, initial
         )
-        reports = await self._run_reviewers(context, reviewer_contexts, initial)
+        reports = await self._run_reviewers(context, reviewer_contexts)
         total_findings = sum(len(report.report.findings) for report in reports)
         if total_findings > context.config.limits.max_total_findings:
             raise DialecticFailure(
@@ -395,7 +400,10 @@ class CodeOnceOrchestrator:
             target_id="driver repair",
         )
 
-        repair_scratch = TurnWorkspace.create(workspace.path)
+        repair_scratch = TurnWorkspace.create(
+            workspace.path,
+            output_schema_bytes=_canonical_dict_bytes(repair_schema),
+        )
         repair_binding, repair_binding_sha, repair_paths = self._bind_driver(
             context,
             workspace,
@@ -446,7 +454,9 @@ class CodeOnceOrchestrator:
             except OutputError as exc:
                 raise DialecticFailure("REPAIR_FAILED", "invalid driver repair report") from exc
         finally:
-            self._cleanup_driver_scratch(repair_scratch, context)
+            self._cleanup_driver_scratch(
+                repair_scratch, context, trigger=sys.exception()
+            )
 
         context.service.advance_phase(context.handle, "FINAL_VALIDATION")
         final = self._validate_change(lambda: validator.validate_repair(initial.head_sha))
@@ -581,6 +591,8 @@ class CodeOnceOrchestrator:
                     neutral_directory=neutral,
                     prompt=packet_bytes.decode("utf-8"),
                     packet_sha256=hashlib.sha256(packet_bytes).hexdigest(),
+                    base_sha=workspace.baseline.base_sha,
+                    review_sha=initial.head_sha,
                 )
             )
         barrier.authorize_launch()
@@ -590,9 +602,9 @@ class CodeOnceOrchestrator:
         self,
         context: ExecutionContext,
         reviewers: Sequence[_ReviewerContext],
-        initial: ValidatedChange,
     ) -> list[ReviewReportArtifact]:
         peer_failure = asyncio.Event()
+        review_schema = ReviewReport.model_json_schema()
 
         async def one(reviewer: _ReviewerContext) -> ReviewReportArtifact:
             self._evidence.validate_launch_evidence(
@@ -616,27 +628,25 @@ class CodeOnceOrchestrator:
                 phase="review",
                 operation="start",
                 prompt=reviewer.prompt,
-                output_schema=ReviewReport.model_json_schema(),
+                output_schema=review_schema,
                 working_directory=reviewer.neutral_directory,
                 access_mode="packet-only",
                 failure_kind="REVIEW_FAILED",
                 peer_failure=peer_failure,
             )
             try:
-                packet = json.loads(reviewer.prompt)
-                core = packet["core"]
                 report = extract_model_payload(
                     turn.response.text,
                     ReviewReport,
                     max_chars=context.config.limits.max_model_field_chars,
                     max_items=context.config.limits.max_model_list_items,
                     context={
-                        "base_sha": core["base_sha"],
-                        "head_sha": core["review_sha"],
+                        "base_sha": reviewer.base_sha,
+                        "head_sha": reviewer.review_sha,
                         "max_findings": context.config.limits.max_findings_per_reviewer,
                     },
                 )
-            except (OutputError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            except OutputError as exc:
                 raise DialecticFailure(
                     "REVIEW_FAILED", f"invalid review report from {reviewer.alias}"
                 ) from exc
@@ -724,16 +734,32 @@ class CodeOnceOrchestrator:
         return binding, sha, dynamic_paths
 
     @staticmethod
-    def _cleanup_driver_scratch(scratch: TurnWorkspace, context: ExecutionContext) -> None:
+    def _cleanup_driver_scratch(
+        scratch: TurnWorkspace,
+        context: ExecutionContext,
+        *,
+        trigger: BaseException | None = None,
+    ) -> None:
+        trigger_label = (
+            trigger.kind
+            if isinstance(trigger, DialecticFailure)
+            else type(trigger).__name__ if trigger is not None else None
+        )
         try:
             scratch.verify_and_cleanup(context.config.limits)
         except TurnWorkspaceCleanupError as exc:
+            detail = "reserved driver workspace cleanup failed"
+            if trigger_label is not None:
+                detail += f"; initiating failure: {trigger_label}"
             raise DialecticFailure(
-                "PROCESS_CLEANUP_FAILED", "reserved driver workspace cleanup failed"
+                "PROCESS_CLEANUP_FAILED", detail
             ) from exc
         except TurnWorkspaceError as exc:
+            detail = "reserved driver workspace validation failed"
+            if trigger_label is not None:
+                detail += f"; initiating failure: {trigger_label}"
             raise DialecticFailure(
-                "INTERNAL_ERROR", "reserved driver workspace validation failed"
+                "INTERNAL_ERROR", detail
             ) from exc
 
     @staticmethod

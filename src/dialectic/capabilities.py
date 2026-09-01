@@ -126,9 +126,7 @@ def build_capability_binding(
         raise CapabilityEvidenceError("target preflight references different capability evidence")
     if preflight.target.runtime != attestation.runtime:
         raise CapabilityEvidenceError("target runtime mismatches the capability attestation")
-    if hashlib.sha256(attestation_bytes).hexdigest() != hashlib.sha256(
-        canonical_json_bytes(attestation)
-    ).hexdigest():
+    if attestation_bytes != canonical_json_bytes(attestation):
         raise CapabilityEvidenceError("attestation bytes are not the validated artifact")
     if set(dynamic_paths) != set(fixture.dynamic_roles):
         raise CapabilityEvidenceError("dynamic role set does not exactly match the fixture")
@@ -143,7 +141,6 @@ def build_capability_binding(
     expected_profile = _substitute_template(fixture.template, substitutions)
     if _canonical_bytes(expected_profile) != _canonical_bytes(supplied_concrete_profile):
         raise CapabilityEvidenceError("concrete profile is not the canonical template instantiation")
-    identities.sort(key=lambda item: (item.role, item.path_sha256))
     return CapabilityBindingArtifact(
         artifact_schema_version=ARTIFACT_SCHEMA_VERSION,
         tool_version=TOOL_VERSION,

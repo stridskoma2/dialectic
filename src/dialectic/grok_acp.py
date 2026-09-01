@@ -40,6 +40,7 @@ from .native_adapters import (
     _BoundProfile,
     _boolean_object_schema,
     _new_process_unit_id,
+    _probe_turn_phase,
     _probe_bound_profile,
     _probe_results,
     _require_static_flags,
@@ -209,11 +210,7 @@ class GrokAdapter(NativeAdapterBase):
             request = AgentRequest(
                 role=self.role,
                 target_id="capability-probe",
-                turn_phase={
-                    "reviewer": "review",
-                    "participant": "opening",
-                    "moderator": "moderation",
-                }[self.role],
+                turn_phase=_probe_turn_phase(self.role),
                 prompt=(
                     (
                         "This is a bounded ACP capability probe. Use WebSearch to find the "

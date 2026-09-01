@@ -23,7 +23,12 @@ from .contracts import (
     ConsensusOutcome,
     TurnPhase,
 )
-from .native_adapters import NativeEnvelopeError, NativeInvocationEvidence, NativeTurnError
+from .native_adapters import (
+    NativeEnvelopeError,
+    NativeInvocationEvidence,
+    NativePreflightError,
+    NativeTurnError,
+)
 from .output import OutputError, extract_model_payload
 from .research import persist_source_citations, research_policy
 from .schemas import (
@@ -39,7 +44,6 @@ from .schemas import (
     CouncilRevision,
     CouncilRevisionArtifact,
     DerivedBallot,
-    EventRecord,
     ModeratorOpeningArtifact,
     OpeningPosition,
     OpeningPositionArtifact,
@@ -343,17 +347,16 @@ class CouncilOnceOrchestrator:
         context.service.mark_model_work_started(context.handle)
 
         moderator_opening: OpeningPosition | None = None
-        moderator_directory: Path | None = None
         if moderator_opening_prompt is not None:
-            moderator_directory = context.service.store.create_role_directory(
-                context.handle, "council-role-directories", "moderator"
+            moderator_opening_directory = context.service.store.create_role_directory(
+                context.handle, "council-role-directories", "moderator-opening"
             )
             opening_binding, opening_binding_sha, opening_relative = self._bind_packet_role(
                 context,
                 role="moderator",
                 target_id="moderator",
                 phase="opening",
-                neutral=moderator_directory,
+                neutral=moderator_opening_directory,
                 gate=moderator_gate,
                 adapter=self.moderator_adapter,
             )
@@ -363,7 +366,7 @@ class CouncilOnceOrchestrator:
                 binding=opening_binding,
                 binding_sha256=opening_binding_sha,
                 binding_relative_path=opening_relative,
-                dynamic_paths={"neutral_role_dir": moderator_directory},
+                dynamic_paths={"neutral_role_dir": moderator_opening_directory},
             )
             moderator_opening_turn = await self._evidence.invoke_turn(
                 context,
@@ -377,7 +380,7 @@ class CouncilOnceOrchestrator:
                 operation="start",
                 prompt=moderator_opening_prompt,
                 output_schema=OpeningPosition.model_json_schema(),
-                working_directory=moderator_directory,
+                working_directory=moderator_opening_directory,
                 access_mode="packet-only",
                 failure_kind="MODERATOR_FAILED",
                 workflow_timeout=self._workflow_timeout,
@@ -564,10 +567,9 @@ class CouncilOnceOrchestrator:
             research_mode=context.config.research_mode,
         )
         self._require_all_packets(context, [("moderator", moderation_prompt)], CandidateConclusion)
-        if moderator_directory is None:
-            moderator_directory = context.service.store.create_role_directory(
-                context.handle, "council-role-directories", "moderator"
-            )
+        moderator_directory = context.service.store.create_role_directory(
+            context.handle, "council-role-directories", "moderator"
+        )
         moderator_binding, moderator_binding_sha, moderator_relative = self._bind_packet_role(
             context,
             role="moderator",
@@ -714,6 +716,8 @@ class CouncilOnceOrchestrator:
         if any(item.persistent and not item.closed for item in participants):
             raise DialecticFailure("INTERNAL_ERROR", "a retained council lease survived ballots")
 
+        by_alias = {ballot.participant_alias: ballot for ballot in derived}
+        derived = [by_alias[item.alias] for item in participants]
         outcome = _consensus_outcome(
             derived,
             participant_count=len(participants),
@@ -1187,31 +1191,26 @@ class CouncilOnceOrchestrator:
         record = context.service.store.read_handle(context.handle)
         context.service.store.append_event(
             context.handle,
-            EventRecord(
-                artifact_schema_version=ARTIFACT_SCHEMA_VERSION,
-                tool_version=TOOL_VERSION,
-                sequence=context.service.store.next_event_sequence(context.handle),
-                timestamp=datetime.now(UTC),
-                run_id=context.handle.run_id,
-                phase=record.phase,
-                event_type=event_type,
-                payload={
-                    "role": "participant",
-                    "alias": item.target_id,
-                    "turn_phase": item.draft.phase if item.draft is not None else "opening",
-                    "process_unit_id": (
-                        evidence.process_unit_id
-                        if evidence is not None
-                        else _process_unit_id(
-                            context.handle.run_id, "participant", item.target_id, "opening"
-                        )
-                    ),
-                    "disposition": (
-                        evidence.process_disposition if evidence is not None else "retained-for-session"
-                    ),
-                    "timestamp": datetime.now(UTC).isoformat(),
-                },
-            ),
+            phase=record.phase,
+            event_type=event_type,
+            payload={
+                "role": "participant",
+                "alias": item.target_id,
+                "turn_phase": item.draft.phase if item.draft is not None else "opening",
+                "process_unit_id": (
+                    evidence.process_unit_id
+                    if evidence is not None
+                    else _process_unit_id(
+                        context.handle.run_id, "participant", item.target_id, "opening"
+                    )
+                ),
+                "disposition": (
+                    evidence.process_disposition
+                    if evidence is not None
+                    else "retained-for-session"
+                ),
+                "timestamp": datetime.now(UTC).isoformat(),
+            },
         )
 
 

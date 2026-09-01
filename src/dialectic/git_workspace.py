@@ -9,7 +9,7 @@ import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Literal, Sequence
+from typing import Callable, Iterable, Literal, Mapping, Sequence
 
 from .contracts import FailureKind
 from .filesystem import hard_link_count
@@ -19,6 +19,48 @@ from .store import RunHandle, RunStore
 
 _GIT_CHUNK_BYTES = 65_536
 _STRUCTURAL_OUTPUT_LIMIT = 16 * 1024 * 1024
+_GIT_ENVIRONMENT_NAMES = (
+    (
+        "SystemRoot",
+        "ComSpec",
+        "PATH",
+        "PATHEXT",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "TEMP",
+        "TMP",
+    )
+    if os.name == "nt"
+    else ("HOME", "PATH", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "LC_CTYPE")
+)
+
+
+def _controller_git_environment(source: Mapping[str, str]) -> dict[str, str]:
+    """Construct Git's environment without inheriting repository-routing controls."""
+
+    lookup = {
+        (name.casefold() if os.name == "nt" else name): value
+        for name, value in source.items()
+    }
+    environment = {
+        name: lookup[key]
+        for name in _GIT_ENVIRONMENT_NAMES
+        if (key := name.casefold() if os.name == "nt" else name) in lookup
+    }
+    environment.update(
+        {
+            "LC_ALL": "C",
+            "LANG": "C",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GCM_INTERACTIVE": "Never",
+        }
+    )
+    return environment
 
 
 class GitWorkflowError(RuntimeError):
@@ -86,15 +128,7 @@ class GitRunner:
             command.extend(["-c", "core.autocrlf=false"])
         command.extend(arguments)
         self.history.append(tuple(command))
-        environment = os.environ.copy()
-        environment.update(
-            {
-                "LC_ALL": "C",
-                "LANG": "C",
-                "GIT_OPTIONAL_LOCKS": "0",
-                "GIT_PAGER": "cat",
-            }
-        )
+        environment = _controller_git_environment(os.environ)
         process = subprocess.Popen(
             command,
             cwd=cwd,

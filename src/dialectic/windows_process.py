@@ -232,10 +232,14 @@ class CtypesWindowsJobBackend:
         if self._kernel32.ResumeThread(self._require_handle(thread).value) == 0xFFFF_FFFF:
             raise ctypes.WinError(ctypes.get_last_error())
 
-    def request_graceful_termination(self, process: object) -> None:
+    def request_graceful_termination(self, process: object) -> bool:
         handle = self._require_handle(process)
-        if handle.process_id is not None:
-            self._kernel32.GenerateConsoleCtrlEvent(_CTRL_BREAK_EVENT, handle.process_id)
+        return bool(
+            handle.process_id is not None
+            and self._kernel32.GenerateConsoleCtrlEvent(
+                _CTRL_BREAK_EVENT, handle.process_id
+            )
+        )
 
     def terminate_job(self, job: object) -> None:
         if not self._kernel32.TerminateJobObject(self._require_handle(job).value, 1):

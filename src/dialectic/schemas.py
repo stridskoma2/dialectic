@@ -109,8 +109,6 @@ class ReviewerSpec(ClosedModel):
                 raise ValueError("an @driver reviewer cannot specify runtime, model, or effort")
         elif self.runtime is None or self.model is None:
             raise ValueError("a concrete reviewer must specify runtime and model")
-        elif self.target is not None:
-            raise ValueError("a concrete reviewer cannot specify target")
         return self
 
 

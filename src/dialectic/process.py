@@ -9,9 +9,11 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Awaitable, BinaryIO, Callable, Literal, Mapping, Protocol, Sequence
 
 from .contracts import FailureKind
+from .launcher import DirectLaunchSpec, LaunchSpec, WindowsBatchLaunchSpec
 
 MAX_READER_CHUNK_BYTES = 65_536
 EXTENDED_STARTUPINFO_PRESENT = 0x0008_0000
@@ -22,7 +24,7 @@ CREATE_UNICODE_ENVIRONMENT = 0x0000_0400
 class ProcessUnit(Protocol):
     async def wait(self) -> int: ...
 
-    async def request_graceful_termination(self) -> None: ...
+    async def request_graceful_termination(self) -> bool | None: ...
 
     async def force_terminate(self) -> None: ...
 
@@ -72,11 +74,16 @@ class ProcessSupervisor:
                 reason = "timeout"
 
             if reason != "completed":
-                await unit.request_graceful_termination()
-                try:
-                    await asyncio.wait_for(asyncio.shield(root_wait), timeout=graceful_kill_seconds)
-                except TimeoutError:
+                graceful_delivered = await unit.request_graceful_termination()
+                if graceful_delivered is False:
                     await unit.force_terminate()
+                else:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(root_wait), timeout=graceful_kill_seconds
+                        )
+                    except TimeoutError:
+                        await unit.force_terminate()
             else:
                 # A normal root exit still owns and reaps lingering unit members.
                 await unit.force_terminate()
@@ -147,8 +154,8 @@ class PosixProcessUnit:
     async def wait(self) -> int:
         return await self.process.wait()
 
-    async def request_graceful_termination(self) -> None:
-        self._signal_group(signal.SIGTERM)
+    async def request_graceful_termination(self) -> bool:
+        return self._signal_group(signal.SIGTERM)
 
     async def force_terminate(self) -> None:
         self._signal_group(signal.SIGKILL)
@@ -169,11 +176,12 @@ class PosixProcessUnit:
             await asyncio.sleep(0.01)
         return False
 
-    def _signal_group(self, sig: signal.Signals) -> None:
+    def _signal_group(self, sig: signal.Signals) -> bool:
         try:
             os.killpg(self.process_group, sig)
         except ProcessLookupError:
-            pass
+            return False
+        return True
 
 
 class FakeProcessUnit:
@@ -214,8 +222,9 @@ class FakeProcessUnit:
         if self.sentinel is not None:
             self.sentinel()
 
-    async def request_graceful_termination(self) -> None:
+    async def request_graceful_termination(self) -> bool:
         self.graceful_requested = True
+        return True
 
     async def force_terminate(self) -> None:
         self.forced = True
@@ -270,7 +279,7 @@ class WindowsJobBackend(Protocol):
 
     def resume_thread(self, thread: object) -> None: ...
 
-    def request_graceful_termination(self, process: object) -> None: ...
+    def request_graceful_termination(self, process: object) -> bool | None: ...
 
     def terminate_job(self, job: object) -> None: ...
 
@@ -407,8 +416,8 @@ class WindowsJobProcessUnit:
             raise RuntimeError("unbounded process wait returned without an exit code")
         return result
 
-    async def request_graceful_termination(self) -> None:
-        await asyncio.to_thread(
+    async def request_graceful_termination(self) -> bool | None:
+        return await asyncio.to_thread(
             self._backend.request_graceful_termination, self._process.process_handle
         )
 
@@ -454,6 +463,27 @@ def _close_distinct_resources(
         except Exception:
             # Closure proof below converts any remaining resource into cleanup failure.
             pass
+
+
+class WindowsPipeReader:
+    """Binary reader adapter around one backend-owned Windows pipe handle."""
+
+    def __init__(self, backend: object, handle: object) -> None:
+        self._backend = backend
+        self._handle = handle
+
+    def read(self, maximum_bytes: int) -> bytes:
+        return self._backend.read_pipe(self._handle, maximum_bytes)
+
+
+def root_command(plan: LaunchSpec) -> tuple[Path, tuple[str, ...]]:
+    """Resolve the OS root executable and arguments for one launch plan."""
+
+    if isinstance(plan, DirectLaunchSpec):
+        return plan.executable, plan.arguments
+    if isinstance(plan, WindowsBatchLaunchSpec):
+        return plan.spawned_root_executable, plan.root_arguments
+    raise TypeError("unknown launch plan")
 
 
 class ReaderHandoffCoordinator:

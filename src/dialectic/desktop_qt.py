@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -112,17 +113,24 @@ class RunWorker(QThread):
         self._prepared = prepared
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task[RunRecord] | None = None
+        self._task_lock = threading.Lock()
         self._cancel_requested = False
         self._service: DialecticService | None = None
         self._run_id = ""
 
     @Slot()
     def request_cancel(self) -> None:
-        self._cancel_requested = True
-        loop = self._loop
-        task = self._task
-        if loop is not None and task is not None and not task.done():
-            loop.call_soon_threadsafe(task.cancel)
+        with self._task_lock:
+            self._cancel_requested = True
+            loop = self._loop
+            task = self._task
+            if loop is None or task is None or task.done():
+                return
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                # Completion may close the loop between a queued Qt click and this slot.
+                return
 
     def deadline_snapshot(self) -> dict[str, object]:
         service = self._service
@@ -155,7 +163,8 @@ class RunWorker(QThread):
             research_mode=prepared.research_mode,
         )
         loop = asyncio.new_event_loop()
-        self._loop = loop
+        with self._task_lock:
+            self._loop = loop
         try:
             asyncio.set_event_loop(loop)
             service = build_service()
@@ -185,7 +194,8 @@ class RunWorker(QThread):
                     config_bytes=prepared.config_bytes,
                     prompt_bytes=prepared.prompt_bytes,
                 )
-            self._task = loop.create_task(operation)
+            with self._task_lock:
+                self._task = loop.create_task(operation)
             try:
                 record = loop.run_until_complete(self._task)
             except asyncio.CancelledError:
@@ -230,8 +240,9 @@ class RunWorker(QThread):
             )
             self.run_error.emit(f"{type(exc).__name__}: {exc}")
         finally:
-            self._task = None
-            self._loop = None
+            with self._task_lock:
+                self._task = None
+                self._loop = None
             asyncio.set_event_loop(None)
             loop.close()
 

@@ -33,12 +33,15 @@ class TurnWorkspace:
     control: Path
     temporary: Path
     output: Path
+    schema: Path | None
     root_identity: tuple[int, int]
     control_identity: tuple[int, int]
     temporary_identity: tuple[int, int]
 
     @classmethod
-    def create(cls, worktree: Path) -> "TurnWorkspace":
+    def create(
+        cls, worktree: Path, *, output_schema_bytes: bytes | None = None
+    ) -> "TurnWorkspace":
         root = worktree / ".dialectic-turn"
         if os.path.lexists(root):
             raise TurnWorkspaceError("reserved turn workspace already exists")
@@ -48,13 +51,29 @@ class TurnWorkspace:
         control.mkdir(mode=0o700)
         temporary.mkdir(mode=0o700)
         output = control / "output.json"
-        descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        descriptor = os.open(output, create_flags, 0o600)
         os.close(descriptor)
+        schema: Path | None = None
+        if output_schema_bytes is not None:
+            schema = control / "output-schema.json"
+            descriptor = os.open(schema, create_flags, 0o600)
+            try:
+                remaining = memoryview(output_schema_bytes)
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    if written <= 0:
+                        raise OSError("failed to write turn output schema")
+                    remaining = remaining[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
         return cls(
             root=root,
             control=control,
             temporary=temporary,
             output=output,
+            schema=schema,
             root_identity=_identity(root),
             control_identity=_identity(control),
             temporary_identity=_identity(temporary),
@@ -66,19 +85,15 @@ class TurnWorkspace:
             _require_same_directory(self.root, self.root_identity, "turn scratch root")
             _require_same_directory(self.control, self.control_identity, "turn control directory")
             _require_same_directory(self.temporary, self.temporary_identity, "turn tmp directory")
-            entries = list(os.scandir(self.control))
-            if len(entries) != 1 or entries[0].name != self.output.name:
+            entries = {entry.name: entry for entry in os.scandir(self.control)}
+            expected = {self.output.name}
+            if self.schema is not None:
+                expected.add(self.schema.name)
+            if set(entries) != expected:
                 raise TurnWorkspaceError("turn control directory contains unexpected entries")
-            info = entries[0].stat(follow_symlinks=False)
-            if (
-                stat.S_ISLNK(info.st_mode)
-                or not stat.S_ISREG(info.st_mode)
-                or hard_link_count(self.output) != 1
-                or info.st_size > limits.max_packet_bytes
-            ):
-                raise TurnWorkspaceError("turn control output identity or type is invalid")
-            if hasattr(os, "getuid") and info.st_uid != os.getuid():
-                raise TurnWorkspaceError("turn control output owner changed")
+            for path in (self.output, self.schema):
+                if path is not None:
+                    _require_control_file(entries[path.name], path, limits)
             require_final_scratch_within_limits(
                 self.temporary,
                 ScratchLimits(
@@ -116,3 +131,16 @@ def _require_same_directory(
 ) -> None:
     if _identity(path) != expected:
         raise TurnWorkspaceError(f"{description} identity changed")
+
+
+def _require_control_file(entry: os.DirEntry[str], path: Path, limits: LimitsSpec) -> None:
+    info = entry.stat(follow_symlinks=False)
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or hard_link_count(path) != 1
+        or info.st_size > limits.max_packet_bytes
+    ):
+        raise TurnWorkspaceError("turn control file identity or type is invalid")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise TurnWorkspaceError("turn control file owner changed")

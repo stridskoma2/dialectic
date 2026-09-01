@@ -33,6 +33,13 @@ def test_windows_desktop_launcher_prefers_the_checkout_and_has_installed_fallbac
     assert "where.exe dialectic-desktop.exe" in launcher
     assert "dialectic.ui" not in launcher
 
+    ui_launcher = (Path(__file__).parents[1] / "Launch Dialectic UI.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert "--token" not in ui_launcher
+    assert "DIALECTIC_WINDOWS_BRIDGE_TOKEN/u" in ui_launcher
+    assert "DIALECTIC_WINDOWS_BRIDGE_TOKEN=$bridgeToken" not in ui_launcher
+
 
 def test_release_examples_validate_for_both_modes() -> None:
     root = Path(__file__).parents[1]

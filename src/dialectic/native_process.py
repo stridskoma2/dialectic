@@ -10,16 +10,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Protocol
 
-from .launcher import DirectLaunchSpec, LaunchSpec, WindowsBatchLaunchSpec
+from .launcher import DirectLaunchSpec, LaunchSpec
 from .process import (
     MAX_READER_CHUNK_BYTES,
     PosixProcessUnit,
     ProcessSupervisor,
     ReaderHandoffCoordinator,
     SupervisionResult,
+    WindowsPipeReader,
     WindowsJobLauncher,
     WindowsReaderHandoff,
     join_reader_threads,
+    root_command,
 )
 from .redaction import BoundedStreamCapture, CapturedStream, KnownCredentials
 from .windows_process import CtypesWindowsJobBackend
@@ -166,7 +168,7 @@ class BoundedNativeProcessTransport:
         activity: Callable[[], None] | None,
     ) -> NativeProcessResult:
         backend = self._windows_backend or CtypesWindowsJobBackend()
-        executable, arguments = _root_command(plan)
+        executable, arguments = root_command(plan)
         try:
             unit = WindowsJobLauncher(backend).launch(
                 executable=str(executable), arguments=arguments,
@@ -207,7 +209,7 @@ class BoundedNativeProcessTransport:
         readers = [
             threading.Thread(
                 target=handoffs[name].read_pipe,
-                args=(_WindowsPipeReader(backend, pipes[name][0]),),
+                args=(WindowsPipeReader(backend, pipes[name][0]),),
                 daemon=True, name=f"dialectic-{name}-reader",
             )
             for name in ("stdout", "stderr")
@@ -281,15 +283,6 @@ class BoundedNativeProcessTransport:
         )
 
 
-class _WindowsPipeReader:
-    def __init__(self, backend: object, handle: object) -> None:
-        self._backend = backend
-        self._handle = handle
-
-    def read(self, maximum_bytes: int) -> bytes:
-        return self._backend.read_pipe(self._handle, maximum_bytes)
-
-
 async def _settle_tasks(tasks: list[asyncio.Task[None]], timeout: float) -> bool:
     try:
         results = await asyncio.wait_for(
@@ -331,14 +324,6 @@ async def _supervise_fail_closed(
             "PROCESS_CLEANUP_FAILED",
             False,
         )
-
-
-def _root_command(plan: LaunchSpec) -> tuple[Path, tuple[str, ...]]:
-    if isinstance(plan, DirectLaunchSpec):
-        return plan.executable, plan.arguments
-    if isinstance(plan, WindowsBatchLaunchSpec):
-        return plan.spawned_root_executable, plan.root_arguments
-    raise TypeError("unknown launch plan")
 
 
 def _result(

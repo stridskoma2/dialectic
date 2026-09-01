@@ -693,7 +693,10 @@ def redacted_response(response: AgentResponse, context: ExecutionContext) -> Age
         if isinstance(value, str):
             return context.credentials.redact_text(value)
         if isinstance(value, dict):
-            return {key: redact(child) for key, child in value.items()}
+            return {
+                context.credentials.redact_text(key): redact(child)
+                for key, child in value.items()
+            }
         if isinstance(value, list):
             return [redact(child) for child in value]
         return value

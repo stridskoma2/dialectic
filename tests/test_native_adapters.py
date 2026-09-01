@@ -29,6 +29,7 @@ from dialectic.native_adapters import (
     NativePreflightError,
     NativeProcessResult,
     NativeTurnError,
+    _probe_turn_phase,
     _versioned_fixture,
     recorded_probe_provider,
 )
@@ -377,6 +378,7 @@ def test_stable_codex_rejection_explains_failed_permission_matrix() -> None:
 
 
 def test_live_web_fixtures_expose_only_provider_web_tools() -> None:
+    assert _probe_turn_phase("moderator") == "candidate"
     codex = _versioned_fixture(
         "codex",
         "0.151.0-alpha.7.1",

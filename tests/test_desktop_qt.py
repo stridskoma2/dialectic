@@ -234,6 +234,23 @@ def test_native_worker_persists_immediate_cancellation(
     assert results[0].record.status == "CANCELLED"
     assert results[0].summary_path.is_file()
 
+    class ClosedLoop:
+        def call_soon_threadsafe(self, _callback: object) -> None:
+            raise RuntimeError("Event loop is closed")
+
+    class PendingTask:
+        @staticmethod
+        def done() -> bool:
+            return False
+
+        @staticmethod
+        def cancel() -> None:
+            return None
+
+    worker._loop = ClosedLoop()  # type: ignore[assignment]
+    worker._task = PendingTask()  # type: ignore[assignment]
+    worker.request_cancel()
+
 
 def test_native_desktop_renders_complete_model_response(
     qt_app: QApplication, tmp_path: Path
