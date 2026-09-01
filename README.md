@@ -21,9 +21,9 @@ Python 3.12 or newer and Git are required. From a source checkout:
 ```bash
 python -m venv .venv
 # Linux
-.venv/bin/python -m pip install -e ".[test]"
+.venv/bin/python -m pip install -e ".[test,desktop]"
 # Windows PowerShell
-.venv\Scripts\python.exe -m pip install -e ".[test]"
+.venv\Scripts\python.exe -m pip install -e ".[test,desktop]"
 ```
 
 Both installed command-line entry points invoke the same application:
@@ -33,27 +33,30 @@ dial --help
 dialectic --help
 ```
 
-For the fast local interface, double-click `Launch Dialectic UI.cmd` on Windows
-or run `dialectic-ui` on either release platform. The Windows launcher prefers the
-checkout's Windows `.venv`; when that is absent, it falls back to Dialectic installed
-in Ubuntu WSL at `~/.local/share/dialectic/venv`. It opens
-the localhost-only interface in a dedicated Edge or Chrome app window without tabs
-or an address bar, falling back to the default browser only when neither is
-available. The WSL path uses an authenticated, per-launch file bridge under `.git/`
-for the native Windows repository picker and removes that control directory on exit.
-The interface calls
-`DialecticService` directly; it does not shell out to the command-line interface.
-It provides Code/Council mode selection, an implementation or deliberation prompt,
+For the fast local interface, install the `desktop` extra and double-click
+`Launch Dialectic Desktop.cmd` on Windows, or run `dialectic-desktop`. The native PySide6
+interface calls `DialecticService` directly and keeps workflow execution on a worker
+thread. It provides Code/Council mode selection, a Markdown source/preview editor,
 a repository browser for Code Once, friendly model dropdowns with installed-CLI
 status, effort selection, one to five reviewers or two to five council participants,
-reviewer focus, consensus tolerance, live phase/status, and direct access to final
-summaries, artifacts, application logs, and isolated worktrees. The catalog includes
-locally configured selectors, while authentication and account-specific model access
-remain verified by native preflight. Council Once remains prompt-only, so a repository
-selected for Code Once is visibly disabled and is not disclosed to council participants.
-Its **Moderator behavior** selector chooses either fresh synthesis only or an
-independent blind moderator opening followed by fresh synthesis. Participant openings,
-cross-examinations, and ballots run in parallel within their respective phases.
+reviewer focus, consensus tolerance, native phase/status updates, complete Markdown
+model responses, the final summary, retained evidence, application logs, and isolated
+worktree access. The catalog includes locally configured selectors, while
+authentication and account-specific model access remain verified by native preflight.
+Council Once remains prompt-only, so a repository selected for Code Once is visibly
+disabled and is not disclosed to council participants. Its **Moderator behavior**
+selector chooses either fresh synthesis only or an independent blind moderator
+opening followed by fresh synthesis. Participant openings, cross-examinations, and
+ballots run in parallel within their respective phases.
+
+The dependency-free localhost interface remains available through `dialectic-ui`.
+The more general `Launch Dialectic UI.cmd` launcher falls back to it when PySide6 is
+absent and, when the checkout's
+Windows `.venv` is absent, can still run Dialectic installed in Ubuntu WSL at
+`~/.local/share/dialectic/venv`. That fallback opens in a dedicated Edge or Chrome
+app window when available. The WSL path uses an authenticated, per-launch file bridge
+under `.git/` for the native Windows repository picker and removes that control
+directory on exit.
 
 For a release build, install `.[release]` and run `python -m build`. The package
 version, controller version, and artifact version are pinned to `0.1.0`, `0.1.0`,

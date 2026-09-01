@@ -1,9 +1,15 @@
 $ErrorActionPreference = 'Stop'
 $repositoryRoot = Split-Path -Parent $PSCommandPath
 $wsl = Join-Path $env:SystemRoot 'System32\wsl.exe'
+$python = Join-Path $repositoryRoot '.venv\Scripts\python.exe'
 $pythonw = Join-Path $repositoryRoot '.venv\Scripts\pythonw.exe'
 
-if (Test-Path -LiteralPath $pythonw) {
+if ((Test-Path -LiteralPath $python) -and (Test-Path -LiteralPath $pythonw)) {
+    & $python -c 'import PySide6' 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        Start-Process -FilePath $pythonw -ArgumentList '-m dialectic.desktop' -WorkingDirectory $repositoryRoot
+        exit 0
+    }
     Start-Process -FilePath $pythonw -ArgumentList '-m dialectic.ui' -WorkingDirectory $repositoryRoot
     exit 0
 }
@@ -44,10 +50,19 @@ if (Test-Path -LiteralPath $wsl) {
     }
 }
 
-$installed = Get-Command dialectic-ui.exe -ErrorAction SilentlyContinue
-if ($null -ne $installed) {
-    Start-Process -FilePath $installed.Source -WorkingDirectory $repositoryRoot
+$installedDesktop = Get-Command dialectic-desktop.exe -ErrorAction SilentlyContinue
+if ($null -ne $installedDesktop) {
+    & $installedDesktop.Source --check 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        Start-Process -FilePath $installedDesktop.Source -WorkingDirectory $repositoryRoot
+        exit 0
+    }
+}
+
+$installedWeb = Get-Command dialectic-ui.exe -ErrorAction SilentlyContinue
+if ($null -ne $installedWeb) {
+    Start-Process -FilePath $installedWeb.Source -WorkingDirectory $repositoryRoot
     exit 0
 }
 
-Write-Error 'Dialectic is not installed in Ubuntu WSL or the Windows .venv. Follow the README install steps, then launch it again.'
+Write-Error 'Dialectic is not installed in Ubuntu WSL or the Windows .venv. Follow the README install steps, including the desktop extra for the native UI, then launch it again.'

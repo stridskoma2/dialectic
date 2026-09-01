@@ -19,8 +19,19 @@ def test_release_metadata_and_entry_points_are_versioned() -> None:
     assert project["scripts"] == {
         "dial": "dialectic.cli:main",
         "dialectic": "dialectic.cli:main",
+        "dialectic-desktop": "dialectic.desktop:main",
         "dialectic-ui": "dialectic.ui:main",
     }
+
+
+def test_windows_desktop_launcher_prefers_the_checkout_and_has_installed_fallback() -> None:
+    launcher = (
+        Path(__file__).parents[1] / "Launch Dialectic Desktop.cmd"
+    ).read_text(encoding="utf-8")
+    assert ".venv\\Scripts\\pythonw.exe" in launcher
+    assert "-m dialectic.desktop" in launcher
+    assert "where.exe dialectic-desktop.exe" in launcher
+    assert "dialectic.ui" not in launcher
 
 
 def test_release_examples_validate_for_both_modes() -> None:
