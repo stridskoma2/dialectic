@@ -6,6 +6,7 @@ import json
 import logging
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -32,6 +33,7 @@ class DesktopResponse:
     text: str
     status: str
     completed_at: str
+    duration_seconds: float | None
 
     @property
     def identity(self) -> str:
@@ -96,6 +98,7 @@ def load_desktop_responses(artifact_dir: Path) -> tuple[DesktopResponse, ...]:
                     or payload.get("capture_completed_at")
                     or ""
                 ),
+                duration_seconds=attempt_duration_seconds(payload),
             )
         )
     responses.sort(
@@ -107,6 +110,23 @@ def load_desktop_responses(artifact_dir: Path) -> tuple[DesktopResponse, ...]:
         )
     )
     return tuple(responses)
+
+
+def attempt_duration_seconds(payload: dict[str, object]) -> float | None:
+    started = payload.get("started_at")
+    completed = payload.get("response_completed_at") or payload.get(
+        "capture_completed_at"
+    )
+    if not isinstance(started, str) or not isinstance(completed, str):
+        return None
+    try:
+        duration = (
+            datetime.fromisoformat(completed.replace("Z", "+00:00"))
+            - datetime.fromisoformat(started.replace("Z", "+00:00"))
+        ).total_seconds()
+    except ValueError:
+        return None
+    return round(duration, 3) if duration >= 0 else None
 
 
 def load_desktop_web_sources(artifact_dir: Path) -> tuple[DesktopWebSource, ...]:

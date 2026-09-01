@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Protocol
+from typing import Callable, Mapping, Protocol
 
 from .launcher import DirectLaunchSpec, LaunchSpec, WindowsBatchLaunchSpec
 from .process import (
@@ -54,6 +54,7 @@ class NativeProcessTransport(Protocol):
         graceful_kill_seconds: float,
         credentials: KnownCredentials,
         cancellation: asyncio.Event | None = None,
+        activity: Callable[[], None] | None = None,
     ) -> NativeProcessResult: ...
 
 
@@ -74,6 +75,7 @@ class BoundedNativeProcessTransport:
         graceful_kill_seconds: float,
         credentials: KnownCredentials,
         cancellation: asyncio.Event | None = None,
+        activity: Callable[[], None] | None = None,
     ) -> NativeProcessResult:
         if os.name == "nt":
             return await self._run_windows(
@@ -81,14 +83,14 @@ class BoundedNativeProcessTransport:
                 stdout_limit=stdout_limit, stderr_limit=stderr_limit,
                 timeout_seconds=timeout_seconds,
                 graceful_kill_seconds=graceful_kill_seconds,
-                credentials=credentials, cancellation=cancellation,
+                credentials=credentials, cancellation=cancellation, activity=activity,
             )
         return await self._run_posix(
             plan, cwd=cwd, environment=environment, stdin=stdin,
             stdout_limit=stdout_limit, stderr_limit=stderr_limit,
             timeout_seconds=timeout_seconds,
             graceful_kill_seconds=graceful_kill_seconds,
-            credentials=credentials, cancellation=cancellation,
+            credentials=credentials, cancellation=cancellation, activity=activity,
         )
 
     async def _run_posix(
@@ -96,6 +98,7 @@ class BoundedNativeProcessTransport:
         stdin: bytes, stdout_limit: int, stderr_limit: int,
         timeout_seconds: float, graceful_kill_seconds: float,
         credentials: KnownCredentials, cancellation: asyncio.Event | None,
+        activity: Callable[[], None] | None,
     ) -> NativeProcessResult:
         if not isinstance(plan, DirectLaunchSpec):
             raise NativeLaunchError("Windows batch plans cannot run on POSIX")
@@ -130,6 +133,8 @@ class BoundedNativeProcessTransport:
             source: asyncio.StreamReader, capture: BoundedStreamCapture
         ) -> None:
             while chunk := await source.read(MAX_READER_CHUNK_BYTES):
+                if activity is not None:
+                    activity()
                 if capture.feed(chunk):
                     overflow.set()
                     return
@@ -158,6 +163,7 @@ class BoundedNativeProcessTransport:
         stdin: bytes, stdout_limit: int, stderr_limit: int,
         timeout_seconds: float, graceful_kill_seconds: float,
         credentials: KnownCredentials, cancellation: asyncio.Event | None,
+        activity: Callable[[], None] | None,
     ) -> NativeProcessResult:
         backend = self._windows_backend or CtypesWindowsJobBackend()
         executable, arguments = _root_command(plan)
@@ -187,11 +193,11 @@ class BoundedNativeProcessTransport:
         handoffs = {
             "stdout": WindowsReaderHandoff(
                 limit_bytes=stdout_limit, coordinator=coordinator,
-                notify=notify, loop=loop,
+                notify=notify, loop=loop, on_activity=activity,
             ),
             "stderr": WindowsReaderHandoff(
                 limit_bytes=stderr_limit, coordinator=coordinator,
-                notify=notify, loop=loop,
+                notify=notify, loop=loop, on_activity=activity,
             ),
         }
         captures = {

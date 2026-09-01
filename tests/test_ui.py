@@ -61,6 +61,12 @@ def test_desktop_ui_contains_the_primary_workflow_controls(tmp_path: Path) -> No
         "previewDialog",
         "/api/content",
         "contextmenu",
+        "turnCountdown",
+        "/api/extend",
+        "durationSeconds",
+        "silence watchdog",
+        "primary:disabled",
+        "#454b55",
     )
     assert all(item in html for item in required)
     assert "Model ID" not in html
@@ -73,6 +79,7 @@ def test_desktop_ui_contains_the_primary_workflow_controls(tmp_path: Path) -> No
                 "role": "participant",
                 "target_id": "participant-a",
                 "turn_phase": "opening",
+                "started_at": "2026-09-01T01:01:00Z",
                 "response_completed_at": "2026-09-01T01:02:03Z",
                 "response": {
                     "runtime": "codex",
@@ -96,6 +103,7 @@ def test_desktop_ui_contains_the_primary_workflow_controls(tmp_path: Path) -> No
         "excerpt": "",
         "status": "response",
         "completedAt": "2026-09-01T01:02:03Z",
+        "durationSeconds": 63.0,
     }
     assert responses[0]["excerpt"].startswith("First line Second line")
     assert len(responses[0]["excerpt"]) == 280

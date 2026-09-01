@@ -1244,6 +1244,9 @@ async def test_recorded_grok_acp_peer_uses_empty_capabilities_and_owned_epochs(
         credentials=credentials,
         preflight_seconds=5,
     )
+    activity: list[str] = []
+    setter = getattr(lease, "set_activity_callback")
+    setter(lambda: activity.append("update"))
     response = await lease.prompt("hostile ' \" $() ` & | ^ % < > 😀", 5)
     first_epoch = await lease.switch_epoch()
     final_epoch = await lease.close(2)
@@ -1252,6 +1255,7 @@ async def test_recorded_grok_acp_peer_uses_empty_capabilities_and_owned_epochs(
     assert response.text == '{"answer":"ok"}'
     assert response.actual_model == "grok-model"
     assert response.usage == {"output_tokens": 1}
+    assert activity == ["update"]
     assert first_epoch.process_exit_code is None
     assert first_epoch.stdout.result.discarded_guard_reason == "epoch-boundary"
     assert final_epoch.process_exit_code == 0
@@ -1369,6 +1373,7 @@ async def test_native_transport_owns_real_process_and_drains_both_streams(
         "sys.stdout.buffer.write(data); sys.stdout.buffer.flush(); "
         "sys.stderr.buffer.write(b'stderr-ok'); sys.stderr.buffer.flush()"
     )
+    activity: list[str] = []
     result = await BoundedNativeProcessTransport().run(
         DirectLaunchSpec(Path(sys.executable), ("-c", script)),
         cwd=tmp_path,
@@ -1379,12 +1384,14 @@ async def test_native_transport_owns_real_process_and_drains_both_streams(
         timeout_seconds=10,
         graceful_kill_seconds=2,
         credentials=KnownCredentials(),
+        activity=lambda: activity.append("chunk"),
     )
     assert result.exit_code == 0
     assert result.end_reason == "completed"
     assert result.cleanup_confirmed
     assert result.stdout.persisted == b"stdout-ok"
     assert result.stderr.persisted == b"stderr-ok"
+    assert len(activity) >= 2
 
 
 @pytest.mark.integration

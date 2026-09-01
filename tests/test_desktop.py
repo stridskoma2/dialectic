@@ -15,6 +15,7 @@ def test_native_desktop_loads_complete_persisted_responses(tmp_path: Path) -> No
                 "role": "participant",
                 "target_id": "participant-a",
                 "turn_phase": "opening",
+                "started_at": "2026-09-01T01:01:00Z",
                 "response_completed_at": "2026-09-01T01:02:03Z",
                 "response": {
                     "runtime": "codex",
@@ -49,6 +50,7 @@ def test_native_desktop_loads_complete_persisted_responses(tmp_path: Path) -> No
     assert [item.target_id for item in responses] == ["participant-a", "reviewer-b"]
     assert responses[0].text == "# Opening\n\nComplete **Markdown** response."
     assert responses[0].status == "response"
+    assert responses[0].duration_seconds == 63.0
     assert responses[1].status == "failed"
     assert responses[1].text == "native process exited before a response"
     assert responses[0].path == opening.resolve()

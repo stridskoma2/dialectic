@@ -66,6 +66,7 @@ from .schemas import (
     PreflightResult,
 )
 from .store import RunStore, canonical_json_bytes
+from .turn_timing import TurnDeadlineController
 
 Role = Literal["driver", "reviewer", "participant", "moderator"]
 AccessMode = Literal["driver-write", "packet-only"]
@@ -192,6 +193,8 @@ class NativeAdapterBase:
         canonical_aliases: Mapping[str, str] | None = None,
         which: Callable[[str], str | None] = shutil.which,
         research_mode: ResearchMode = "offline",
+        turn_deadlines: TurnDeadlineController | None = None,
+        turn_max_seconds: float | None = None,
     ) -> None:
         if target.runtime != self.runtime:
             raise ValueError(f"{type(self).__name__} cannot serve {target.runtime}")
@@ -217,6 +220,8 @@ class NativeAdapterBase:
         self.probe_provider = probe_provider
         self.canonical_aliases = dict(canonical_aliases or {})
         self.which = which
+        self.turn_deadlines = turn_deadlines
+        self.turn_max_seconds = turn_max_seconds
         self._material: NativePreflightMaterial | None = None
         self._fixture: NativeAdapterFixture | None = None
         self._bindings: dict[tuple[str, str, str], _BoundProfile] = {}
@@ -389,6 +394,16 @@ class NativeAdapterBase:
         self._last_invocation = None
         return evidence
 
+    def _turn_activity_callback(
+        self, request: AgentRequest
+    ) -> Callable[[], None] | None:
+        if self.turn_deadlines is None or self.runtime == "claude-code":
+            return None
+        return self.turn_deadlines.activity_callback(request)
+
+    def _turn_transport_timeout(self, request: AgentRequest) -> float:
+        return self.turn_max_seconds or request.timeout_seconds
+
     async def start(self, request: AgentRequest) -> AgentResponse:
         return await self._invoke("start", None, request)
 
@@ -419,14 +434,17 @@ class NativeAdapterBase:
         started = datetime.now(UTC)
         unit_id = _new_process_unit_id()
         cancellation = asyncio.Event()
+        activity = self._turn_activity_callback(request)
+        transport_options = {"activity": activity} if activity is not None else {}
         task = asyncio.create_task(
             self.transport.run(
                 plan, cwd=Path(request.working_directory), environment=environment,
                 stdin=request.prompt.encode("utf-8"),
                 stdout_limit=self.stdout_limit, stderr_limit=self.stderr_limit,
-                timeout_seconds=request.timeout_seconds,
+                timeout_seconds=self._turn_transport_timeout(request),
                 graceful_kill_seconds=self.graceful_kill_seconds,
                 credentials=self.credentials, cancellation=cancellation,
+                **transport_options,
             )
         )
         try:

@@ -46,6 +46,7 @@ from .contracts import RunMode
 from .desktop import DesktopResponse, load_desktop_responses, load_desktop_web_sources
 from .runtime import build_service
 from .schemas import RunRecord
+from .service import DialecticService
 from .ui import (
     _PreparedRun,
     _choose_repository,
@@ -112,6 +113,8 @@ class RunWorker(QThread):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task[RunRecord] | None = None
         self._cancel_requested = False
+        self._service: DialecticService | None = None
+        self._run_id = ""
 
     @Slot()
     def request_cancel(self) -> None:
@@ -120,6 +123,27 @@ class RunWorker(QThread):
         task = self._task
         if loop is not None and task is not None and not task.done():
             loop.call_soon_threadsafe(task.cancel)
+
+    def deadline_snapshot(self) -> dict[str, object]:
+        service = self._service
+        return (
+            service.turn_deadline_snapshot(self._run_id)
+            if service is not None and self._run_id
+            else {
+                "active": False,
+                "turnCount": 0,
+                "remainingSeconds": 0,
+                "effectiveRemainingSeconds": 0,
+                "canExtend": False,
+                "turns": [],
+            }
+        )
+
+    def extend_turn_deadline(self) -> dict[str, object]:
+        service = self._service
+        if service is None or not self._run_id:
+            raise ValueError("no active turn is available to extend")
+        return service.extend_turn_deadlines(self._run_id)
 
     def run(self) -> None:
         prepared = self._prepared
@@ -135,8 +159,10 @@ class RunWorker(QThread):
         try:
             asyncio.set_event_loop(loop)
             service = build_service()
+            self._service = service
             service.set_progress_observer(self._present_progress)
             handle = service.create_run(prepared.mode)
+            self._run_id = handle.run_id
             self.run_created.emit(handle.run_id, str(handle.path))
             log_event(
                 _LOGGER,
@@ -413,6 +439,7 @@ class MainWindow(QMainWindow):
         self._response_timer = QTimer(self)
         self._response_timer.setInterval(500)
         self._response_timer.timeout.connect(self._refresh_responses)
+        self._response_timer.timeout.connect(self._refresh_turn_timing)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -738,10 +765,21 @@ class MainWindow(QMainWindow):
         self.cancel_button.setObjectName("Danger")
         self.cancel_button.hide()
         self.cancel_button.clicked.connect(self._cancel_run)
+        self.deadline_label = QLabel()
+        self.deadline_label.setObjectName("Hint")
+        self.deadline_label.hide()
+        self.extend_button = QPushButton("+5 min")
+        self.extend_button.setToolTip(
+            "Extend each active turn by five minutes, up to the one-hour hard ceiling."
+        )
+        self.extend_button.clicked.connect(self._extend_turn_deadline)
+        self.extend_button.hide()
         self.run_button = QPushButton("Run Code Once")
         self.run_button.setObjectName("Primary")
         self.run_button.clicked.connect(self._start_run)
         layout.addWidget(self.run_note, 1)
+        layout.addWidget(self.deadline_label)
+        layout.addWidget(self.extend_button)
         layout.addWidget(self.cancel_button)
         layout.addWidget(self.run_button)
         return footer
@@ -759,6 +797,8 @@ class MainWindow(QMainWindow):
         self.council_mode.setChecked(mode == "council")
         self.phase_strip.set_mode(mode)
         self.phase_strip.set_phase(None)
+        self.deadline_label.hide()
+        self.extend_button.hide()
         self.mode_hint.setText(
             "Implement once, review the immutable diff in parallel, repair at most once, then stop."
             if mode == "code"
@@ -1056,6 +1096,8 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _run_completed(self, result: DesktopRunResult) -> None:
         self._response_timer.stop()
+        self.deadline_label.hide()
+        self.extend_button.hide()
         self._artifact_dir = result.artifact_dir
         self._summary_path = result.summary_path
         self._worktree = result.worktree
@@ -1085,6 +1127,8 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _run_failed(self, message: str) -> None:
         self._response_timer.stop()
+        self.deadline_label.hide()
+        self.extend_button.hide()
         self._set_running(False)
         self.header_status.setText("●  UI error")
         self.result_title.setText("Could not run")
@@ -1156,6 +1200,45 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(False)
         self.result_detail.setText("Cancellation requested; waiting for bounded cleanup.")
 
+    def _refresh_turn_timing(self) -> None:
+        worker = self._worker
+        timing = worker.deadline_snapshot() if worker is not None else {}
+        active = bool(timing.get("active"))
+        self.deadline_label.setVisible(active)
+        self.extend_button.setVisible(active)
+        if not active:
+            return
+        count = int(timing.get("turnCount", 0))
+        turns = timing.get("turns")
+        first = turns[0] if isinstance(turns, list) and turns else {}
+        remaining = _format_duration(float(first.get("remainingSeconds", 0)))
+        idle_value = first.get("idleRemainingSeconds")
+        idle = (
+            _format_duration(float(idle_value))
+            if isinstance(idle_value, (int, float))
+            else ""
+        )
+        target = _friendly(str(first.get("targetId", "agent")))
+        phase = _friendly(str(first.get("phase", "turn")))
+        prefix = f"{target} · {phase}" if count == 1 else f"{count} active turns · earliest"
+        detail = f"{remaining} allotted"
+        if idle:
+            detail += f" · {idle} silence watchdog"
+        self.deadline_label.setText(f"{prefix} · {detail}")
+        self.extend_button.setEnabled(bool(timing.get("canExtend")))
+
+    def _extend_turn_deadline(self) -> None:
+        worker = self._worker
+        if worker is None:
+            return
+        try:
+            worker.extend_turn_deadline()
+        except ValueError as exc:
+            self.result_detail.setText(str(exc))
+            return
+        self._refresh_turn_timing()
+        self.result_detail.setText("Active turn deadline extended by five minutes.")
+
     def _refresh_responses(self) -> None:
         artifact_dir = self._artifact_dir
         if artifact_dir is None:
@@ -1174,7 +1257,9 @@ class MainWindow(QMainWindow):
             agent = _friendly(response.target_id)
             model = _friendly_model(self._options, response.runtime, response.model)
             phase = _friendly(response.phase)
-            item = QListWidgetItem(f"{agent} · {model}\n{phase}")
+            duration = _format_duration(response.duration_seconds)
+            duration_suffix = f" · {duration}" if duration else ""
+            item = QListWidgetItem(f"{agent} · {model}\n{phase}{duration_suffix}")
             item.setData(Qt.ItemDataRole.UserRole, response.identity)
             item.setToolTip(response.path.name)
             self.response_list.addItem(item)
@@ -1235,7 +1320,11 @@ class MainWindow(QMainWindow):
         if response is None:
             return
         agent = _friendly(response.target_id)
-        self.response_heading.setText(f"{agent} · {_friendly(response.phase)}")
+        duration = _format_duration(response.duration_seconds)
+        suffix = f" · {duration}" if duration else ""
+        self.response_heading.setText(
+            f"{agent} · {_friendly(response.phase)}{suffix}"
+        )
         if response.status == "failed":
             self.response_view.setPlainText(response.text)
         else:
@@ -1499,6 +1588,19 @@ def _format_bytes(value: int) -> str:
     return f"{value / 1_048_576:.1f} MiB"
 
 
+def _format_duration(value: float | None) -> str:
+    if value is None:
+        return ""
+    seconds = max(0, int(round(value)))
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {seconds:02d}s"
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
+
+
 def _markdown_browser() -> QTextBrowser:
     browser = QTextBrowser()
     browser.setOpenExternalLinks(False)
@@ -1577,6 +1679,7 @@ QPushButton#ModeButton { background: #1b1f27; color: #929baa; padding: 9px; }
 QPushButton#ModeButton:checked { background: #303640; color: #f3f5f8; }
 QPushButton#Primary { background: #59d0ac; color: #07120f; border: 0; font-weight: 700; padding: 10px 19px; }
 QPushButton#Primary:hover { background: #6dd9b8; }
+QPushButton#Primary:disabled { background: #454b55; color: #a0a7b2; border: 1px solid #59616d; }
 QPushButton#Danger { color: #ff9e9e; }
 QPushButton#Remove { background: transparent; border: 0; color: #929baa; font-size: 17px; padding: 2px; }
 QPushButton#Remove:hover { color: #ff8f8f; }

@@ -89,6 +89,34 @@ def test_native_desktop_switches_modes_and_previews_markdown(
         assert all(row.runtime.findData("@driver") == -1 for row in window._agent_rows)
         assert window.research_mode.currentData() == "live-web"
         assert "provider-native web" in window.research_hint.text()
+        window._set_running(True)
+        assert not window.run_button.isEnabled()
+        window._set_running(False)
+        assert window.run_button.isEnabled()
+
+        class _TimingWorker:
+            @staticmethod
+            def deadline_snapshot() -> dict[str, object]:
+                return {
+                    "active": True,
+                    "turnCount": 1,
+                    "canExtend": True,
+                    "turns": [
+                        {
+                            "targetId": "participant-a",
+                            "phase": "opening",
+                            "remainingSeconds": 1_797,
+                            "idleRemainingSeconds": 87,
+                        }
+                    ],
+                }
+
+        window._worker = _TimingWorker()  # type: ignore[assignment]
+        window._refresh_turn_timing()
+        assert "29m 57s allotted" in window.deadline_label.text()
+        assert "1m 27s silence watchdog" in window.deadline_label.text()
+        assert window.extend_button.isEnabled()
+        window._worker = None
     finally:
         window.close()
 
@@ -219,6 +247,7 @@ def test_native_desktop_renders_complete_model_response(
                 "role": "reviewer",
                 "target_id": "reviewer-a",
                 "turn_phase": "review",
+                "started_at": "2026-09-01T01:01:00Z",
                 "response_completed_at": "2026-09-01T01:02:03Z",
                 "response": {
                     "runtime": "claude-code",
@@ -236,6 +265,8 @@ def test_native_desktop_renders_complete_model_response(
         qt_app.processEvents()
         assert window.response_list.count() == 1
         assert "Reviewer A" in window.response_list.item(0).text()
+        assert "1m 03s" in window.response_list.item(0).text()
+        assert "1m 03s" in window.response_heading.text()
         assert "complete response" in window.response_view.toPlainText()
         assert window.copy_response.isEnabled()
         assert window.open_response.isEnabled()

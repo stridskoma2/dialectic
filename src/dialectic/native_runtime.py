@@ -14,6 +14,7 @@ from .native_adapters import ClaudeAdapter, CodexAdapter, ProbeProvider
 from .redaction import KnownCredentials
 from .schemas import AgentTarget, DialecticConfig
 from .service import ExecutionContext
+from .turn_timing import MAXIMUM_TURN_SECONDS
 
 _CREDENTIAL_NAMES = {
     "codex": ("OPENAI_API_KEY",),
@@ -82,6 +83,8 @@ class NativeCodeExecutor:
                 if access_mode == "packet-only"
                 else "offline"
             ),
+            "turn_deadlines": context.turn_deadlines,
+            "turn_max_seconds": MAXIMUM_TURN_SECONDS,
         }
         adapter_type = {
             "codex": CodexAdapter,

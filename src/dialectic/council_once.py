@@ -842,8 +842,8 @@ class CouncilOnceOrchestrator:
                 if draft.operation == "start"
                 else item.adapter.resume(item.session_id or "", draft.request)
             )
-            raw = await asyncio.wait_for(
-                invocation, timeout=context.config.limits.agent_turn_seconds
+            raw = await context.turn_deadlines.wait_for(
+                draft.request, item.target.runtime, invocation
             )
             response = AgentResponse.model_validate(raw)
             validate_model_bounds(

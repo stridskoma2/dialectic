@@ -108,6 +108,7 @@ from dialectic.store import (
     StateCorruptError,
     canonical_json_bytes,
 )
+from dialectic.turn_timing import TurnDeadlineController, TurnDeadlineExpired
 from dialectic.workflow_evidence import (
     bounded_preflight_diagnostic,
     stage_preflight_requests,
@@ -253,6 +254,48 @@ async def test_core_007_timeout_reaps_owned_descendant_before_sentinel() -> None
     assert result.cleanup_confirmed
     assert unit.forced
     assert sentinel == []
+
+    request = AgentRequest.model_construct(
+        role="participant",
+        target_id="participant-a",
+        turn_phase="opening",
+        prompt="test",
+        output_schema=None,
+        timeout_seconds=0.02,
+        working_directory=".",
+        access_mode="packet-only",
+    )
+    controller = TurnDeadlineController(idle_seconds=0.05, maximum_turn_seconds=0.3)
+
+    async def completes_after_extension() -> str:
+        await asyncio.sleep(0.04)
+        return "completed"
+
+    extended = asyncio.create_task(
+        controller.wait_for(request, "claude-code", completes_after_extension())
+    )
+    await asyncio.sleep(0.01)
+    assert controller.snapshot()["remainingSeconds"] > 0
+    assert controller.extend_active(0.03)["extendedTurns"] == 1
+    assert await extended == "completed"
+
+    streaming_request = request.model_copy(update={"timeout_seconds": 0.2})
+    activity = controller.activity_callback(streaming_request)
+
+    async def streaming_response() -> str:
+        for _ in range(3):
+            await asyncio.sleep(0.02)
+            activity()
+        return "streamed"
+
+    assert (
+        await controller.wait_for(streaming_request, "codex", streaming_response())
+        == "streamed"
+    )
+
+    with pytest.raises(TurnDeadlineExpired, match="no observable provider activity") as error:
+        await controller.wait_for(streaming_request, "codex", asyncio.Event().wait())
+    assert error.value.reason == "idle"
 
 
 @pytest.mark.asyncio

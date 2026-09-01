@@ -9,7 +9,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from .launcher import DirectLaunchSpec, LaunchSpec, WindowsBatchLaunchSpec
 from .output import strict_json_loads
@@ -161,6 +161,12 @@ class _ManagedAcpLease:
         self._windows_notification: asyncio.Event | None = None
         self._windows_io_finalized = False
         self._windows_io_cleanup_result = True
+        self._activity_callback: Callable[[], None] | None = None
+
+    def set_activity_callback(self, callback: Callable[[], None] | None) -> None:
+        """Set the current logical turn's controller-owned liveness sink."""
+
+        self._activity_callback = callback
 
     async def start(self, timeout_seconds: float) -> None:
         loop = asyncio.get_running_loop()
@@ -458,6 +464,8 @@ class _ManagedAcpLease:
                 update.get("sessionUpdate"), str
             ):
                 raise AcpProtocolError("ACP session/update payload is invalid")
+            if self._activity_callback is not None:
+                self._activity_callback()
             if update["sessionUpdate"] == "agent_message_chunk":
                 content = update.get("content")
                 if not isinstance(content, dict) or not isinstance(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,6 +29,7 @@ from .redaction import (
 )
 from .schemas import DialecticConfig, EventRecord, RunRecord, SummaryRecord, WorkspaceRecord
 from .store import RunHandle, RunStore
+from .turn_timing import TURN_EXTENSION_SECONDS, TurnDeadlineController
 
 
 class RunExecutor(Protocol):
@@ -40,6 +42,17 @@ ProgressObserver = Callable[[RunRecord], None]
 _LOGGER = logging.getLogger(__name__)
 
 
+def _empty_deadline_snapshot() -> dict[str, object]:
+    return {
+        "active": False,
+        "turnCount": 0,
+        "remainingSeconds": 0,
+        "effectiveRemainingSeconds": 0,
+        "canExtend": False,
+        "turns": [],
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionContext:
     handle: RunHandle
@@ -48,6 +61,7 @@ class ExecutionContext:
     repository_path: Path | None
     credentials: KnownCredentials
     service: "DialecticService"
+    turn_deadlines: TurnDeadlineController
 
 
 class DialecticFailure(RuntimeError):
@@ -79,10 +93,45 @@ class DialecticService:
             "council": council_executor,
         }
         self._progress_observer: ProgressObserver | None = None
+        self._deadline_lock = threading.RLock()
+        self._active_deadlines: dict[str, TurnDeadlineController] = {}
 
     def set_progress_observer(self, observer: ProgressObserver | None) -> None:
         """Set the non-authoritative presentation observer for durable transitions."""
         self._progress_observer = observer
+
+    def turn_deadline_snapshot(self, run_id: str) -> dict[str, object]:
+        """Return a presentation-only snapshot of controller-owned turn deadlines."""
+
+        with self._deadline_lock:
+            controller = self._active_deadlines.get(run_id)
+        return controller.snapshot() if controller is not None else _empty_deadline_snapshot()
+
+    def extend_turn_deadlines(
+        self, run_id: str, seconds: float = TURN_EXTENSION_SECONDS
+    ) -> dict[str, object]:
+        """Extend active logical turns without weakening their hard ceiling."""
+
+        if seconds != TURN_EXTENSION_SECONDS:
+            raise ValueError("turn deadlines may be extended only in five-minute increments")
+        with self._deadline_lock:
+            controller = self._active_deadlines.get(run_id)
+        if controller is None:
+            raise ValueError("no active turn is available to extend")
+        snapshot = controller.extend_active(seconds)
+        if snapshot["extendedTurns"] == 0:
+            if snapshot["turnCount"] == 0:
+                raise ValueError("no active turn is available to extend")
+            raise ValueError("active turns have reached the one-hour hard ceiling")
+        log_event(
+            _LOGGER,
+            logging.INFO,
+            "turn.deadline_extended",
+            run_id=run_id,
+            seconds=int(seconds),
+            extended_turns=snapshot["extendedTurns"],
+        )
+        return snapshot
 
     def create_run(self, mode: RunMode) -> RunHandle:
         handle = self.store.bootstrap_run(mode)
@@ -187,6 +236,7 @@ class DialecticService:
                 "no native workflow executor is configured in Slice 0",
                 phase="PREFLIGHT",
             )
+        turn_deadlines = TurnDeadlineController()
         context = ExecutionContext(
             handle=handle,
             config=loaded.config,
@@ -194,7 +244,10 @@ class DialecticService:
             repository_path=repository_path,
             credentials=credentials,
             service=self,
+            turn_deadlines=turn_deadlines,
         )
+        with self._deadline_lock:
+            self._active_deadlines[handle.run_id] = turn_deadlines
         try:
             result = await executor(context)
         except DialecticFailure as exc:
@@ -209,6 +262,10 @@ class DialecticService:
                 "INTERNAL_ERROR",
                 f"unexpected controller error: {type(exc).__name__}",
             )
+        finally:
+            with self._deadline_lock:
+                if self._active_deadlines.get(handle.run_id) is turn_deadlines:
+                    self._active_deadlines.pop(handle.run_id, None)
         if result.run_id != handle.run_id or result.status not in {
             "FINALIZED",
             "FAILED",

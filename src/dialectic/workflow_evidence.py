@@ -340,8 +340,8 @@ class WorkflowEvidenceSupport:
                 if operation == "start"
                 else adapter.resume(session_id or "", request)
             )
-            raw_response = await asyncio.wait_for(
-                invocation, timeout=context.config.limits.agent_turn_seconds
+            raw_response = await context.turn_deadlines.wait_for(
+                request, target.runtime, invocation
             )
             exit_code = 0
             try:
@@ -364,7 +364,7 @@ class WorkflowEvidenceSupport:
         except asyncio.TimeoutError as exc:
             termination = "timeout"
             attempt_failure = failure_kind
-            diagnostic = "agent turn reached its individual timeout"
+            diagnostic = str(exc) or "agent turn reached its individual timeout"
             caught = exc
         except asyncio.CancelledError as exc:
             if workflow_timeout is not None and workflow_timeout.is_set():

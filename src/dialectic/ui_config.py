@@ -20,7 +20,7 @@ SUPPORTED_EFFORTS: dict[RuntimeName, tuple[str, ...]] = {
     "grok-build": ("", "low", "medium", "high", "xhigh"),
 }
 
-# The UI emits the documented v0.1 defaults. Safety limits remain controller-owned
+# The UI emits conservative bounded defaults. Safety limits remain controller-owned
 # and deliberately are not user-editable in the simple desktop surface.
 DEFAULT_LIMITS: dict[str, int] = {
     "max_reviewers": 5,
@@ -46,9 +46,11 @@ DEFAULT_LIMITS: dict[str, int] = {
     "max_turn_scratch_depth": 64,
     "preflight_seconds": 30,
     "capability_probe_seconds": 120,
-    "agent_turn_seconds": 300,
-    "code_run_seconds": 1_200,
-    "council_run_seconds": 1_200,
+    # Native UI runs start with a generous research-capable allotment. Streaming
+    # providers are still reaped quickly by the controller idle watchdog.
+    "agent_turn_seconds": 1_800,
+    "code_run_seconds": 3_600,
+    "council_run_seconds": 3_600,
     "graceful_kill_seconds": 5,
     "turn_cleanup_seconds": 30,
     "code_review_cycles": 1,

@@ -28,8 +28,10 @@ from .app_logging import (
     log_event,
 )
 from .contracts import ResearchMode, RunMode
-from .desktop import load_desktop_web_sources
+from .desktop import attempt_duration_seconds, load_desktop_web_sources
 from .runtime import build_service
+from .service import DialecticService
+from .turn_timing import TURN_EXTENSION_SECONDS
 from .ui_config import (
     ModeratorMode,
     RuntimeName,
@@ -277,6 +279,7 @@ class _UiState:
         self._lock = threading.RLock()
         self._active = False
         self._last_seen = time.monotonic()
+        self._service: DialecticService | None = None
         self._snapshot: dict[str, object] = {
             "active": False,
             "runId": "",
@@ -304,6 +307,20 @@ class _UiState:
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             snapshot = dict(self._snapshot)
+            service = self._service
+        run_id = snapshot.get("runId")
+        snapshot["turnTiming"] = (
+            service.turn_deadline_snapshot(run_id)
+            if service is not None and isinstance(run_id, str) and run_id
+            else {
+                "active": False,
+                "turnCount": 0,
+                "remainingSeconds": 0,
+                "effectiveRemainingSeconds": 0,
+                "canExtend": False,
+                "turns": [],
+            }
+        )
         artifact_dir = snapshot.get("artifactDir")
         snapshot["responses"] = (
             _response_excerpts(Path(artifact_dir))
@@ -316,6 +333,14 @@ class _UiState:
             else []
         )
         return snapshot
+
+    def extend_turns(self) -> dict[str, object]:
+        with self._lock:
+            service = self._service
+            run_id = self._snapshot.get("runId")
+        if service is None or not isinstance(run_id, str) or not run_id:
+            raise ValueError("no active turn is available to extend")
+        return service.extend_turn_deadlines(run_id, TURN_EXTENSION_SECONDS)
 
     def start(self, prepared: _PreparedRun) -> None:
         with self._lock:
@@ -391,6 +416,8 @@ class _UiState:
         )
         try:
             service = build_service()
+            with self._lock:
+                self._service = service
             service.set_progress_observer(self._progress)
             handle = service.create_run(prepared.mode)
             with self._lock:
@@ -557,6 +584,10 @@ class _RequestHandler(BaseHTTPRequestHandler):
                     raise ValueError("Request body must be an object")
                 target = _string(payload.get("target"), "target")
                 self._json(HTTPStatus.OK, self.server.ui_state.content_for(target))
+            elif parsed.path == "/api/extend":
+                if not isinstance(payload, dict):
+                    raise ValueError("Request body must be an object")
+                self._json(HTTPStatus.OK, self.server.ui_state.extend_turns())
             elif parsed.path == "/api/shutdown":
                 if self.server.ui_state.snapshot()["active"]:
                     raise ValueError("Wait for the active run to finish before exiting")
@@ -783,11 +814,11 @@ def _summary_brief(path: Path) -> str:
     return brief
 
 
-def _response_excerpts(artifact_dir: Path) -> list[dict[str, str]]:
+def _response_excerpts(artifact_dir: Path) -> list[dict[str, object]]:
     turns = artifact_dir / "turns"
     if not turns.is_dir():
         return []
-    responses: list[dict[str, str]] = []
+    responses: list[dict[str, object]] = []
     for path in turns.glob("*/*/*.attempt.json"):
         try:
             if path.stat().st_size > _MAX_PREVIEW_BYTES:
@@ -823,6 +854,7 @@ def _response_excerpts(artifact_dir: Path) -> list[dict[str, str]]:
                     or payload.get("capture_completed_at")
                     or ""
                 ),
+                "durationSeconds": attempt_duration_seconds(payload),
             }
         )
     responses.sort(

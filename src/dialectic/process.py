@@ -517,6 +517,7 @@ class WindowsReaderHandoff:
         notify: Callable[[], None],
         loop: asyncio.AbstractEventLoop | None = None,
         queue_capacity_bytes: int | None = None,
+        on_activity: Callable[[], None] | None = None,
     ) -> None:
         capacity = (
             min(limit_bytes, MAX_READER_CHUNK_BYTES)
@@ -530,6 +531,7 @@ class WindowsReaderHandoff:
         self.coordinator = coordinator
         self._notify = notify
         self._loop = loop
+        self._on_activity = on_activity
         self._condition = threading.Condition()
         self.coordinator.register(self._condition)
         self._queue: deque[bytes] = deque()
@@ -580,6 +582,8 @@ class WindowsReaderHandoff:
                 chunk = pipe.read(MAX_READER_CHUNK_BYTES)
                 if not chunk:
                     break
+                if self._on_activity is not None:
+                    self._on_activity()
                 current_chunk_bytes = len(chunk)
                 if current_chunk_bytes > MAX_READER_CHUNK_BYTES:
                     raise RuntimeError("reader returned a chunk larger than 65536 bytes")

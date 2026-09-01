@@ -41,14 +41,23 @@ a repository browser for Code Once, friendly model dropdowns with installed-CLI
 status, effort selection, one to five reviewers or two to five council participants,
 reviewer focus, consensus tolerance, an Offline/Live web research selector, native
 phase/status updates, complete Markdown model responses, a live model-cited Sources
-view, the final summary, retained evidence, application logs, and isolated worktree
-access. The catalog includes locally configured selectors, while
+view, per-answer durations, a live turn countdown with five-minute extensions, the
+final summary, retained evidence, application logs, and isolated worktree access.
+The catalog includes locally configured selectors, while
 authentication and account-specific model access remain verified by native preflight.
 Council Once remains prompt-only, so a repository selected for Code Once is visibly
 disabled and is not disclosed to council participants. Its **Moderator behavior**
 selector chooses either fresh synthesis only or an independent blind moderator
 opening followed by fresh synthesis. Participant openings, cross-examinations, and
 ballots run in parallel within their respective phases.
+
+UI-created runs start each turn with a 30-minute allotment and retain a one-hour
+controller hard ceiling; the whole workflow retains its separate one-hour wall-clock
+limit. The **+5 min** control extends every currently active parallel turn without
+moving the hard ceiling. Codex JSONL and Grok ACP turns also fail after 90 seconds of
+observable provider silence. Claude Code's current output mode is buffered, so it
+uses the absolute allotment without an unsafe idle assumption. Hand-authored CLI
+configuration continues to use its explicit `agent_turn_seconds` value.
 
 New Council runs default to **Live web** in both UIs. Participants and the Moderator
 may use only their provider's native web-search/web-fetch tools; shell networking,

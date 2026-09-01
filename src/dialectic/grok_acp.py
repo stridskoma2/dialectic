@@ -304,7 +304,10 @@ class GrokAdapter(NativeAdapterBase):
         state.prepared_request = None
         started = datetime.now(UTC)
         try:
-            logical = await state.lease.prompt(request.prompt, request.timeout_seconds)
+            self._set_lease_activity(state.lease, request)
+            logical = await state.lease.prompt(
+                request.prompt, self._turn_transport_timeout(request)
+            )
             response_completed = datetime.now(UTC)
             response = self._normalize(logical, request)
         except BaseException as exc:
@@ -406,7 +409,10 @@ class GrokAdapter(NativeAdapterBase):
         lease: AcpLease | None = None
         try:
             lease = await self._open_lease(request, unit_id)
-            logical = await lease.prompt(request.prompt, request.timeout_seconds)
+            self._set_lease_activity(lease, request)
+            logical = await lease.prompt(
+                request.prompt, self._turn_transport_timeout(request)
+            )
             response_completed = datetime.now(UTC)
             response = self._normalize(logical, request)
         except BaseException as exc:
@@ -454,7 +460,10 @@ class GrokAdapter(NativeAdapterBase):
         epoch: AcpEpochCapture | None = None
         try:
             lease = await self._open_lease(request, unit_id)
-            logical = await lease.prompt(request.prompt, request.timeout_seconds)
+            self._set_lease_activity(lease, request)
+            logical = await lease.prompt(
+                request.prompt, self._turn_transport_timeout(request)
+            )
             response_completed = datetime.now(UTC)
             response = self._normalize(logical, request)
             epoch = await lease.close(self.graceful_kill_seconds)
@@ -508,6 +517,11 @@ class GrokAdapter(NativeAdapterBase):
             credentials=self.credentials,
             preflight_seconds=self.preflight_seconds,
         )
+
+    def _set_lease_activity(self, lease: AcpLease, request: AgentRequest) -> None:
+        setter = getattr(lease, "set_activity_callback", None)
+        if callable(setter):
+            setter(self._turn_activity_callback(request))
 
     def _normalize(
         self, logical: AcpLogicalResponse, request: AgentRequest
