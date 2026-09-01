@@ -50,6 +50,8 @@ from dialectic.contracts import (
     exit_code_for,
 )
 from dialectic.ingress import InputAcquisitionError, acquire_named_file
+from dialectic.filesystem import stable_filesystem_identity
+from dialectic.json_schema import JsonSchemaError, validate_json_schema
 from dialectic.launcher import LaunchPlanError, WindowsBatchLaunchSpec, build_launch_spec
 from dialectic.locking import (
     RepositoryBusyError,
@@ -76,6 +78,7 @@ from dialectic.redaction import (
     KnownCredentials,
     redact_config,
 )
+from dialectic.research import extract_source_citations, research_policy
 from dialectic.schemas import (
     AgentRequest,
     AgentRequestArtifact,
@@ -104,6 +107,10 @@ from dialectic.store import (
     RunStore,
     StateCorruptError,
     canonical_json_bytes,
+)
+from dialectic.workflow_evidence import (
+    bounded_preflight_diagnostic,
+    stage_preflight_requests,
 )
 
 
@@ -1248,6 +1255,16 @@ def test_core_027_stream_scratch_and_cleanup_bounds(tmp_path: Path) -> None:
             clock=lambda: next(ticks),
         )
 
+    if os.name != "nt":
+        deep_root = tmp_path / "deep-cleanup"
+        deep_root.mkdir()
+        cursor = deep_root
+        for _ in range(1_100):
+            cursor /= "d"
+            cursor.mkdir()
+        cleanup_reserved_tree(deep_root, timeout_seconds=10)
+        assert not os.path.lexists(deep_root)
+
 
 @pytest.mark.asyncio
 async def test_core_028_windows_reader_handoff_is_byte_and_callback_bounded() -> None:
@@ -1672,6 +1689,50 @@ def test_core_029_only_scalar_utf8_without_bom_is_accepted(
 def test_core_030_capability_evidence_and_binding_barriers_are_fail_closed(
     tmp_path: Path,
 ) -> None:
+    assert research_policy()["allowed_tools"] == ["web-search", "web-fetch"]
+    citations, total = extract_source_citations(
+        "[Foo (bar)](https://en.wikipedia.org/wiki/Foo_(bar)) and "
+        "https://en.wikipedia.org/wiki/Baz_(qux).",
+        limit=10,
+    )
+    assert total == 2
+    assert [citation.url for citation in citations] == [
+        "https://en.wikipedia.org/wiki/Foo_(bar)",
+        "https://en.wikipedia.org/wiki/Baz_(qux)",
+    ]
+
+    cyclic_schema = {
+        "$defs": {"loop": {"$ref": "#/$defs/loop"}},
+        "$ref": "#/$defs/loop",
+    }
+    with pytest.raises(JsonSchemaError, match="cyclic"):
+        validate_json_schema({}, cyclic_schema)
+
+    if os.name != "nt":
+        identity_target = tmp_path / "identity-target"
+        identity_target.write_text("target", encoding="utf-8")
+        identity_link = tmp_path / "identity-link"
+        identity_link.symlink_to(identity_target)
+        assert stable_filesystem_identity(identity_link) != stable_filesystem_identity(
+            identity_target
+        )
+
+    leaders, followers = stage_preflight_requests(
+        (
+            ("participant-a", "codex", "packet-only"),
+            ("participant-b", "claude-code", "packet-only"),
+            ("participant-c", "claude-code", "packet-only"),
+            ("driver", "codex", "driver-write"),
+        ),
+        cohort_key=lambda request: request[1:],
+    )
+    assert leaders == (
+        ("participant-a", "codex", "packet-only"),
+        ("participant-b", "claude-code", "packet-only"),
+        ("driver", "codex", "driver-write"),
+    )
+    assert followers == (("participant-c", "claude-code", "packet-only"),)
+
     scratch_root = tmp_path / ".dialectic-turn"
     scratch_control = scratch_root / "control"
     scratch_tmp = scratch_root / "tmp"
@@ -1746,6 +1807,37 @@ def test_core_030_capability_evidence_and_binding_barriers_are_fail_closed(
             fixture=fixture,
             expected_fields={**expected_fields, "cli_version": "2.0"},
         )
+    failed_probe = CapabilityProbeResult(
+        probe_id="network-denied",
+        expected="deny",
+        observed="unavailable",
+        passed=False,
+        bounded_diagnostic="pinned probe",
+    )
+    failed_results = [failed_probe.model_dump(mode="json")]
+    failed_attestation = attestation.model_copy(
+        update={
+            "probe_results": [failed_probe],
+            "probe_results_sha256": hashlib.sha256(
+                (
+                    json.dumps(failed_results, sort_keys=True, separators=(",", ":"))
+                    + "\n"
+                ).encode()
+            ).hexdigest(),
+        }
+    )
+    with pytest.raises(
+        CapabilityEvidenceError,
+        match="network-denied=unavailable",
+    ) as failed:
+        validate_cached_attestation(
+            canonical_json_bytes(failed_attestation),
+            fixture=fixture,
+            expected_fields=expected_fields,
+        )
+    assert bounded_preflight_diagnostic(failed.value) == (
+        "capability attestation failed probes: network-denied=unavailable"
+    )
     probe_calls = 0
 
     def reprobe() -> CapabilityAttestationArtifact:

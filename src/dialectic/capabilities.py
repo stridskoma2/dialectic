@@ -67,8 +67,12 @@ def validate_cached_attestation(
             raise CapabilityEvidenceError(f"capability attestation is stale at {field}")
     if artifact.profile_template_sha256 != fixture.template_sha256:
         raise CapabilityEvidenceError("capability attestation template is stale")
-    if not all(result.passed for result in artifact.probe_results):
-        raise CapabilityEvidenceError("capability attestation contains a failed probe")
+    failed = [result for result in artifact.probe_results if not result.passed]
+    if failed:
+        detail = ", ".join(
+            f"{result.probe_id}={result.observed}" for result in failed
+        )
+        raise CapabilityEvidenceError(f"capability attestation failed probes: {detail}")
     results_hash = _canonical_hash(
         [result.model_dump(mode="json") for result in artifact.probe_results]
     )

@@ -77,6 +77,11 @@ class NativeCodeExecutor:
             "graceful_kill_seconds": limits.graceful_kill_seconds,
             "source_environment": self.source_environment,
             "probe_provider": self.probe_provider,
+            "research_mode": (
+                context.config.research_mode
+                if access_mode == "packet-only"
+                else "offline"
+            ),
         }
         adapter_type = {
             "codex": CodexAdapter,

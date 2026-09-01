@@ -35,6 +35,7 @@ from .git_workspace import (
 )
 from .locking import RepositoryBusyError, RepositoryLock
 from .output import OutputError, extract_model_payload
+from .research import research_policy
 from .schemas import (
     AgentTarget,
     CapabilityBindingArtifact,
@@ -61,6 +62,7 @@ from .workflow_evidence import (
     canonical_mapping_bytes as _canonical_dict_bytes,
     concrete_profile as _concrete_profile,
     require_packet_bound,
+    stage_preflight_requests,
 )
 
 
@@ -152,8 +154,6 @@ class CodeOnceOrchestrator:
         for index, (reviewer_id, target) in enumerate(reviewers):
             adapter = self.reviewer_adapters.get(reviewer_id)
             if adapter is None:
-                adapter = self.driver_adapter if target == driver_target else None
-            if adapter is None:
                 raise DialecticFailure(
                     "PREFLIGHT_FAILED", f"no adapter is configured for reviewer {reviewer_id}"
                 )
@@ -199,7 +199,13 @@ class CodeOnceOrchestrator:
             )
             return (role, lookup_id), evidence
 
-        pairs = await asyncio.gather(*(one(*request) for request in requests))
+        leaders, followers = stage_preflight_requests(
+            requests,
+            cohort_key=lambda request: (request[3].runtime, request[5]),
+        )
+        pairs = list(await asyncio.gather(*(one(*request) for request in leaders)))
+        if followers:
+            pairs.extend(await asyncio.gather(*(one(*request) for request in followers)))
         return dict(pairs)
 
     async def _run_locked(
@@ -367,7 +373,10 @@ class CodeOnceOrchestrator:
             return context.service.finalize_code(
                 context.handle,
                 "COMPLETED_NO_FINDINGS",
-                artifact_paths=_code_artifact_paths(findings=False),
+                artifact_paths=_code_artifact_paths(
+                    findings=False,
+                    research=context.config.research_mode == "live-web",
+                ),
                 markdown_notes=[
                     "Repair turn: not performed; reviewers returned no findings.",
                     "Re-review: not applicable.",
@@ -476,7 +485,10 @@ class CodeOnceOrchestrator:
             context.handle,
             outcome,
             unresolved_items=unresolved,
-            artifact_paths=_code_artifact_paths(findings=True),
+            artifact_paths=_code_artifact_paths(
+                findings=True,
+                research=context.config.research_mode == "live-web",
+            ),
             markdown_notes=[
                 "Repair turn: performed.",
                 "Re-review: not performed; the post-repair state has not been re-reviewed.",
@@ -518,6 +530,8 @@ class CodeOnceOrchestrator:
         ):
             alias = f"reviewer-{chr(ord('a') + index)}"
             packet = {"core": core, "lens": spec.lens}
+            if context.config.research_mode == "live-web":
+                packet["research_policy"] = research_policy()
             packet_bytes = _canonical_dict_bytes(packet)
             require_packet_bound(
                 context,
@@ -531,7 +545,10 @@ class CodeOnceOrchestrator:
             evidence = gate_a[("reviewer", reviewer_id)]
             adapter = self.reviewer_adapters.get(reviewer_id)
             if adapter is None:
-                adapter = self.driver_adapter
+                raise DialecticFailure(
+                    "PREFLIGHT_FAILED",
+                    f"no adapter is configured for reviewer {reviewer_id}",
+                )
             dynamic_paths = {"neutral_role_dir": neutral}
             concrete = _concrete_profile(evidence.fixture, dynamic_paths)
             binding = build_capability_binding(
@@ -805,7 +822,7 @@ def _repair_prompt(feedback: FeedbackArtifact) -> str:
     return _canonical_dict_bytes(model_packet).decode("utf-8")
 
 
-def _code_artifact_paths(*, findings: bool) -> dict[str, str]:
+def _code_artifact_paths(*, findings: bool, research: bool = False) -> dict[str, str]:
     paths = {
         "events": "events.jsonl",
         "run": "run.json",
@@ -821,4 +838,6 @@ def _code_artifact_paths(*, findings: bool) -> dict[str, str]:
                 "repair_delta": "git/repair.delta.diff",
             }
         )
+    if research:
+        paths["research_sources"] = "research/sources"
     return paths

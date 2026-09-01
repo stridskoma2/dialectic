@@ -20,6 +20,7 @@ from dialectic.ui import (
     _model_options,
     _prepare_run,
     _response_excerpts,
+    _source_excerpts,
     _resolve_repository_path,
     _summary_brief,
     _shutdown_windows_bridge,
@@ -48,6 +49,12 @@ def test_desktop_ui_contains_the_primary_workflow_controls(tmp_path: Path) -> No
         "Run Code Once",
         "App log",
         "Model responses",
+        "Research access",
+        "Live web",
+        "Web sources",
+        "data-model-link",
+        "window.confirm",
+        'researchMode:"live-web"',
         "outcomePanel",
         "Outcome / summary",
         "summaryBrief",
@@ -110,6 +117,38 @@ def test_desktop_ui_contains_the_primary_workflow_controls(tmp_path: Path) -> No
     assert _summary_brief(summary) == (
         "Repair turn: not performed.\nRe-review: not applicable."
     )
+
+    source = tmp_path / "research/sources/participant/participant-a/opening.json"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        json.dumps(
+            {
+                "role": "participant",
+                "target_id": "participant-a",
+                "turn_phase": "opening",
+                "captured_at": "2026-09-01T01:02:03Z",
+                "sources": [
+                    {
+                        "title": "Example Domain",
+                        "url": "https://example.com/",
+                        "claim_context": "Current example evidence.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert _source_excerpts(tmp_path) == [
+        {
+            "role": "participant",
+            "targetId": "participant-a",
+            "phase": "opening",
+            "title": "Example Domain",
+            "url": "https://example.com/",
+            "claimContext": "Current example evidence.",
+            "capturedAt": "2026-09-01T01:02:03Z",
+        }
+    ]
 
 
 def test_desktop_model_options_use_friendly_names_and_report_installed_clis(
@@ -203,7 +242,9 @@ def test_desktop_run_request_uses_the_selected_repository(tmp_path: Path) -> Non
 
     assert prepared.repository == repository.resolve()
     assert prepared.prompt_bytes == b"Implement the focused change."
-    assert ConfigLoader({}).load(prepared.config_bytes, mode="code").config.driver is not None
+    config = ConfigLoader({}).load(prepared.config_bytes, mode="code").config
+    assert config.driver is not None
+    assert config.research_mode == "offline"
 
 
 def test_wsl_translates_a_windows_repository_path(

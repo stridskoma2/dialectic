@@ -8,7 +8,7 @@ from typing import Literal, TypeAlias
 import yaml
 
 from .config import ConfigLoader
-from .contracts import RunMode
+from .contracts import ResearchMode, RunMode
 
 RuntimeName: TypeAlias = Literal["codex", "claude-code", "grok-build"]
 ReviewRuntime: TypeAlias = RuntimeName | Literal["@driver"]
@@ -38,6 +38,7 @@ DEFAULT_LIMITS: dict[str, int] = {
     "max_lens_chars": 4_096,
     "max_model_field_chars": 32_768,
     "max_model_list_items": 100,
+    "max_web_sources_per_turn": 20,
     "max_agent_stdout_bytes": 8_388_608,
     "max_agent_stderr_bytes": 2_097_152,
     "max_turn_scratch_bytes": 67_108_864,
@@ -70,6 +71,7 @@ class UiRunConfig:
     main_model: str
     main_effort: str
     agents: tuple[UiAgentChoice, ...]
+    research_mode: ResearchMode = "offline"
     max_dissenters: int = 0
     moderator_mode: ModeratorMode = "fresh"
 
@@ -79,12 +81,15 @@ def build_config_bytes(request: UiRunConfig) -> bytes:
 
     if request.main_runtime not in SUPPORTED_EFFORTS:
         raise ValueError(f"Unsupported main runtime {request.main_runtime!r}")
+    if request.research_mode not in {"offline", "live-web"}:
+        raise ValueError(f"Unsupported research mode {request.research_mode!r}")
     main_model = _required(request.main_model, "main model")
     main_effort = request.main_effort.strip()
     _validate_effort(request.main_runtime, main_effort)
 
     data: dict[str, object] = {
         "version": 1,
+        "research_mode": request.research_mode,
         "limits": dict(DEFAULT_LIMITS),
     }
     main_target: dict[str, str] = {

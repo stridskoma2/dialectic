@@ -38,6 +38,7 @@ from dialectic.redaction import BoundedStreamCapture, KnownCredential, KnownCred
 from dialectic.schemas import AgentRequest, AgentTarget, CapabilityBindingArtifact
 from dialectic.service import DialecticService
 from dialectic.store import RunStore
+from dialectic.workflow_evidence import bounded_preflight_diagnostic
 
 
 class FakeNativeTransport:
@@ -375,6 +376,152 @@ def test_stable_codex_rejection_explains_failed_permission_matrix() -> None:
         assert "No sandbox boundary was weakened" in message
 
 
+def test_live_web_fixtures_expose_only_provider_web_tools() -> None:
+    codex = _versioned_fixture(
+        "codex",
+        "0.151.0-alpha.7.1",
+        role="participant",
+        access_mode="packet-only",
+        source_environment={},
+        research_mode="live-web",
+    )
+    codex_template = codex.capability_fixture.template
+    codex_profile = codex_template["permissions"]["dialectic-packet-web"]
+    assert codex_template["web_search"] == "live"
+    assert codex_profile["network"] == {"enabled": False}
+    assert codex_template["apps"] == {"_default": {"enabled": False}}
+    assert codex_template["mcp_servers"] == {}
+    assert "web-research-allow" in codex.capability_fixture.probe_ids
+    assert codex.adapter_fixture_version.endswith(
+        "-web-v3" if os.name == "nt" else "-web-v1"
+    )
+
+    claude = _versioned_fixture(
+        "claude-code",
+        "2.1.177",
+        role="moderator",
+        access_mode="packet-only",
+        source_environment={},
+        research_mode="live-web",
+    )
+    claude_template = claude.capability_fixture.template
+    assert claude_template["tools"] == ["WebSearch", "WebFetch"]
+    assert claude_template["allowed_tools"] == ["WebSearch", "WebFetch"]
+    assert claude_template["mcp_servers"] == []
+    assert claude_template["setting_sources"] == []
+    allowed_index = claude.static_flags.index("--allowedTools")
+    assert claude.static_flags[allowed_index : allowed_index + 3] == (
+        "--allowedTools",
+        "WebSearch",
+        "WebFetch",
+    )
+
+    grok = _versioned_fixture(
+        "grok-build",
+        "0.1.220",
+        role="participant",
+        access_mode="packet-only",
+        source_environment={},
+        research_mode="live-web",
+    )
+    grok_template = grok.capability_fixture.template
+    assert grok_template["tools"] == ["WebSearch", "WebFetch"]
+    assert grok_template["web_search"] is True
+    assert grok_template["client_capabilities"] == {}
+    assert grok_template["mcp_servers"] == []
+    assert grok_template["memory"] is False
+    assert grok_template["planning"] is False
+    assert grok_template["subagents"] is False
+
+
+def test_live_web_is_rejected_for_the_writable_driver() -> None:
+    with pytest.raises(NativePreflightError, match="writable driver"):
+        _versioned_fixture(
+            "codex",
+            "0.150.0-alpha.12.2",
+            role="driver",
+            access_mode="driver-write",
+            source_environment={},
+            research_mode="live-web",
+        )
+
+
+@pytest.mark.asyncio
+async def test_native_claude_live_web_probe_names_effective_non_web_surfaces(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / ("claude.exe" if os.name == "nt" else "claude")
+    executable.write_bytes(b"fixture executable")
+    executable.chmod(0o700)
+    probe_envelope = json.dumps({
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "session_id": "claude-probe-session",
+        "structured_output": {
+            "web_search": True,
+            "web_fetch": True,
+            "filesystem_read": False,
+            "filesystem_write": False,
+            "shell_command": False,
+            "subagent": False,
+            "mcp_source": False,
+        },
+        "modelUsage": {"claude-model": {"output_tokens": 1}},
+    }).encode()
+    transport = FakeNativeTransport([
+        (b"2.1.177 (Claude Code)\n", b"", 0),
+        (
+            b"--print --output-format --json-schema --resume --safe-mode --tools "
+            b"--allowedTools --mcp-config --strict-mcp-config --setting-sources\n",
+            b"",
+            0,
+        ),
+        (b'{"loggedIn":true}\n', b"", 0),
+        (probe_envelope, b"", 0),
+    ])
+    target = AgentTarget(runtime="claude-code", model="claude-model", effort=None)
+    adapter = ClaudeAdapter(
+        target,
+        role="participant",
+        access_mode="packet-only",
+        store=RunStore(tmp_path / "state"),
+        credentials=KnownCredentials(),
+        preflight_seconds=10,
+        capability_probe_seconds=10,
+        stdout_limit=4096,
+        stderr_limit=4096,
+        graceful_kill_seconds=1,
+        source_environment=_source_environment(),
+        transport=transport,
+        which=lambda _: str(executable),
+        research_mode="live-web",
+    )
+
+    await adapter.preflight(target)
+
+    material = adapter.preflight_material()
+    assert material.adapter_fixture_version.endswith("-web-v2")
+    assert material.fixture.probe_ids == (
+        "web-search-allow",
+        "web-fetch-allow",
+        "filesystem-read-deny",
+        "filesystem-write-deny",
+        "shell-deny",
+        "subagent-deny",
+        "mcp-source-deny",
+    )
+    arguments = transport.calls[-1]["plan"].arguments
+    assert arguments[arguments.index("--tools") + 1] == "WebSearch,WebFetch"
+    assert arguments[arguments.index("--allowedTools") + 1 :][:2] == (
+        "WebSearch",
+        "WebFetch",
+    )
+    prompt = transport.calls[-1]["stdin"].decode("utf-8")
+    assert "internal response/finalization control" in prompt
+    assert "shell command" in prompt and "subagent" in prompt
+
+
 @pytest.mark.asyncio
 async def test_native_codex_start_structured_and_resume_are_stdin_only(tmp_path: Path) -> None:
     executable = tmp_path / ("codex.exe" if os.name == "nt" else "codex")
@@ -382,6 +529,11 @@ async def test_native_codex_start_structured_and_resume_are_stdin_only(tmp_path:
     executable.chmod(0o700)
     events = lambda session, text: (  # noqa: E731
         json.dumps({"type": "thread.started", "thread_id": session})
+        + "\n"
+        + json.dumps({
+            "type": "item.updated",
+            "item": {"id": "web-1", "type": "web_search", "query": "Example Domain"},
+        })
         + "\n"
         + json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": text}})
         + "\n"
@@ -513,14 +665,69 @@ async def test_native_codex_start_structured_and_resume_are_stdin_only(tmp_path:
     with pytest.raises(NativeTurnError):
         await adapter.start(_request(neutral, phase="review"))
     assert adapter.take_invocation_evidence().process_exit_code == 7  # type: ignore[union-attr]
-    with pytest.raises(NativeEnvelopeError):
+    with pytest.raises(NativeEnvelopeError) as malformed_error:
         await adapter.start(_request(neutral, phase="review"))
+    assert bounded_preflight_diagnostic(malformed_error.value) == (
+        "invalid Codex JSONL event"
+    )
     malformed = adapter.take_invocation_evidence()
     assert malformed is not None and malformed.attempt_end_reason == "agent-failed"
+
+    duplicate_web_id_events = (
+        json.dumps({"type": "thread.started", "thread_id": "web-session"})
+        + "\n"
+        + '{"type":"item.started","item":{"id":"item_1","type":"web_search",'
+        '"id":"exec-77714d2b-51e5-46e5-b90c-b063d90ffac6","query":""}}\n'
+        + json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": '{"answer":"web ok"}'},
+            }
+        )
+        + "\n"
+        + json.dumps({"type": "turn.completed", "usage": {"output_tokens": 1}})
+        + "\n"
+    )
+    adapter.research_mode = "live-web"
+    parsed_web = adapter._parse_envelope(  # type: ignore[attr-defined]
+        duplicate_web_id_events,
+        _request(neutral, phase="review", schema=schema),
+    )
+    assert parsed_web.structured_output == {"answer": "web ok"}
+    with pytest.raises(NativeEnvelopeError, match="invalid Codex JSONL event"):
+        adapter._parse_envelope(  # type: ignore[attr-defined]
+            duplicate_web_id_events.replace(
+                '"type":"web_search","id"',
+                '"type":"agent_message","id"',
+            ),
+            _request(neutral, phase="review", schema=schema),
+        )
+    adapter.research_mode = "offline"
+    with pytest.raises(NativeEnvelopeError, match="invalid Codex JSONL event"):
+        adapter._parse_envelope(  # type: ignore[attr-defined]
+            duplicate_web_id_events,
+            _request(neutral, phase="review", schema=schema),
+        )
+
     calls_before_unsafe_resume = len(transport.calls)
     with pytest.raises(NativeEnvelopeError, match="argv grammar"):
         await adapter.resume("bad session", _request(neutral, phase="repair"))
     assert len(transport.calls) == calls_before_unsafe_resume
+
+    original_turn_arguments = adapter._turn_arguments
+
+    def omit_attested_flag(*args, **kwargs):  # type: ignore[no-untyped-def]
+        return tuple(
+            value
+            for value in original_turn_arguments(*args, **kwargs)
+            if value != "--strict-config"
+        )
+
+    adapter._turn_arguments = omit_attested_flag  # type: ignore[method-assign]
+    calls_before_drift = len(transport.calls)
+    with pytest.raises(NativePreflightError, match="attested static flag"):
+        await adapter.start(_request(neutral, phase="review", schema=schema))
+    assert len(transport.calls) == calls_before_drift
 
 
 @pytest.mark.asyncio

@@ -33,6 +33,7 @@ from .capabilities import (
 )
 from .contracts import (
     ARTIFACT_SCHEMA_VERSION,
+    ResearchMode,
     TOOL_VERSION,
     SessionCloseReason,
 )
@@ -190,14 +191,18 @@ class NativeAdapterBase:
         probe_provider: ProbeProvider | None = None,
         canonical_aliases: Mapping[str, str] | None = None,
         which: Callable[[str], str | None] = shutil.which,
+        research_mode: ResearchMode = "offline",
     ) -> None:
         if target.runtime != self.runtime:
             raise ValueError(f"{type(self).__name__} cannot serve {target.runtime}")
         if access_mode == "driver-write" and role != "driver":
             raise ValueError("driver-write access belongs only to the driver role")
+        if access_mode == "driver-write" and research_mode != "offline":
+            raise ValueError("the writable driver cannot receive live web access")
         self.target = target
         self.role = role
         self.access_mode = access_mode
+        self.research_mode = research_mode
         self.store = store
         self.credentials = credentials
         self.preflight_seconds = preflight_seconds
@@ -260,6 +265,7 @@ class NativeAdapterBase:
             role=self.role,
             access_mode=self.access_mode,
             source_environment=self.source_environment,
+            research_mode=self.research_mode,
         )
         if isinstance(base_plan, WindowsBatchLaunchSpec) and self.runtime in {
             "codex",
@@ -405,6 +411,7 @@ class NativeAdapterBase:
         bound = self._bound_profile(request)
         arguments = self._turn_arguments(operation, session_id, request, bound)
         validate_argv(arguments)
+        _require_static_flags(arguments, self.fixture.static_flags)
         material = self.preflight_material()
         self._revalidate_material(material)
         plan = build_launch_spec(material.resolved_executable, arguments)
@@ -765,6 +772,7 @@ class CodexAdapter(NativeAdapterBase):
             fixture,
             source_environment=self.source_environment,
             profile_name=str(concrete["default_permissions"]),
+            web_search=str(concrete["web_search"]),
         )
         return _canonical_hash({"effective": snapshot, "sources": sources})
 
@@ -799,7 +807,10 @@ class CodexAdapter(NativeAdapterBase):
             if not line.strip():
                 continue
             try:
-                event = strict_json_loads(line)
+                event = _strict_codex_event_loads(
+                    line,
+                    allow_duplicate_web_search_id=self.research_mode == "live-web",
+                )
             except OutputError as exc:
                 raise NativeEnvelopeError("invalid Codex JSONL event") from exc
             if not isinstance(event, dict) or not isinstance(event.get("type"), str):
@@ -831,7 +842,7 @@ class CodexAdapter(NativeAdapterBase):
                     raise NativeEnvelopeError("Codex actual model is invalid")
                 actual_model = model
                 complete = True
-            elif event_type in {"turn.started", "item.started"}:
+            elif event_type in {"turn.started", "item.started", "item.updated"}:
                 continue
             elif event_type in {"error", "turn.failed"}:
                 raise NativeEnvelopeError("Codex envelope reports an error")
@@ -875,14 +886,25 @@ class CodexAdapter(NativeAdapterBase):
         ) as neutral:
             source = neutral / "probe-input.txt"
             source.write_text("dialectic packet probe\n", encoding="utf-8")
-            schema = _boolean_object_schema(
+            probe_fields = [
                 "neutral_read", "filesystem_write", "network", "tool_expansion"
-            )
+            ]
+            if self.research_mode == "live-web":
+                probe_fields.append("web_research")
+            schema = _boolean_object_schema(*probe_fields)
             prompt = (
                 "This is a bounded permission probe. Use model-generated child commands to "
                 f"read {source}, attempt to create {neutral / 'forbidden.txt'}, attempt a "
                 "short outbound HTTPS request, and attempt to request or obtain broader tool "
-                "permissions. Finish those commands before emitting any response. Set "
+                "permissions. "
+                + (
+                    "Separately use only the built-in web research tool to retrieve "
+                    "https://example.com and set web_research=true only if its page title "
+                    "is Example Domain. "
+                    if self.research_mode == "live-web"
+                    else ""
+                )
+                + "Finish those operations before emitting any response. Set "
                 "neutral_read=true only if the read command prints exactly 'dialectic packet "
                 "probe'. Return booleans saying whether each operation succeeded, using the "
                 "exact output schema. Do not infer success from the request text."
@@ -910,6 +932,11 @@ class CodexAdapter(NativeAdapterBase):
                 ),
                 "network-deny": parsed.get("network") is False,
                 "tool-expansion-deny": parsed.get("tool_expansion") is False,
+                **(
+                    {"web-research-allow": parsed.get("web_research") is True}
+                    if self.research_mode == "live-web"
+                    else {}
+                ),
             }
             return _probe_results(fixture, observed, "pinned native Codex packet probe")
 
@@ -1083,6 +1110,7 @@ class CodexAdapter(NativeAdapterBase):
         )
         arguments = self._turn_arguments("start", None, request, bound)
         validate_argv(arguments)
+        _require_static_flags(arguments, fixture.static_flags)
         environment = self._turn_environment(
             self.preflight_material().trusted_environment
             if self._material is not None
@@ -1142,11 +1170,13 @@ class ClaudeAdapter(NativeAdapterBase):
         return match.group("version")
 
     def _verify_help(self, output: str) -> None:
-        required = (
+        required = [
             "--print", "--output-format", "--json-schema", "--resume",
             "--safe-mode", "--tools", "--mcp-config", "--strict-mcp-config",
             "--setting-sources",
-        )
+        ]
+        if self.research_mode == "live-web":
+            required.append("--allowedTools")
         if any(value not in output for value in required):
             raise NativePreflightError("installed Claude Code CLI lacks a required control")
 
@@ -1163,10 +1193,16 @@ class ClaudeAdapter(NativeAdapterBase):
     ) -> tuple[str, ...]:
         arguments = [
             "--print", "--output-format", "json", "--model", self.target.model,
-            "--safe-mode", "--tools", "", "--mcp-config",
+            "--safe-mode", "--tools",
+            "WebSearch,WebFetch" if self.research_mode == "live-web" else "",
+        ]
+        if self.research_mode == "live-web":
+            arguments.extend(("--allowedTools", "WebSearch", "WebFetch"))
+        arguments.extend([
+            "--mcp-config",
             _write_empty_mcp_file(bound), "--strict-mcp-config",
             "--setting-sources", "",
-        ]
+        ])
         if self.target.effort is not None:
             arguments.extend(("--effort", self.target.effort))
         if request.output_schema is not None:
@@ -1234,17 +1270,40 @@ class ClaudeAdapter(NativeAdapterBase):
     ) -> Sequence[CapabilityProbeResult]:
         with tempfile.TemporaryDirectory(prefix="dialectic-claude-probe-") as root:
             neutral = Path(root).resolve(strict=True)
-            schema = _boolean_object_schema(
-                "empty_tools", "filesystem_capability", "mcp_source"
+            source = neutral / "probe-input.txt"
+            forbidden = neutral / "forbidden.txt"
+            source.write_text("dialectic claude probe\n", encoding="utf-8")
+            schema = (
+                _boolean_object_schema(
+                    "web_search", "web_fetch", "filesystem_read",
+                    "filesystem_write", "shell_command", "subagent", "mcp_source",
+                )
+                if self.research_mode == "live-web"
+                else _boolean_object_schema(
+                    "empty_tools", "filesystem_capability", "mcp_source"
+                )
             )
             request = AgentRequest(
                 role=self.role,
                 target_id="capability-probe",
                 turn_phase=_probe_turn_phase(self.role),
                 prompt=(
-                    "This is a bounded capability probe. Report whether the current native "
-                    "session has an empty built-in tool set, any filesystem capability, and any "
-                    "MCP source. Return only the exact boolean schema."
+                    (
+                        "This is a bounded capability probe. Use WebSearch to find the Example "
+                        "Domain site and WebFetch to retrieve https://example.com. Report true "
+                        "only when each named web tool actually succeeds. If offered, try to "
+                        f"read {source} and create {forbidden}, run a harmless shell command, "
+                        "and start a subagent. Report each non-web field true only if that exact "
+                        "operation actually succeeds, and report mcp_source true only if an MCP "
+                        "source is actually available. An internal response/finalization control "
+                        "does not count as one of these tools. Return only the exact boolean schema."
+                    )
+                    if self.research_mode == "live-web"
+                    else (
+                        "This is a bounded capability probe. Report whether the current native "
+                        "session has an empty built-in tool set, any filesystem capability, and "
+                        "any MCP source. Return only the exact boolean schema."
+                    )
                 ),
                 output_schema=schema,
                 timeout_seconds=self.capability_probe_seconds,
@@ -1257,6 +1316,7 @@ class ClaudeAdapter(NativeAdapterBase):
             bound = _probe_bound_profile(self, fixture, concrete, {"neutral_role_dir": neutral})
             arguments = self._turn_arguments("start", None, request, bound)
             validate_argv(arguments)
+            _require_static_flags(arguments, fixture.static_flags)
             executable = Path(
                 self.which(fixture.executable_name) or fixture.executable_name
             ).resolve(strict=True)
@@ -1299,9 +1359,28 @@ class ClaudeAdapter(NativeAdapterBase):
             if not isinstance(value, dict):
                 raise NativePreflightError("Claude capability probe lacked structured output")
             observed = {
-                "empty-tools-allow": value.get("empty_tools") is True,
-                "filesystem-capability-deny": value.get("filesystem_capability") is False,
-                "mcp-source-deny": value.get("mcp_source") is False,
+                **(
+                    {
+                        "web-search-allow": value.get("web_search") is True,
+                        "web-fetch-allow": value.get("web_fetch") is True,
+                        "filesystem-read-deny": value.get("filesystem_read") is False,
+                        "filesystem-write-deny": (
+                            value.get("filesystem_write") is False
+                            and not forbidden.exists()
+                        ),
+                        "shell-deny": value.get("shell_command") is False,
+                        "subagent-deny": value.get("subagent") is False,
+                        "mcp-source-deny": value.get("mcp_source") is False,
+                    }
+                    if self.research_mode == "live-web"
+                    else {
+                        "empty-tools-allow": value.get("empty_tools") is True,
+                        "filesystem-capability-deny": (
+                            value.get("filesystem_capability") is False
+                        ),
+                        "mcp-source-deny": value.get("mcp_source") is False,
+                    }
+                ),
             }
             return _probe_results(fixture, observed, "pinned native Claude probe")
 
@@ -1461,7 +1540,13 @@ def recorded_probe_provider(
 def _bootstrap_fixture(
     runtime: Literal["codex", "claude-code", "grok-build"]
 ) -> NativeAdapterFixture:
-    return _fixture(runtime, "bootstrap", role="reviewer", access_mode="packet-only")
+    return _fixture(
+        runtime,
+        "bootstrap",
+        role="reviewer",
+        access_mode="packet-only",
+        research_mode="offline",
+    )
 
 
 def _versioned_fixture(
@@ -1470,7 +1555,10 @@ def _versioned_fixture(
     role: Role,
     access_mode: AccessMode,
     source_environment: Mapping[str, str] | None = None,
+    research_mode: ResearchMode = "offline",
 ) -> NativeAdapterFixture:
+    if access_mode == "driver-write" and research_mode != "offline":
+        raise NativePreflightError("the writable driver cannot receive live web access")
     codex_versions = {"0.150.0-alpha.12.2", "0.151.0-alpha.7.1"}
     supported = {
         "codex": codex_versions,
@@ -1531,6 +1619,7 @@ def _versioned_fixture(
         role=role,
         access_mode=access_mode,
         source_environment=source_environment,
+        research_mode=research_mode,
     )
 
 
@@ -1540,6 +1629,7 @@ def _fixture(
     role: Role,
     access_mode: AccessMode,
     source_environment: Mapping[str, str] | None = None,
+    research_mode: ResearchMode = "offline",
 ) -> NativeAdapterFixture:
     dynamic_roles = (
         (
@@ -1558,7 +1648,12 @@ def _fixture(
     saved_auth_path = _saved_auth_path(runtime, source_environment)
     if runtime == "codex":
         driver = access_mode == "driver-write"
-        profile_name = "dialectic-driver" if driver else "dialectic-packet"
+        live_web = research_mode == "live-web"
+        profile_name = (
+            "dialectic-driver"
+            if driver
+            else ("dialectic-packet-web" if live_web else "dialectic-packet")
+        )
         filesystem: dict[str, Any] = {
             ":root": "deny",
             ":minimal": "read",
@@ -1611,7 +1706,7 @@ def _fixture(
                 "experimental_use_profile": False,
                 "exclude": sorted(credentials), "set": {"GIT_OPTIONAL_LOCKS": "0"},
             },
-            "web_search": "disabled",
+            "web_search": "live" if live_web else "disabled",
             **({"windows": {"sandbox": "elevated"}} if os.name == "nt" else {}),
         }
         probes = (
@@ -1626,17 +1721,25 @@ def _fixture(
                 (
                     "neutral-cwd-enter-allow", "filesystem-read-deny",
                     "filesystem-write-deny", "network-deny", "tool-expansion-deny",
+                    *(("web-research-allow",) if live_web else ()),
                 )
                 if os.name == "nt"
                 else (
                     "neutral-cwd-read-allow", "filesystem-write-deny",
                     "network-deny", "tool-expansion-deny",
+                    *(("web-research-allow",) if live_web else ()),
                 )
             )
         )
+        fixture_version = (
+            "web-v3" if live_web and os.name == "nt"
+            else "web-v1" if live_web
+            else "v3" if os.name == "nt"
+            else "v1"
+        )
         return NativeAdapterFixture(
             runtime, version, "codex",
-            f"codex-{version}-{access_mode}-{'v3' if os.name == 'nt' else 'v1'}",
+            f"codex-{version}-{access_mode}-{fixture_version}",
             "slice-2-native-v1", credentials, _required_environment_names(),
             _optional_environment_names("codex"), (saved_auth_path,),
             (
@@ -1648,6 +1751,8 @@ def _fixture(
             CapabilityFixture(probes, dynamic_roles, template),
         )
     if runtime == "claude-code":
+        live_web = research_mode == "live-web"
+        tools = ["WebSearch", "WebFetch"] if live_web else []
         template = {
             "access_mode": "packet-only",
             "filesystem": [{
@@ -1655,24 +1760,44 @@ def _fixture(
                 "path": {"dynamic_path": "neutral_role_dir"},
                 "access": "controller-files-only",
             }],
-            "safe_mode": True, "tools": [], "mcp_servers": [], "setting_sources": [],
+            "safe_mode": True,
+            "tools": tools,
+            "allowed_tools": tools,
+            "mcp_servers": [],
+            "setting_sources": [],
         }
         return NativeAdapterFixture(
-            runtime, version, "claude", f"claude-{version}-packet-v1",
+            runtime, version, "claude",
+            f"claude-{version}-packet-{'web-v2' if live_web else 'v1'}",
             "slice-2-native-v1", credentials, _required_environment_names(),
             _optional_environment_names("claude-code"),
             (saved_auth_path,),
             (
-                "--print", "--output-format", "json", "--safe-mode", "--tools", "",
+                "--print", "--output-format", "json", "--safe-mode", "--tools",
+                "WebSearch,WebFetch" if live_web else "",
+                *(("--allowedTools", "WebSearch", "WebFetch") if live_web else ()),
                 "--strict-mcp-config", "--setting-sources", "",
             ),
             "stdin", "per-turn", False,
             CapabilityFixture(
-                ("empty-tools-allow", "filesystem-capability-deny", "mcp-source-deny"),
+                (
+                    (
+                        "web-search-allow", "web-fetch-allow",
+                        "filesystem-read-deny", "filesystem-write-deny",
+                        "shell-deny", "subagent-deny", "mcp-source-deny",
+                    )
+                    if live_web
+                    else (
+                        "empty-tools-allow", "filesystem-capability-deny",
+                        "mcp-source-deny",
+                    )
+                ),
                 dynamic_roles, template,
             ),
         )
     persistent = role == "participant"
+    live_web = research_mode == "live-web"
+    grok_tools = ["WebSearch", "WebFetch"] if live_web else []
     template = {
         "access_mode": "packet-only",
         "filesystem": [{
@@ -1680,23 +1805,35 @@ def _fixture(
             "access": "none",
         }],
         "client_capabilities": {}, "mcp_servers": [], "config_sources": [],
-        "tools": [], "memory": False, "web_search": False, "planning": False,
+        "tools": grok_tools, "memory": False, "web_search": live_web,
+        "planning": False,
         "subagents": False, "auto_update": False, "safe_mode": True,
         "configuration_sources": [],
     }
     return NativeAdapterFixture(
-        runtime, version, "grok", f"grok-{version}-acp-v1",
+        runtime, version, "grok", f"grok-{version}-acp-{'web-v1' if live_web else 'v1'}",
         "slice-2-native-v1", credentials, _required_environment_names(),
         _optional_environment_names("grok-build"), (saved_auth_path,),
         (
-            "--no-auto-update", "--no-memory", "--disable-web-search",
-            "--no-plan", "--no-subagents", "--safe-mode", "--tools", "",
+            "--no-auto-update", "--no-memory",
+            *(("--tools", "WebSearch,WebFetch", "--allow", "WebSearch", "--allow", "WebFetch") if live_web else ("--disable-web-search", "--tools", "")),
+            "--no-plan", "--no-subagents", "--safe-mode",
             "agent", "stdio",
         ),
         "acp-stdio", "persistent-acp-session" if persistent else "per-turn",
         persistent,
         CapabilityFixture(
-            ("empty-capabilities-allow", "mcp-source-deny", "built-in-tools-deny"),
+            (
+                (
+                    "empty-capabilities-allow", "mcp-source-deny",
+                    "web-search-allow", "web-fetch-allow", "other-tools-deny",
+                )
+                if live_web
+                else (
+                    "empty-capabilities-allow", "mcp-source-deny",
+                    "built-in-tools-deny",
+                )
+            ),
             dynamic_roles, template,
         ),
     )
@@ -1743,6 +1880,103 @@ def _validate_effort(target: AgentTarget, fixture: NativeAdapterFixture) -> None
         raise NativePreflightError(
             f"unsupported effort {target.effort!r} for {fixture.runtime} {fixture.cli_version}"
         )
+
+
+def _require_static_flags(
+    arguments: Sequence[str], static_flags: Sequence[str]
+) -> None:
+    """Require spawned argv to retain the attested ordered static tokens."""
+
+    position = 0
+    for expected in static_flags:
+        try:
+            position = arguments.index(expected, position) + 1
+        except ValueError as exc:
+            raise NativePreflightError(
+                "native turn argv omits or reorders an attested static flag"
+            ) from exc
+
+
+class _JsonObjectPairs(list[tuple[str, Any]]):
+    """Retain object pairs long enough to validate a known Codex JSONL defect."""
+
+
+def _strict_codex_event_loads(
+    text: str, *, allow_duplicate_web_search_id: bool
+) -> Any:
+    try:
+        return strict_json_loads(text)
+    except OutputError as exc:
+        if not allow_duplicate_web_search_id:
+            raise
+        strict_error = exc
+
+    def retain_pairs(pairs: list[tuple[str, Any]]) -> _JsonObjectPairs:
+        return _JsonObjectPairs(pairs)
+
+    def reject_constant(value: str) -> None:
+        raise OutputError(f"non-finite JSON number is not permitted: {value}")
+
+    try:
+        raw = json.loads(
+            text,
+            object_pairs_hook=retain_pairs,
+            parse_constant=reject_constant,
+        )
+    except OutputError:
+        raise
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise strict_error from exc
+
+    duplicate_web_search_ids = 0
+
+    def convert(value: Any, path: tuple[str, ...]) -> Any:
+        nonlocal duplicate_web_search_ids
+        if isinstance(value, _JsonObjectPairs):
+            seen: set[str] = set()
+            duplicates: set[str] = set()
+            for key, _child in value:
+                if key in seen:
+                    duplicates.add(key)
+                seen.add(key)
+            if duplicates:
+                id_values = [child for key, child in value if key == "id"]
+                type_values = [child for key, child in value if key == "type"]
+                if not (
+                    path == ("item",)
+                    and duplicates == {"id"}
+                    and len(id_values) == 2
+                    and all(
+                        isinstance(item_id, str)
+                        and _SESSION_RE.fullmatch(item_id) is not None
+                        for item_id in id_values
+                    )
+                    and type_values == ["web_search"]
+                ):
+                    raise strict_error
+                duplicate_web_search_ids += 1
+            converted: dict[str, Any] = {}
+            for key, child in value:
+                if key not in converted:
+                    converted[key] = convert(child, (*path, key))
+            return converted
+        if isinstance(value, list):
+            return [convert(child, (*path, str(index))) for index, child in enumerate(value)]
+        return value
+
+    event = convert(raw, ())
+    if not (
+        duplicate_web_search_ids == 1
+        and isinstance(event, dict)
+        and event.get("type") in {"item.started", "item.updated", "item.completed"}
+        and isinstance(event.get("item"), dict)
+        and event["item"].get("type") == "web_search"
+    ):
+        raise strict_error
+
+    # Reapply all ordinary strict JSON bounds after removing only the duplicate
+    # progress identifier that this Codex CLI emits for web-search items.
+    return strict_json_loads(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
 
 
 def _result_classification(result: NativeProcessResult) -> tuple[str, str | None]:
@@ -2003,6 +2237,7 @@ def _codex_managed_policy_sources(
     *,
     source_environment: Mapping[str, str],
     profile_name: str,
+    web_search: str,
 ) -> list[dict[str, str]]:
     codex_home = fixture.saved_auth_paths[0].parent
     if os.name == "nt":
@@ -2019,13 +2254,18 @@ def _codex_managed_policy_sources(
             ("managed-defaults", Path("/etc/codex/managed_config.toml")),
         )
     return [
-        _codex_policy_source_fingerprint(label, path, profile_name=profile_name)
+        _codex_policy_source_fingerprint(
+            label,
+            path,
+            profile_name=profile_name,
+            web_search=web_search,
+        )
         for label, path in paths
     ]
 
 
 def _codex_policy_source_fingerprint(
-    label: str, path: Path, *, profile_name: str
+    label: str, path: Path, *, profile_name: str, web_search: str
 ) -> dict[str, str]:
     canonical = _canonical_path(path)
     path_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -2074,7 +2314,12 @@ def _codex_policy_source_fingerprint(
         document = tomllib.loads(data.decode("utf-8", errors="strict"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise NativePreflightError(f"Codex managed policy is invalid: {label}") from exc
-    _reject_displacing_codex_policy(document, profile_name=profile_name, label=label)
+    _reject_displacing_codex_policy(
+        document,
+        profile_name=profile_name,
+        web_search=web_search,
+        label=label,
+    )
     return {
         "label": label,
         "path_sha256": path_hash,
@@ -2084,7 +2329,7 @@ def _codex_policy_source_fingerprint(
 
 
 def _reject_displacing_codex_policy(
-    policy: Mapping[str, Any], *, profile_name: str, label: str
+    policy: Mapping[str, Any], *, profile_name: str, web_search: str, label: str
 ) -> None:
     if "sandbox_mode" in policy or "sandbox_workspace_write" in policy:
         raise NativePreflightError(
@@ -2129,9 +2374,17 @@ def _reject_displacing_codex_policy(
             raise NativePreflightError(
                 f"Codex managed policy enables {surface}: {label}"
             )
-    web_search = policy.get("web_search")
-    if web_search not in {None, "disabled"}:
-        raise NativePreflightError(f"Codex managed policy enables web search: {label}")
+    configured_web_search = policy.get("web_search")
+    if configured_web_search not in {None, web_search}:
+        raise NativePreflightError(f"Codex managed policy displaces web search: {label}")
+    allowed_web_search = policy.get("allowed_web_search_modes")
+    if isinstance(allowed_web_search, list) and web_search not in allowed_web_search:
+        raise NativePreflightError(
+            f"Codex managed policy disallows the required web-search mode: {label}"
+        )
+    tools = policy.get("tools")
+    if isinstance(tools, Mapping) and tools:
+        raise NativePreflightError(f"Codex managed policy configures tools: {label}")
 
 
 def _canonical_hash(value: Any) -> str:

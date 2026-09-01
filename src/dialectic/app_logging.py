@@ -13,9 +13,9 @@ from pathlib import Path
 from typing import Literal
 
 from .store import (
-    _apply_private_file_security,
-    _ensure_private_directory,
+    apply_private_file_security,
     default_state_root,
+    ensure_private_directory,
 )
 
 ApplicationComponent = Literal["cli", "ui"]
@@ -37,7 +37,7 @@ class _PrivateRotatingFileHandler(RotatingFileHandler):
     def _open(self):  # type: ignore[no-untyped-def]
         stream = super()._open()
         try:
-            _apply_private_file_security(Path(self.baseFilename))
+            apply_private_file_security(Path(self.baseFilename))
         except Exception:
             stream.close()
             raise
@@ -48,7 +48,7 @@ class _PrivateRotatingFileHandler(RotatingFileHandler):
         base = Path(self.baseFilename)
         for candidate in base.parent.glob(f"{base.name}*"):
             if candidate.is_file():
-                _apply_private_file_security(candidate)
+                apply_private_file_security(candidate)
 
 
 class _JsonLineFormatter(logging.Formatter):
@@ -89,8 +89,8 @@ def configure_structured_logging(
 
     root = Path(state_root) if state_root is not None else default_state_root()
     logs_root = root / "logs"
-    _ensure_private_directory(root)
-    _ensure_private_directory(logs_root)
+    ensure_private_directory(root)
+    ensure_private_directory(logs_root)
     started = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     path = logs_root / f"dialectic-{component}-{started}-{os.getpid()}.jsonl"
     handler = _PrivateRotatingFileHandler(

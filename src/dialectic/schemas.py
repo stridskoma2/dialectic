@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from typing import Any, Literal, Self
+from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
@@ -21,6 +22,7 @@ from .contracts import (
     CodeOutcome,
     ConsensusOutcome,
     FailureKind,
+    ResearchMode,
     RunMode,
     RunPhase,
     RunStatus,
@@ -193,6 +195,7 @@ class LimitsSpec(ClosedModel):
     max_lens_chars: int = Field(ge=1, le=8_192)
     max_model_field_chars: int = Field(ge=1, le=65_536)
     max_model_list_items: int = Field(ge=1, le=500)
+    max_web_sources_per_turn: int = Field(default=20, ge=1, le=100)
     max_agent_stdout_bytes: int = Field(ge=256, le=67_108_864)
     max_agent_stderr_bytes: int = Field(ge=256, le=16_777_216)
     max_turn_scratch_bytes: int = Field(ge=1, le=1_073_741_824)
@@ -229,6 +232,7 @@ class LimitsSpec(ClosedModel):
 
 class DialecticConfig(ClosedModel):
     version: Literal[1]
+    research_mode: ResearchMode = "offline"
     driver: DriverSpec | None = None
     reviewers: list[ReviewerSpec] | None = None
     council: CouncilSpec | None = None
@@ -292,6 +296,51 @@ def _spec_strings(spec: BaseModel) -> list[tuple[str, str]]:
 class ControllerArtifact(ClosedModel):
     artifact_schema_version: Literal[1]
     tool_version: str
+
+
+class WebSourceCitation(ClosedModel):
+    url: str = Field(max_length=2_048)
+    title: str = Field(max_length=512)
+    claim_context: str = Field(max_length=2_048)
+
+    @field_validator("url")
+    @classmethod
+    def safe_https_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise ValueError("web source URL must be an HTTPS URL without credentials")
+        return value
+
+
+class WebSourceCitationArtifact(ControllerArtifact):
+    research_mode: Literal["live-web"]
+    role: Literal["reviewer", "participant", "moderator"]
+    target_id: str
+    turn_phase: TurnPhase
+    captured_at: datetime
+    total_discovered: int = Field(ge=0)
+    truncated: bool
+    sources: list[WebSourceCitation] = Field(max_length=100)
+
+    @field_validator("captured_at")
+    @classmethod
+    def captured_at_is_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("captured_at must be timezone-aware")
+        return value
+
+    @model_validator(mode="after")
+    def projection_is_consistent(self) -> Self:
+        if self.total_discovered < len(self.sources):
+            raise ValueError("total_discovered cannot be less than persisted sources")
+        if self.truncated != (self.total_discovered > len(self.sources)):
+            raise ValueError("truncated must match the source projection count")
+        return self
 
 
 class RunRecord(ControllerArtifact):

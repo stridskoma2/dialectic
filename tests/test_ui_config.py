@@ -47,7 +47,9 @@ def test_desktop_code_config_maps_main_and_review_models() -> None:
         },
     ]
     assert "council" not in parsed
-    assert ConfigLoader({}).load(raw, mode="code").config.driver is not None
+    loaded = ConfigLoader({}).load(raw, mode="code").config
+    assert loaded.driver is not None
+    assert loaded.research_mode == "offline"
 
 
 def test_desktop_council_config_maps_moderator_participants_and_consensus() -> None:
@@ -64,6 +66,7 @@ def test_desktop_council_config_maps_moderator_participants_and_consensus() -> N
             ),
             max_dissenters=1,
             moderator_mode="independent-opening",
+            research_mode="live-web",
         )
     )
 
@@ -80,8 +83,11 @@ def test_desktop_council_config_maps_moderator_participants_and_consensus() -> N
         "participant-c",
     ]
     assert parsed["council"]["consensus"] == {"max_dissenters": 1}
+    assert parsed["research_mode"] == "live-web"
     assert "driver" not in parsed
-    assert ConfigLoader({}).load(raw, mode="council").config.council is not None
+    loaded = ConfigLoader({}).load(raw, mode="council").config
+    assert loaded.council is not None
+    assert loaded.research_mode == "live-web"
 
 
 @pytest.mark.parametrize(

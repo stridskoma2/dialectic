@@ -39,15 +39,24 @@ interface calls `DialecticService` directly and keeps workflow execution on a wo
 thread. It provides Code/Council mode selection, a Markdown source/preview editor,
 a repository browser for Code Once, friendly model dropdowns with installed-CLI
 status, effort selection, one to five reviewers or two to five council participants,
-reviewer focus, consensus tolerance, native phase/status updates, complete Markdown
-model responses, the final summary, retained evidence, application logs, and isolated
-worktree access. The catalog includes locally configured selectors, while
+reviewer focus, consensus tolerance, an Offline/Live web research selector, native
+phase/status updates, complete Markdown model responses, a live model-cited Sources
+view, the final summary, retained evidence, application logs, and isolated worktree
+access. The catalog includes locally configured selectors, while
 authentication and account-specific model access remain verified by native preflight.
 Council Once remains prompt-only, so a repository selected for Code Once is visibly
 disabled and is not disclosed to council participants. Its **Moderator behavior**
 selector chooses either fresh synthesis only or an independent blind moderator
 opening followed by fresh synthesis. Participant openings, cross-examinations, and
 ballots run in parallel within their respective phases.
+
+New Council runs default to **Live web** in both UIs. Participants and the Moderator
+may use only their provider's native web-search/web-fetch tools; shell networking,
+MCP, apps, plugins, subagents, memory, planning, and repository access remain
+disabled. Code Once defaults to **Offline**. If Live web is selected there, it
+applies only to packet-only reviewers—the writable Codex driver always stays
+offline. Hand-authored YAML remains offline unless `research_mode: live-web` is
+explicitly set. Live web is network-dependent and may consume provider quota.
 
 The dependency-free localhost interface remains available through `dialectic-ui`.
 The more general `Launch Dialectic UI.cmd` launcher falls back to it when PySide6 is
@@ -174,9 +183,11 @@ Cleanup is never automatic.
   Native commands use executable/argument arrays; prompts travel over stdin or ACP.
 - Codex is the only writable driver. Reviewers, council participants, and the
   moderator receive packet-only neutral directories.
-- Packet-only roles cannot browse: web search, MCP, apps, and built-in tools are
-  disabled by the qualified native profiles. They reason only from the supplied
-  prompt and controller-built ledgers.
+- Packet-only roles use either the qualified offline profile or the qualified
+  `live-web` profile. The latter exposes only provider-native web search/fetch;
+  shell networking, MCP, apps, plugins, subagents, and other built-in tools remain
+  disabled. Web citations are projected into bounded `research/sources/` artifacts
+  and displayed as model-cited links, not as independently verified evidence.
 - The controller does not inject a repository/worktree path into packet-only
   prompts, argv, environment overrides, or packet artifacts. A bounded user task
   or driver-authored product diff may itself contain such a path; Dialectic neither

@@ -15,6 +15,7 @@ MAX_JSON_DEPTH: Final = 64
 MAX_ARG_BYTES: Final = 4_096
 
 RunMode: TypeAlias = Literal["code", "council"]
+ResearchMode: TypeAlias = Literal["offline", "live-web"]
 RunStatus: TypeAlias = Literal[
     "CREATED", "RUNNING", "FINALIZED", "FAILED", "TIMED_OUT", "CANCELLED"
 ]

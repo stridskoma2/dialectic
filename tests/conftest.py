@@ -24,6 +24,7 @@ def limits() -> dict[str, int]:
         "max_changed_paths": 1_000,
         "max_changed_regular_file_bytes": 8_388_608,
         "max_candidate_change_bytes": 33_554_432,
+        "max_web_sources_per_turn": 20,
         "max_packet_bytes": 393_216,
         "max_lens_chars": 4_096,
         "max_model_field_chars": 32_768,

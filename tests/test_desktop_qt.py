@@ -87,6 +87,8 @@ def test_native_desktop_switches_modes_and_previews_markdown(
         assert window.council_settings.isHidden() is False
         assert len(window._agent_rows) == 2
         assert all(row.runtime.findData("@driver") == -1 for row in window._agent_rows)
+        assert window.research_mode.currentData() == "live-web"
+        assert "provider-native web" in window.research_hint.text()
     finally:
         window.close()
 
@@ -107,6 +109,7 @@ def test_native_desktop_builds_the_same_validated_code_request(
         assert config.driver is not None
         assert config.reviewers is not None
         assert len(config.reviewers) == 2
+        assert config.research_mode == "offline"
     finally:
         window.close()
 
@@ -236,5 +239,46 @@ def test_native_desktop_renders_complete_model_response(
         assert "complete response" in window.response_view.toPlainText()
         assert window.copy_response.isEnabled()
         assert window.open_response.isEnabled()
+    finally:
+        window.close()
+
+
+def test_native_desktop_renders_model_cited_web_sources(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    artifact_dir = tmp_path / "run"
+    path = artifact_dir / "research/sources/participant/participant-a/opening.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "role": "participant",
+                "target_id": "participant-a",
+                "turn_phase": "opening",
+                "captured_at": "2026-09-01T01:02:03Z",
+                "sources": [
+                    {
+                        "title": "Example Domain",
+                        "url": "https://example.com/",
+                        "claim_context": "Current evidence from the reply.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    window = _window(tmp_path)
+    try:
+        window._artifact_dir = artifact_dir
+        window._refresh_sources()
+        qt_app.processEvents()
+        assert window.workspace_tabs.tabText(3) == "Sources (1)"
+        assert "Example Domain" in window.sources_view.toPlainText()
+        assert "not independent verification" in window.sources_view.toPlainText()
+        path.unlink()
+        window._refresh_sources()
+        qt_app.processEvents()
+        assert window.workspace_tabs.tabText(3) == "Sources"
+        assert window.sources_view.toPlainText() == ""
     finally:
         window.close()

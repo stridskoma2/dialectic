@@ -486,6 +486,12 @@ def _ensure_private_directory(path: Path) -> None:
     _apply_private_directory_security(path)
 
 
+def ensure_private_directory(path: Path) -> None:
+    """Create or re-secure a private artifact directory."""
+
+    _ensure_private_directory(path)
+
+
 def _apply_private_directory_security(path: Path) -> None:
     if os.name == "nt":
         _apply_windows_private_dacl(path, directory=True)
@@ -498,6 +504,12 @@ def _apply_private_file_security(path: Path) -> None:
         _apply_windows_private_dacl(path, directory=False)
     else:
         os.chmod(path, 0o600, follow_symlinks=False)
+
+
+def apply_private_file_security(path: Path) -> None:
+    """Apply the platform private-file policy to an existing artifact."""
+
+    _apply_private_file_security(path)
 
 
 def _apply_windows_private_dacl(path: Path, *, directory: bool) -> None:

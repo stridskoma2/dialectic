@@ -33,6 +33,7 @@ def _validate(
     *,
     root: Mapping[str, Any],
     path: str,
+    active_references: frozenset[tuple[str, str]] = frozenset(),
 ) -> None:
     if schema is True:
         return
@@ -46,24 +47,59 @@ def _validate(
             f"{path} uses unsupported schema keyword {sorted(unsupported)[0]}"
         )
     if "$ref" in schema:
-        target = _resolve_reference(root, schema["$ref"])
-        _validate(value, target, root=root, path=path)
+        reference = schema["$ref"]
+        target = _resolve_reference(root, reference)
+        assert isinstance(reference, str)
+        marker = (reference, path)
+        if marker in active_references:
+            raise JsonSchemaError(f"{path} contains a cyclic JSON-Schema reference")
+        _validate(
+            value,
+            target,
+            root=root,
+            path=path,
+            active_references=active_references | {marker},
+        )
     all_of = schema.get("allOf", [])
     if not isinstance(all_of, list):
         raise JsonSchemaError(f"{path} has invalid allOf branches")
     for branch in all_of:
-        _validate(value, branch, root=root, path=path)
+        _validate(
+            value,
+            branch,
+            root=root,
+            path=path,
+            active_references=active_references,
+        )
     if "anyOf" in schema:
-        if not _matches_any(value, schema["anyOf"], root=root, path=path):
+        if not _matches_any(
+            value,
+            schema["anyOf"],
+            root=root,
+            path=path,
+            active_references=active_references,
+        ):
             raise JsonSchemaError(f"{path} matches no anyOf branch")
     if "oneOf" in schema:
         matches = sum(
-            _matches(value, branch, root=root, path=path)
+            _matches(
+                value,
+                branch,
+                root=root,
+                path=path,
+                active_references=active_references,
+            )
             for branch in schema["oneOf"]
         )
         if matches != 1:
             raise JsonSchemaError(f"{path} must match exactly one oneOf branch")
-    if "not" in schema and _matches(value, schema["not"], root=root, path=path):
+    if "not" in schema and _matches(
+        value,
+        schema["not"],
+        root=root,
+        path=path,
+        active_references=active_references,
+    ):
         raise JsonSchemaError(f"{path} matches a forbidden schema")
     if "const" in schema and not _json_equal(value, schema["const"]):
         raise JsonSchemaError(f"{path} violates const")
@@ -83,9 +119,21 @@ def _validate(
             raise JsonSchemaError(f"{path} has the wrong JSON type")
 
     if isinstance(value, dict):
-        _validate_object(value, schema, root=root, path=path)
+        _validate_object(
+            value,
+            schema,
+            root=root,
+            path=path,
+            active_references=active_references,
+        )
     elif isinstance(value, list):
-        _validate_array(value, schema, root=root, path=path)
+        _validate_array(
+            value,
+            schema,
+            root=root,
+            path=path,
+            active_references=active_references,
+        )
     elif isinstance(value, str):
         _validate_string(value, schema, path=path)
     elif type(value) in {int, float}:
@@ -93,7 +141,12 @@ def _validate(
 
 
 def _validate_object(
-    value: dict[str, Any], schema: Mapping[str, Any], *, root: Mapping[str, Any], path: str
+    value: dict[str, Any],
+    schema: Mapping[str, Any],
+    *,
+    root: Mapping[str, Any],
+    path: str,
+    active_references: frozenset[tuple[str, str]],
 ) -> None:
     required = schema.get("required", [])
     if not isinstance(required, list) or not all(isinstance(item, str) for item in required):
@@ -113,7 +166,13 @@ def _validate_object(
             raise JsonSchemaError(f"{path} has a non-string object key")
         matched = False
         if key in properties:
-            _validate(child, properties[key], root=root, path=f"{path}/{key}")
+            _validate(
+                child,
+                properties[key],
+                root=root,
+                path=f"{path}/{key}",
+                active_references=active_references,
+            )
             matched = True
         for pattern, branch in patterns.items():
             if not isinstance(pattern, str):
@@ -123,31 +182,60 @@ def _validate_object(
             except re.error as exc:
                 raise JsonSchemaError(f"{path} has invalid patternProperties") from exc
             if matches:
-                _validate(child, branch, root=root, path=f"{path}/{key}")
+                _validate(
+                    child,
+                    branch,
+                    root=root,
+                    path=f"{path}/{key}",
+                    active_references=active_references,
+                )
                 matched = True
         if not matched:
             if additional is False:
                 raise JsonSchemaError(f"{path} contains unexpected field {key}")
             if isinstance(additional, (dict, bool)):
-                _validate(child, additional, root=root, path=f"{path}/{key}")
+                _validate(
+                    child,
+                    additional,
+                    root=root,
+                    path=f"{path}/{key}",
+                    active_references=active_references,
+                )
             else:
                 raise JsonSchemaError(f"{path} has invalid additionalProperties")
     _bounded_length(value, schema, "Properties", path)
 
 
 def _validate_array(
-    value: list[Any], schema: Mapping[str, Any], *, root: Mapping[str, Any], path: str
+    value: list[Any],
+    schema: Mapping[str, Any],
+    *,
+    root: Mapping[str, Any],
+    path: str,
+    active_references: frozenset[tuple[str, str]],
 ) -> None:
     prefix = schema.get("prefixItems", [])
     if not isinstance(prefix, list):
         raise JsonSchemaError(f"{path} has invalid prefixItems")
     for index, branch in enumerate(prefix):
         if index < len(value):
-            _validate(value[index], branch, root=root, path=f"{path}[{index}]")
+            _validate(
+                value[index],
+                branch,
+                root=root,
+                path=f"{path}[{index}]",
+                active_references=active_references,
+            )
     items = schema.get("items", True)
     start = len(prefix)
     for index in range(start, len(value)):
-        _validate(value[index], items, root=root, path=f"{path}[{index}]")
+        _validate(
+            value[index],
+            items,
+            root=root,
+            path=f"{path}[{index}]",
+            active_references=active_references,
+        )
     _bounded_length(value, schema, "Items", path)
     if schema.get("uniqueItems") is True:
         for index, item in enumerate(value):
@@ -224,18 +312,43 @@ def _has_type(value: Any, name: str) -> bool:
 
 
 def _matches_any(
-    value: Any, branches: Any, *, root: Mapping[str, Any], path: str
+    value: Any,
+    branches: Any,
+    *,
+    root: Mapping[str, Any],
+    path: str,
+    active_references: frozenset[tuple[str, str]],
 ) -> bool:
     if not isinstance(branches, list):
         raise JsonSchemaError(f"{path} has invalid schema branches")
-    return any(_matches(value, branch, root=root, path=path) for branch in branches)
+    return any(
+        _matches(
+            value,
+            branch,
+            root=root,
+            path=path,
+            active_references=active_references,
+        )
+        for branch in branches
+    )
 
 
 def _matches(
-    value: Any, schema: Any, *, root: Mapping[str, Any], path: str
+    value: Any,
+    schema: Any,
+    *,
+    root: Mapping[str, Any],
+    path: str,
+    active_references: frozenset[tuple[str, str]],
 ) -> bool:
     try:
-        _validate(value, schema, root=root, path=path)
+        _validate(
+            value,
+            schema,
+            root=root,
+            path=path,
+            active_references=active_references,
+        )
     except JsonSchemaError:
         return False
     return True

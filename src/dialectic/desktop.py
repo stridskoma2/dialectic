@@ -7,6 +7,7 @@ import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .app_logging import (
     close_structured_logging,
@@ -35,6 +36,24 @@ class DesktopResponse:
     @property
     def identity(self) -> str:
         return str(self.path)
+
+
+@dataclass(frozen=True, slots=True)
+class DesktopWebSource:
+    """One bounded citation projected from a controller-authored source index."""
+
+    path: Path
+    role: str
+    target_id: str
+    phase: str
+    title: str
+    url: str
+    claim_context: str
+    captured_at: str
+
+    @property
+    def identity(self) -> str:
+        return f"{self.path}:{self.url}"
 
 
 def load_desktop_responses(artifact_dir: Path) -> tuple[DesktopResponse, ...]:
@@ -88,6 +107,80 @@ def load_desktop_responses(artifact_dir: Path) -> tuple[DesktopResponse, ...]:
         )
     )
     return tuple(responses)
+
+
+def load_desktop_web_sources(artifact_dir: Path) -> tuple[DesktopWebSource, ...]:
+    """Load bounded HTTPS citation projections without treating them as proof."""
+
+    source_root = artifact_dir / "research" / "sources"
+    if not source_root.is_dir():
+        return ()
+    sources: list[DesktopWebSource] = []
+    for path in source_root.glob("*/*/*.json"):
+        try:
+            if path.stat().st_size > _MAX_ATTEMPT_BYTES:
+                continue
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        role = str(payload.get("role", "agent"))
+        target_id = str(payload.get("target_id", "agent"))
+        phase = str(payload.get("turn_phase", "turn"))
+        captured_at = str(payload.get("captured_at", ""))
+        raw_sources = payload.get("sources")
+        if not isinstance(raw_sources, list):
+            continue
+        for raw_source in raw_sources[:100]:
+            if not isinstance(raw_source, dict):
+                continue
+            url = raw_source.get("url")
+            title = raw_source.get("title")
+            context = raw_source.get("claim_context")
+            if not isinstance(url, str):
+                continue
+            try:
+                parsed_url = urlsplit(url)
+            except ValueError:
+                continue
+            if (
+                parsed_url.scheme != "https"
+                or not parsed_url.hostname
+                or parsed_url.username is not None
+                or parsed_url.password is not None
+            ):
+                continue
+            if (
+                len(url) > 2_048
+                or not isinstance(title, str)
+                or len(title) > 512
+                or not isinstance(context, str)
+                or len(context) > 2_048
+            ):
+                continue
+            sources.append(
+                DesktopWebSource(
+                    path=path.resolve(),
+                    role=role,
+                    target_id=target_id,
+                    phase=phase,
+                    title=title,
+                    url=url,
+                    claim_context=context,
+                    captured_at=captured_at,
+                )
+            )
+    sources.sort(
+        key=lambda item: (
+            item.captured_at,
+            item.role,
+            item.target_id,
+            item.phase,
+            item.url,
+        )
+    )
+    return tuple(sources)
 
 
 def main() -> None:

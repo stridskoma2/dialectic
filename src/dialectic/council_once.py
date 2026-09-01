@@ -18,12 +18,14 @@ from .capabilities import (
 from .config import validate_model_bounds
 from .contracts import (
     ARTIFACT_SCHEMA_VERSION,
+    ResearchMode,
     TOOL_VERSION,
     ConsensusOutcome,
     TurnPhase,
 )
 from .native_adapters import NativeEnvelopeError, NativeInvocationEvidence, NativeTurnError
 from .output import OutputError, extract_model_payload
+from .research import persist_source_citations, research_policy
 from .schemas import (
     AgentRequest,
     AgentRequestArtifact,
@@ -57,6 +59,7 @@ from .workflow_evidence import (
     process_unit_id_for as _process_unit_id,
     redacted_response as _redacted_response,
     require_packet_bound,
+    stage_preflight_requests,
     take_native_invocation_evidence as _take_native_invocation_evidence,
 )
 
@@ -254,7 +257,13 @@ class CouncilOnceOrchestrator:
             )
             return (role, configured_id), evidence
 
-        pairs = await asyncio.gather(*(one(*request) for request in requests))
+        leaders, followers = stage_preflight_requests(
+            requests,
+            cohort_key=lambda request: request[3].runtime,
+        )
+        pairs = list(await asyncio.gather(*(one(*request) for request in leaders)))
+        if followers:
+            pairs.extend(await asyncio.gather(*(one(*request) for request in followers)))
         gates = dict(pairs)
         aliases = {
             _alias(index): target for index, (_configured_id, target) in enumerate(specs)
@@ -316,9 +325,13 @@ class CouncilOnceOrchestrator:
         council = context.config.council
         if council is None:
             raise DialecticFailure("INTERNAL_ERROR", "validated council configuration vanished")
-        opening_prompt = _opening_prompt(context.input_text)
+        opening_prompt = _opening_prompt(
+            context.input_text, research_mode=context.config.research_mode
+        )
         moderator_opening_prompt = (
-            _moderator_opening_prompt(context.input_text)
+            _moderator_opening_prompt(
+                context.input_text, research_mode=context.config.research_mode
+            )
             if council.moderator_mode == "independent-opening"
             else None
         )
@@ -459,7 +472,12 @@ class CouncilOnceOrchestrator:
         ledger = _position_ledger(participants, moderator_opening)
 
         cross_prompts = {
-            item.target_id: _cross_prompt(context.input_text, ledger, item.alias)
+            item.target_id: _cross_prompt(
+                context.input_text,
+                ledger,
+                item.alias,
+                research_mode=context.config.research_mode,
+            )
             for item in participants
         }
         self._require_all_packets(
@@ -543,6 +561,7 @@ class CouncilOnceOrchestrator:
             ledger,
             _revision_ledger(participants),
             participant_aliases=[item.alias for item in participants],
+            research_mode=context.config.research_mode,
         )
         self._require_all_packets(context, [("moderator", moderation_prompt)], CandidateConclusion)
         if moderator_directory is None:
@@ -610,7 +629,12 @@ class CouncilOnceOrchestrator:
         )
 
         ballot_prompts = {
-            item.target_id: _ballot_prompt(candidate, item.alias) for item in participants
+            item.target_id: _ballot_prompt(
+                candidate,
+                item.alias,
+                research_mode=context.config.research_mode,
+            )
+            for item in participants
         }
         self._require_all_packets(
             context,
@@ -711,6 +735,8 @@ class CouncilOnceOrchestrator:
         }
         if moderator_opening is not None:
             artifact_paths["moderator_opening"] = "council/moderator-opening.json"
+        if context.config.research_mode == "live-web":
+            artifact_paths["research_sources"] = "research/sources"
         return context.service.finalize_council(
             context.handle,
             outcome,
@@ -1010,6 +1036,15 @@ class CouncilOnceOrchestrator:
         context.service.store.write_artifact(
             context.handle, f"{draft.root}.attempt.json", attempt
         )
+        if draft.response is not None and context.config.research_mode == "live-web":
+            persist_source_citations(
+                context,
+                role="participant",
+                target_id=item.target_id,
+                phase=draft.phase,
+                response_text=draft.response.text,
+                captured_at=evidence.capture_completed_at,
+            )
         draft.persisted = True
 
     def _persist_unstarted(
@@ -1188,19 +1223,24 @@ def _alias(index: int) -> str:
     return f"Participant {chr(ord('A') + index)}"
 
 
-def _opening_prompt(prompt: str) -> str:
-    return _canonical_dict_bytes(
+def _opening_prompt(
+    prompt: str, *, research_mode: ResearchMode = "offline"
+) -> str:
+    return _research_packet(
         {
             "phase": "opening",
             "prompt": prompt,
             "instruction": "Give one independent position without assuming or referencing any peer.",
             "output_schema": OpeningPosition.model_json_schema(),
-        }
-    ).decode("utf-8")
+        },
+        research_mode,
+    )
 
 
-def _moderator_opening_prompt(prompt: str) -> str:
-    return _canonical_dict_bytes(
+def _moderator_opening_prompt(
+    prompt: str, *, research_mode: ResearchMode = "offline"
+) -> str:
+    return _research_packet(
         {
             "phase": "opening",
             "prompt": prompt,
@@ -1210,8 +1250,9 @@ def _moderator_opening_prompt(prompt: str) -> str:
                 "the council result."
             ),
             "output_schema": OpeningPosition.model_json_schema(),
-        }
-    ).decode("utf-8")
+        },
+        research_mode,
+    )
 
 
 def _position_ledger(
@@ -1246,8 +1287,14 @@ def _revision_ledger(participants: Sequence[_Participant]) -> dict[str, Any]:
     }
 
 
-def _cross_prompt(prompt: str, ledger: Mapping[str, Any], alias: str) -> str:
-    return _canonical_dict_bytes(
+def _cross_prompt(
+    prompt: str,
+    ledger: Mapping[str, Any],
+    alias: str,
+    *,
+    research_mode: ResearchMode = "offline",
+) -> str:
+    return _research_packet(
         {
             "phase": "cross-examination",
             "prompt": prompt,
@@ -1258,8 +1305,9 @@ def _cross_prompt(prompt: str, ledger: Mapping[str, Any], alias: str) -> str:
                 "state what changed your view, and submit one revised conclusion."
             ),
             "output_schema": CouncilRevision.model_json_schema(),
-        }
-    ).decode("utf-8")
+        },
+        research_mode,
+    )
 
 
 def _moderator_prompt(
@@ -1268,8 +1316,9 @@ def _moderator_prompt(
     revisions: Mapping[str, Any],
     *,
     participant_aliases: Sequence[str],
+    research_mode: ResearchMode = "offline",
 ) -> str:
-    return _canonical_dict_bytes(
+    return _research_packet(
         {
             "phase": "candidate",
             "prompt": prompt,
@@ -1285,20 +1334,33 @@ def _moderator_prompt(
                 "non-voting position rather than an eligible supporting participant."
             ),
             "output_schema": CandidateConclusion.model_json_schema(),
-        }
-    ).decode("utf-8")
+        },
+        research_mode,
+    )
 
 
-def _ballot_prompt(candidate: CandidateConclusion, alias: str) -> str:
-    return _canonical_dict_bytes(
+def _ballot_prompt(
+    candidate: CandidateConclusion,
+    alias: str,
+    *,
+    research_mode: ResearchMode = "offline",
+) -> str:
+    return _research_packet(
         {
             "phase": "ballot",
             "self_alias": alias,
             "candidate": candidate.model_dump(mode="json"),
             "instruction": "Vote exactly once on every proposition. Do not submit an overall vote.",
             "output_schema": CouncilBallot.model_json_schema(),
-        }
-    ).decode("utf-8")
+        },
+        research_mode,
+    )
+
+
+def _research_packet(payload: dict[str, Any], research_mode: ResearchMode) -> str:
+    if research_mode == "live-web":
+        payload["research_policy"] = research_policy()
+    return _canonical_dict_bytes(payload).decode("utf-8")
 
 
 def _consensus_outcome(

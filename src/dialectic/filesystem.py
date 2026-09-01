@@ -20,7 +20,7 @@ def stable_filesystem_identity(path: Path) -> str:
     """Return a platform-stable identity for an existing filesystem object."""
 
     if os.name != "nt":
-        information = path.stat()
+        information = path.lstat()
         return f"{information.st_dev:x}:{information.st_ino:x}"
     information = _windows_file_information(path)
     file_index = (information.nFileIndexHigh << 32) | information.nFileIndexLow

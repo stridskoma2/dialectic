@@ -48,6 +48,7 @@ from dialectic.schemas import (
     WorkspaceRecord,
 )
 from dialectic.scratch import ScratchCleanupTimeout, ScratchContainmentError
+from dialectic.research import research_policy
 from dialectic.service import DialecticService
 from dialectic.store import RunHandle, RunStore
 from dialectic.turn_workspace import TurnWorkspace
@@ -198,6 +199,7 @@ def _config(
     *,
     reviewers: list[dict[str, object]] | None = None,
     limit_updates: dict[str, int] | None = None,
+    research_mode: str | None = None,
 ) -> bytes:
     data = copy.deepcopy(config_data)
     if reviewers is not None:
@@ -206,6 +208,8 @@ def _config(
         limits = data["limits"]
         assert isinstance(limits, dict)
         limits.update(limit_updates)
+    if research_mode is not None:
+        data["research_mode"] = research_mode
     return yaml.safe_dump(data, sort_keys=False).encode("utf-8")
 
 
@@ -221,6 +225,13 @@ async def _execute(
 ) -> tuple[RunRecord, RunStore, RunHandle]:
     state_name = "s-" + hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:10]
     store = RunStore(root.parent / state_name)
+    if reviewers is None:
+        configured = yaml.safe_load(config_bytes)
+        reviewers = {
+            spec["id"]: driver
+            for spec in configured.get("reviewers", [])
+            if spec.get("target") == "@driver"
+        }
     orchestrator = CodeOnceOrchestrator(
         driver_adapter=driver,
         reviewer_adapters=reviewers,
@@ -264,7 +275,12 @@ async def test_code_001_happy_path_two_reviewers_return_findings(
         {"id": "first", "runtime": "claude-code", "model": "claude-model", "lens": "correctness"},
         {"id": "second", "runtime": "grok-build", "model": "grok-model", "lens": "security"},
     ]
-    first = ScriptedAgentAdapter(claude, [_review_step(claude, [_finding("F1")])])
+    first_finding = _finding("F1")
+    first_finding["evidence"] = (
+        "The current contract is documented by "
+        "[Example](https://example.com/reviewer-source)."
+    )
+    first = ScriptedAgentAdapter(claude, [_review_step(claude, [first_finding])])
     second = ScriptedAgentAdapter(grok, [_review_step(grok, [_finding("F2")])])
     record, store, handle = await _execute(
         tmp_path,
@@ -272,6 +288,7 @@ async def test_code_001_happy_path_two_reviewers_return_findings(
             config_data,
             reviewers=reviewer_specs,
             limit_updates={"preflight_seconds": 1, "capability_probe_seconds": 2},
+            research_mode="live-web",
         ),
         repo,
         driver,
@@ -280,6 +297,13 @@ async def test_code_001_happy_path_two_reviewers_return_findings(
     assert record.status == "FINALIZED"
     assert [item.operation for item in driver.invocations] == ["start", "resume"]
     assert len(first.invocations) == len(second.invocations) == 1
+    assert json.loads(first.invocations[0].prompt)["research_policy"] == research_policy()
+    source_artifact = _load_json(
+        handle.path / "research/sources/reviewer/reviewer-a/review.json"
+    )
+    assert source_artifact["sources"][0]["url"] == (
+        "https://example.com/reviewer-source"
+    )
     commit_count = int(
         _git(
             store.state_root / "worktrees" / handle.run_id,

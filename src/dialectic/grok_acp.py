@@ -23,7 +23,12 @@ from .acp_transport import (
     ManagedAcpLeaseFactory,
 )
 from .adapters import ModelMismatchError, verify_model_equivalence
-from .contracts import ARTIFACT_SCHEMA_VERSION, TOOL_VERSION, SessionCloseReason
+from .contracts import (
+    ARTIFACT_SCHEMA_VERSION,
+    ResearchMode,
+    TOOL_VERSION,
+    SessionCloseReason,
+)
 from .json_schema import JsonSchemaError, validate_json_schema
 from .launcher import build_launch_spec, validate_argv
 from .native_adapters import (
@@ -37,6 +42,7 @@ from .native_adapters import (
     _new_process_unit_id,
     _probe_bound_profile,
     _probe_results,
+    _require_static_flags,
     _strict_utf8,
     _trusted_environment,
 )
@@ -90,17 +96,19 @@ class GrokAdapter(NativeAdapterBase):
         return match.group("version")
 
     def _verify_help(self, output: str) -> None:
-        required = (
+        required = [
             "agent",
             "stdio",
             "inspect",
             "--no-auto-update",
             "--no-memory",
-            "--disable-web-search",
             "--no-plan",
             "--no-subagents",
             "--safe-mode",
             "--tools",
+        ]
+        required.extend(
+            ("--allow",) if self.research_mode == "live-web" else ("--disable-web-search",)
         )
         if any(value not in output for value in required):
             raise NativePreflightError("installed Grok Build lacks a required ACP control")
@@ -132,10 +140,11 @@ class GrokAdapter(NativeAdapterBase):
     ) -> None:
         fixture = self.fixture
         with tempfile.TemporaryDirectory(prefix="dialectic-grok-preflight-") as directory:
-            plan = build_launch_spec(
-                executable,
-                _grok_arguments(self.target.model, self.target.effort),
+            arguments = _grok_arguments(
+                self.target.model, self.target.effort, self.research_mode
             )
+            _require_static_flags(arguments, fixture.static_flags)
+            plan = build_launch_spec(executable, arguments)
             lease = await self.acp_factory.open(
                 plan,
                 cwd=Path(directory),
@@ -172,11 +181,12 @@ class GrokAdapter(NativeAdapterBase):
                 )[0],
                 bound,
             )
+            arguments = _grok_arguments(
+                self.target.model, self.target.effort, self.research_mode
+            )
+            _require_static_flags(arguments, fixture.static_flags)
             lease = await self.acp_factory.open(
-                build_launch_spec(
-                    executable,
-                    _grok_arguments(self.target.model, self.target.effort),
-                ),
+                build_launch_spec(executable, arguments),
                 cwd=neutral,
                 environment=environment,
                 model=self.target.model,
@@ -186,8 +196,15 @@ class GrokAdapter(NativeAdapterBase):
                 credentials=self.credentials,
                 preflight_seconds=self.preflight_seconds,
             )
-            schema = _boolean_object_schema(
-                "empty_capabilities", "mcp_source", "built_in_tools"
+            schema = (
+                _boolean_object_schema(
+                    "empty_capabilities", "mcp_source", "web_search", "web_fetch",
+                    "other_built_in_tools",
+                )
+                if self.research_mode == "live-web"
+                else _boolean_object_schema(
+                    "empty_capabilities", "mcp_source", "built_in_tools"
+                )
             )
             request = AgentRequest(
                 role=self.role,
@@ -198,10 +215,21 @@ class GrokAdapter(NativeAdapterBase):
                     "moderator": "moderation",
                 }[self.role],
                 prompt=(
-                    "This is a bounded ACP capability probe. Report whether the ACP client "
-                    "advertises an empty capability set, whether any MCP source is available, "
-                    "and whether any built-in tool is available. Return only the exact JSON "
-                    "schema."
+                    (
+                        "This is a bounded ACP capability probe. Use WebSearch to find the "
+                        "Example Domain site and WebFetch to retrieve https://example.com. "
+                        "Report true only when each named web tool actually succeeds. Also "
+                        "report whether the ACP client advertises any capability, whether any "
+                        "MCP source exists, and whether any other built-in tool is available. "
+                        "Return only the exact JSON schema."
+                    )
+                    if self.research_mode == "live-web"
+                    else (
+                        "This is a bounded ACP capability probe. Report whether the ACP client "
+                        "advertises an empty capability set, whether any MCP source is available, "
+                        "and whether any built-in tool is available. Return only the exact JSON "
+                        "schema."
+                    )
                 ),
                 output_schema=schema,
                 timeout_seconds=self.capability_probe_seconds,
@@ -223,7 +251,15 @@ class GrokAdapter(NativeAdapterBase):
             observed = {
                 "empty-capabilities-allow": value.get("empty_capabilities") is True,
                 "mcp-source-deny": value.get("mcp_source") is False,
-                "built-in-tools-deny": value.get("built_in_tools") is False,
+                **(
+                    {
+                        "web-search-allow": value.get("web_search") is True,
+                        "web-fetch-allow": value.get("web_fetch") is True,
+                        "other-tools-deny": value.get("other_built_in_tools") is False,
+                    }
+                    if self.research_mode == "live-web"
+                    else {"built-in-tools-deny": value.get("built_in_tools") is False}
+                ),
             }
             return _probe_results(fixture, observed, "pinned native Grok ACP probe")
 
@@ -234,7 +270,9 @@ class GrokAdapter(NativeAdapterBase):
         request: AgentRequest,
         bound: _BoundProfile,
     ) -> tuple[str, ...]:
-        return _grok_arguments(self.target.model, self.target.effort)
+        return _grok_arguments(
+            self.target.model, self.target.effort, self.research_mode
+        )
 
     def _parse_envelope(self, stdout: str, request: AgentRequest) -> Any:
         raise RuntimeError("Grok ACP envelopes are parsed by the persistent transport")
@@ -452,8 +490,11 @@ class GrokAdapter(NativeAdapterBase):
 
     async def _open_lease(self, request: AgentRequest, unit_id: str) -> AcpLease:
         bound = self._bound_profile(request)
-        arguments = _grok_arguments(self.target.model, self.target.effort)
+        arguments = _grok_arguments(
+            self.target.model, self.target.effort, self.research_mode
+        )
         validate_argv(arguments)
+        _require_static_flags(arguments, self.fixture.static_flags)
         material = self.preflight_material()
         self._revalidate_material(material)
         return await self.acp_factory.open(
@@ -535,19 +576,24 @@ class GrokAdapter(NativeAdapterBase):
         self._record_launch_failure(started, error)
 
 
-def _grok_arguments(model: str, effort: str | None) -> tuple[str, ...]:
+def _grok_arguments(
+    model: str, effort: str | None, research_mode: ResearchMode = "offline"
+) -> tuple[str, ...]:
     arguments = [
         "--no-auto-update",
         "--no-memory",
-        "--disable-web-search",
-        "--no-plan",
-        "--no-subagents",
-        "--safe-mode",
-        "--tools",
-        "",
-        "--model",
-        model,
     ]
+    if research_mode == "live-web":
+        arguments.extend(
+            (
+                "--tools", "WebSearch,WebFetch",
+                "--allow", "WebSearch",
+                "--allow", "WebFetch",
+            )
+        )
+    else:
+        arguments.extend(("--disable-web-search", "--tools", ""))
+    arguments.extend(("--no-plan", "--no-subagents", "--safe-mode", "--model", model))
     if effort is not None:
         arguments.extend(("--effort", effort))
     arguments.extend(("agent", "stdio"))

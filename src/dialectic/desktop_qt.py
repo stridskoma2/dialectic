@@ -43,7 +43,7 @@ from PySide6.QtWidgets import (
 
 from .app_logging import log_event
 from .contracts import RunMode
-from .desktop import DesktopResponse, load_desktop_responses
+from .desktop import DesktopResponse, load_desktop_responses, load_desktop_web_sources
 from .runtime import build_service
 from .schemas import RunRecord
 from .ui import (
@@ -123,7 +123,13 @@ class RunWorker(QThread):
 
     def run(self) -> None:
         prepared = self._prepared
-        log_event(_LOGGER, logging.INFO, "ui.run_requested", mode=prepared.mode)
+        log_event(
+            _LOGGER,
+            logging.INFO,
+            "ui.run_requested",
+            mode=prepared.mode,
+            research_mode=prepared.research_mode,
+        )
         loop = asyncio.new_event_loop()
         self._loop = loop
         try:
@@ -531,6 +537,19 @@ class MainWindow(QMainWindow):
         self.repo_hint.setWordWrap(True)
         panel_layout.addWidget(self.repo_hint)
 
+        research_label = QLabel("Research access")
+        research_label.setObjectName("FieldLabel")
+        panel_layout.addWidget(research_label)
+        self.research_mode = QComboBox()
+        self.research_mode.addItem("Offline", "offline")
+        self.research_mode.addItem("Live web", "live-web")
+        self.research_mode.currentIndexChanged.connect(self._research_mode_changed)
+        panel_layout.addWidget(self.research_mode)
+        self.research_hint = QLabel()
+        self.research_hint.setObjectName("Hint")
+        self.research_hint.setWordWrap(True)
+        panel_layout.addWidget(self.research_hint)
+
         agent_head = QHBoxLayout()
         self.agents_title = QLabel("Review models")
         self.agents_title.setObjectName("SectionTitle")
@@ -589,6 +608,11 @@ class MainWindow(QMainWindow):
             "# No run yet\n\nTerminal summaries and evidence will appear here.",
         )
         self.responses_tab = self._build_responses_tab()
+        self.sources_view = _markdown_browser()
+        _set_markdown(
+            self.sources_view,
+            "# No web sources yet\n\nLive-web citation projections will appear here as models reply.",
+        )
         self.evidence_tree = QTreeWidget()
         self.evidence_tree.setHeaderLabels(["Artifact", "Size"])
         self.evidence_tree.setColumnWidth(0, 420)
@@ -596,6 +620,7 @@ class MainWindow(QMainWindow):
         self.workspace_tabs.addTab(self.prompt_tab, "Prompt")
         self.workspace_tabs.addTab(self.summary_view, "Summary")
         self.workspace_tabs.addTab(self.responses_tab, "Responses")
+        self.workspace_tabs.addTab(self.sources_view, "Sources")
         self.workspace_tabs.addTab(self.evidence_tree, "Evidence")
         layout.addWidget(self.workspace_tabs, 1)
 
@@ -751,9 +776,15 @@ class MainWindow(QMainWindow):
         )
         self.run_button.setText("Run Code Once" if mode == "code" else "Run Council Once")
         self.run_note.setText(
-            "Installed CLIs are labeled; model access and authentication are verified during preflight."
+            (
+                "Installed CLIs are labeled. The driver stays offline; optional live web applies only to reviewers."
+            )
             if mode == "code"
-            else "Participant phases run in parallel. Web search, MCP, and built-in tools are disabled in the secure profile."
+            else (
+                "Participant phases run in parallel. Live web is enabled by default; non-web tools remain disabled."
+                if draft["researchMode"] == "live-web"
+                else "Participant phases run in parallel with all web and built-in tools disabled."
+            )
         )
         self.repository.setDisabled(mode == "council")
         self.browse.setDisabled(
@@ -764,6 +795,8 @@ class MainWindow(QMainWindow):
             if mode == "code"
             else "Council is prompt-only; repository paths are not disclosed to participants."
         )
+        _select_data(self.research_mode, str(draft["researchMode"]))
+        self._research_mode_changed()
         self.council_settings.setVisible(mode == "council")
         self._populate_main(
             runtime=str(draft["main"]["runtime"]),  # type: ignore[index]
@@ -787,6 +820,7 @@ class MainWindow(QMainWindow):
             "prompt": self.prompt_edit.toPlainText(),
             "maxDissenters": self.max_dissenters.value(),
             "moderatorMode": str(self.moderator_mode.currentData() or "fresh"),
+            "researchMode": str(self.research_mode.currentData() or "offline"),
         }
 
     def _populate_main(self, *, runtime: str, model: str, effort: str) -> None:
@@ -822,6 +856,32 @@ class MainWindow(QMainWindow):
             self.main_effort.addItem(item or "default", item)
         _select_data(self.main_effort, effort)
         self._show_main_model_hint()
+
+    @Slot()
+    def _research_mode_changed(self) -> None:
+        value = str(self.research_mode.currentData() or "offline")
+        self._drafts[self._mode]["researchMode"] = value
+        if self._mode == "code":
+            self.research_hint.setText(
+                "The writable driver stays offline. Live web applies only to packet-only reviewers."
+            )
+            self.run_note.setText(
+                "Installed CLIs are labeled. The driver stays offline; reviewers use the selected research profile."
+            )
+        elif value == "live-web":
+            self.research_hint.setText(
+                "Live web is the default. Participants and the Moderator may use provider-native web search and fetch; shell networking, MCP, apps, plugins, and subagents stay disabled."
+            )
+            self.run_note.setText(
+                "Participant phases run in parallel with live web enabled; non-web tools remain disabled."
+            )
+        else:
+            self.research_hint.setText(
+                "Participants and the Moderator run without web or other tool access."
+            )
+            self.run_note.setText(
+                "Participant phases run in parallel with all web and built-in tools disabled."
+            )
 
     def _show_main_model_hint(self) -> None:
         runtime = str(self.main_runtime.currentData() or "")
@@ -924,6 +984,7 @@ class MainWindow(QMainWindow):
             "agents": [row.payload() for row in self._agent_rows],
             "maxDissenters": self.max_dissenters.value(),
             "moderatorMode": str(self.moderator_mode.currentData() or "fresh"),
+            "researchMode": str(self.research_mode.currentData() or "offline"),
         }
 
     def _start_run(self) -> None:
@@ -961,6 +1022,10 @@ class MainWindow(QMainWindow):
             self.summary_view,
             "# Run in progress\n\nDurable phase transitions and the terminal summary will appear here.",
         )
+        _set_markdown(
+            self.sources_view,
+            "# Waiting for web sources\n\nThis stays empty for offline runs. Live-web links are citation projections, not independent proof that a source supports a claim.",
+        )
         self.evidence_tree.clear()
         self.copy_response.setEnabled(False)
         self.open_response.setEnabled(False)
@@ -986,6 +1051,7 @@ class MainWindow(QMainWindow):
         self.result_detail.setText(f"Run {record.run_id} · {record.status}")
         self.phase_strip.set_phase(record.phase)
         self._refresh_responses()
+        self._refresh_sources()
 
     @Slot(object)
     def _run_completed(self, result: DesktopRunResult) -> None:
@@ -1012,6 +1078,7 @@ class MainWindow(QMainWindow):
         self.result_detail.setText(" · ".join(details))
         self._load_summary()
         self._refresh_responses()
+        self._refresh_sources()
         self._refresh_artifacts()
         self.workspace_tabs.setCurrentWidget(self.summary_view)
 
@@ -1046,6 +1113,7 @@ class MainWindow(QMainWindow):
             self.repository,
             self.browse,
             self.moderator_mode,
+            self.research_mode,
             self.max_dissenters,
             self.prompt_edit,
             self.run_button,
@@ -1120,6 +1188,36 @@ class MainWindow(QMainWindow):
                 self.workspace_tabs.setCurrentWidget(self.responses_tab)
         else:
             self.workspace_tabs.setTabText(2, "Responses")
+
+    def _refresh_sources(self) -> None:
+        root = self._artifact_dir
+        if root is None:
+            return
+        sources = load_desktop_web_sources(root)
+        if not sources:
+            _set_markdown(self.sources_view, "")
+            self.workspace_tabs.setTabText(3, "Sources")
+            return
+        lines = [
+            "# Web sources",
+            "",
+            "Links were cited in model responses. They are a bounded index, not independent verification.",
+            "",
+        ]
+        for source in sources:
+            title = _markdown_text(source.title) or source.url
+            identity = _markdown_text(
+                f"{_friendly(source.target_id)} · {_friendly(source.phase)}"
+            )
+            context = _markdown_text(source.claim_context)
+            lines.extend(
+                [
+                    f"- **{title}** — <{source.url}>  ",
+                    f"  {identity}" + (f" — {context}" if context else ""),
+                ]
+            )
+        _set_markdown(self.sources_view, "\n".join(lines))
+        self.workspace_tabs.setTabText(3, f"Sources ({len(sources)})")
 
     def _selected_response_id(self) -> str:
         item = self.response_list.currentItem()
@@ -1326,6 +1424,7 @@ def _default_drafts(options: dict[str, object]) -> dict[RunMode, dict[str, objec
             "prompt": "",
             "maxDissenters": 0,
             "moderatorMode": "fresh",
+            "researchMode": "offline",
         },
         "council": {
             "main": {"runtime": "codex", "model": codex, "effort": "high"},
@@ -1341,6 +1440,7 @@ def _default_drafts(options: dict[str, object]) -> dict[RunMode, dict[str, objec
             "prompt": "",
             "maxDissenters": 0,
             "moderatorMode": "fresh",
+            "researchMode": "live-web",
         },
     }
 
@@ -1417,6 +1517,21 @@ def _markdown_browser() -> QTextBrowser:
 
 def _set_markdown(browser: QTextBrowser, markdown: str) -> None:
     browser.document().setMarkdown(markdown, _MARKDOWN_FEATURES)
+
+
+def _markdown_text(value: str) -> str:
+    """Escape model-authored text before inserting it into generated Markdown."""
+
+    return (
+        " ".join(value.split())
+        .replace("\\", "\\\\")
+        .replace("*", "\\*")
+        .replace("_", "\\_")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+        .replace("<", "\\<")
+        .replace(">", "\\>")
+    )
 
 
 def _confirm_link(parent: QWidget, url: QUrl) -> None:

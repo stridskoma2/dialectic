@@ -15,10 +15,12 @@ round, fresh moderator, ballots, controller-derived consensus, stop).
 `GptPro/DIALECTIC_MVP_IMPLEMENTATION_AND_TEST_SPEC_V0.5.4.md` — **frozen MVP
 implementation baseline**, 2026 lines.
 
-`GptPro/DIALECTIC_COUNCIL_MODERATOR_MODE_EXTENSION_V0.1.md` is the sole normative
-post-baseline extension. It adds the user-selectable fresh-versus-independent-opening
-moderator behavior while preserving fresh final synthesis, one cross-examination
-round, non-voting moderation, and the packet-only tool boundary.
+`GptPro/DIALECTIC_COUNCIL_MODERATOR_MODE_EXTENSION_V0.1.md` and
+`GptPro/DIALECTIC_WEB_RESEARCH_EXTENSION_V0.1.md` are the normative post-baseline
+extensions. They add user-selectable fresh-versus-independent-opening moderator
+behavior and bounded provider-native web research while preserving fresh final
+synthesis, one cross-examination round, non-voting moderation, and the packet-only
+security boundary.
 
 Read the relevant section before implementing against it. It went through five
 review rounds with two independent reviewers and its clauses are load-bearing:

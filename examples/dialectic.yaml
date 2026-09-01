@@ -1,4 +1,5 @@
 version: 1
+research_mode: offline
 
 driver:
   runtime: codex
@@ -48,6 +49,7 @@ limits:
   max_changed_paths: 1000
   max_changed_regular_file_bytes: 8388608
   max_candidate_change_bytes: 33554432
+  max_web_sources_per_turn: 20
   max_packet_bytes: 393216
   max_lens_chars: 4096
   max_model_field_chars: 32768

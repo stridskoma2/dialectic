@@ -21,6 +21,7 @@ from dialectic.council_once import (
     _opening_prompt,
 )
 from dialectic.native_adapters import NativePreflightError, NativeTurnError
+from dialectic.research import research_policy
 from dialectic.schemas import (
     AgentResponse,
     AgentTarget,
@@ -327,15 +328,37 @@ async def test_council_001_complete_three_participant_artifact_and_persistent_li
 
         adapters[0].preflight = preflight_with_separate_probe_budget  # type: ignore[method-assign]
 
+    openings = [_opening(index) for index in range(3)]
+    openings[0]["claims"][0]["evidence"] = (
+        "Current evidence: [Example](https://example.com/council-source)."
+    )
+
+    def enable_live_web(data: dict[str, Any]) -> None:
+        data["research_mode"] = "live-web"
+
     record, handle, adapters, moderator, _store = await _scenario(
         tmp_path,
         limits,
+        openings=openings,
+        config_mutator=enable_live_web,
         opening_callback=barrier_callback,
         adapter_mutator=delayed_preflight,
     )
     assert (record.status, record.consensus_outcome) == ("FINALIZED", "UNANIMOUS")
     assert [len(adapter.invocations) for adapter in adapters] == [3, 3, 3]
     assert len(moderator.invocations) == 1
+    assert all(
+        json.loads(invocation.prompt)["research_policy"] == research_policy()
+        for adapter in adapters
+        for invocation in adapter.invocations
+    )
+    assert json.loads(moderator.invocations[0].prompt)["research_policy"] == research_policy()
+    source_artifact = _read_json(
+        handle.path / "research/sources/participant/participant-a/opening.json"
+    )
+    assert source_artifact["sources"][0]["url"] == (
+        "https://example.com/council-source"
+    )
     assert [item.operation for item in adapters[2].invocations] == ["start", "resume", "resume"]
     attempts = sorted(handle.path.glob("turns/*/*/*.attempt.json"))
     assert len(attempts) == 10

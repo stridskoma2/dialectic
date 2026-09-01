@@ -11,7 +11,7 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Hashable, Mapping, Sequence, TypeVar
 
 from .adapters import AgentAdapter, AgentProcessError, ModelMismatchError
 from .capabilities import (
@@ -23,10 +23,12 @@ from .capabilities import (
 from .config import validate_model_bounds
 from .contracts import ARTIFACT_SCHEMA_VERSION, TOOL_VERSION, FailureKind
 from .native_adapters import (
+    NativeEnvelopeError,
     NativeInvocationEvidence,
     NativePreflightError,
     NativeTurnError,
 )
+from .research import persist_source_citations
 from .schemas import (
     AgentRequest,
     AgentRequestArtifact,
@@ -44,6 +46,7 @@ from .service import DialecticFailure, ExecutionContext
 from .store import canonical_json_bytes
 
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+_PreflightRequest = TypeVar("_PreflightRequest")
 
 
 class TurnFailure(RuntimeError):
@@ -51,6 +54,26 @@ class TurnFailure(RuntimeError):
         self.kind = kind
         self.detail = detail
         super().__init__(detail)
+
+
+def stage_preflight_requests(
+    requests: Sequence[_PreflightRequest],
+    *,
+    cohort_key: Callable[[_PreflightRequest], Hashable],
+) -> tuple[tuple[_PreflightRequest, ...], tuple[_PreflightRequest, ...]]:
+    """Run one cache-populating request per capability cohort before its peers."""
+
+    leaders: list[_PreflightRequest] = []
+    followers: list[_PreflightRequest] = []
+    seen: set[Hashable] = set()
+    for request in requests:
+        key = cohort_key(request)
+        if key in seen:
+            followers.append(request)
+        else:
+            seen.add(key)
+            leaders.append(request)
+    return tuple(leaders), tuple(followers)
 
 
 @dataclass(frozen=True, slots=True)
@@ -497,6 +520,20 @@ class WorkflowEvidenceSupport:
         context.service.store.write_artifact(
             context.handle, f"{root}.attempt.json", attempt
         )
+        if (
+            response is not None
+            and access_mode == "packet-only"
+            and context.config.research_mode == "live-web"
+            and role in {"reviewer", "participant", "moderator"}
+        ):
+            persist_source_citations(
+                context,
+                role=role,  # type: ignore[arg-type]
+                target_id=target_id,
+                phase=phase,  # type: ignore[arg-type]
+                response_text=response.text,
+                captured_at=capture_completed_at,
+            )
         if caught is not None:
             if isinstance(caught, asyncio.CancelledError):
                 if attempt_failure == "PROCESS_CLEANUP_FAILED":
@@ -611,7 +648,10 @@ def take_native_invocation_evidence(
 def bounded_preflight_diagnostic(error: BaseException) -> str:
     if isinstance(error, TimeoutError):
         detail = "native preflight exceeded its configured timeout"
-    elif isinstance(error, NativePreflightError):
+    elif isinstance(
+        error,
+        (NativePreflightError, NativeEnvelopeError, CapabilityEvidenceError),
+    ):
         detail = str(error)
     else:
         detail = f"unexpected {type(error).__name__}"

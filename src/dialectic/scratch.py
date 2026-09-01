@@ -6,6 +6,7 @@ import asyncio
 import os
 import stat
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -346,52 +347,76 @@ def _cleanup_directory_fd(
     deadline: float,
     clock: Callable[[], float],
 ) -> None:
-    for name in os.listdir(directory_fd):
-        if clock() > deadline:
-            raise ScratchCleanupTimeout(
-                "reserved-tree cleanup exceeded its independent bound"
-            )
-        try:
-            information = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        if stat.S_ISDIR(information.st_mode) and not stat.S_ISLNK(information.st_mode):
-            try:
-                child_fd = os.open(name, flags, dir_fd=directory_fd)
-            except OSError as exc:
-                raise ScratchContainmentError(
-                    "reserved child directory cannot be opened safely"
-                ) from exc
-            try:
-                opened = os.fstat(child_fd)
-                if (opened.st_dev, opened.st_ino) != (
-                    information.st_dev,
-                    information.st_ino,
-                ):
-                    raise ScratchContainmentError(
-                        "reserved child identity changed during cleanup"
-                    )
-                _cleanup_directory_fd(
-                    child_fd,
-                    flags=flags,
-                    deadline=deadline,
-                    clock=clock,
+    root_entries = os.scandir(directory_fd)
+    stack: list[tuple[int, int | None, str | None, Iterator[os.DirEntry[str]]]] = [
+        (directory_fd, None, None, root_entries)
+    ]
+    try:
+        while stack:
+            current_fd, parent_fd, child_name, entries = stack[-1]
+            if clock() > deadline:
+                raise ScratchCleanupTimeout(
+                    "reserved-tree cleanup exceeded its independent bound"
                 )
-            finally:
-                os.close(child_fd)
             try:
-                os.rmdir(name, dir_fd=directory_fd)
-            except OSError as exc:
-                raise ScratchContainmentError(
-                    "reserved child changed before directory removal"
-                ) from exc
-        else:
+                entry = next(entries)
+            except StopIteration:
+                entries.close()
+                stack.pop()
+                if parent_fd is not None and child_name is not None:
+                    os.close(current_fd)
+                    try:
+                        os.rmdir(child_name, dir_fd=parent_fd)
+                    except OSError as exc:
+                        raise ScratchContainmentError(
+                            "reserved child changed before directory removal"
+                        ) from exc
+                continue
+
+            name = entry.name
             try:
-                os.unlink(name, dir_fd=directory_fd)
-            except OSError as exc:
-                raise ScratchContainmentError(
-                    "reserved child changed before leaf removal"
-                ) from exc
+                information = os.stat(
+                    name,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(information.st_mode) and not stat.S_ISLNK(
+                information.st_mode
+            ):
+                try:
+                    child_fd = os.open(name, flags, dir_fd=current_fd)
+                except OSError as exc:
+                    raise ScratchContainmentError(
+                        "reserved child directory cannot be opened safely"
+                    ) from exc
+                try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino) != (
+                        information.st_dev,
+                        information.st_ino,
+                    ):
+                        raise ScratchContainmentError(
+                            "reserved child identity changed during cleanup"
+                        )
+                    child_entries = os.scandir(child_fd)
+                except BaseException:
+                    os.close(child_fd)
+                    raise
+                stack.append((child_fd, current_fd, name, child_entries))
+            else:
+                try:
+                    os.unlink(name, dir_fd=current_fd)
+                except OSError as exc:
+                    raise ScratchContainmentError(
+                        "reserved child changed before leaf removal"
+                    ) from exc
+    finally:
+        for current_fd, parent_fd, _child_name, entries in reversed(stack):
+            entries.close()
+            if parent_fd is not None:
+                os.close(current_fd)
 
 
 def _unlink_reparse(path: Path, info: os.stat_result) -> None:

@@ -27,7 +27,8 @@ from .app_logging import (
     configure_structured_logging,
     log_event,
 )
-from .contracts import RunMode
+from .contracts import ResearchMode, RunMode
+from .desktop import load_desktop_web_sources
 from .runtime import build_service
 from .ui_config import (
     ModeratorMode,
@@ -91,6 +92,7 @@ _RUNTIME_EXECUTABLES: dict[RuntimeName, str] = {
 @dataclass(frozen=True, slots=True)
 class _PreparedRun:
     mode: RunMode
+    research_mode: ResearchMode
     config_bytes: bytes
     prompt_bytes: bytes
     repository: Path | None
@@ -105,6 +107,9 @@ def _prepare_run(payload: object) -> _PreparedRun:
     prompt = _string(payload.get("prompt"), "prompt").strip()
     if not prompt:
         raise ValueError("Prompt is required")
+    research_mode = _string(payload.get("researchMode", "offline"), "research mode")
+    if research_mode not in {"offline", "live-web"}:
+        raise ValueError("Research mode must be offline or live-web")
 
     raw_main = payload.get("main")
     if not isinstance(raw_main, dict):
@@ -145,6 +150,7 @@ def _prepare_run(payload: object) -> _PreparedRun:
             main_model=main_model,
             main_effort=main_effort,
             agents=tuple(agents),
+            research_mode=cast(ResearchMode, research_mode),
             max_dissenters=max_dissenters,
             moderator_mode=cast(ModeratorMode, moderator_mode),
         )
@@ -161,6 +167,7 @@ def _prepare_run(payload: object) -> _PreparedRun:
 
     return _PreparedRun(
         mode=cast(RunMode, mode),
+        research_mode=cast(ResearchMode, research_mode),
         config_bytes=config_bytes,
         prompt_bytes=prompt.encode("utf-8"),
         repository=repository,
@@ -303,6 +310,11 @@ class _UiState:
             if isinstance(artifact_dir, str) and artifact_dir
             else []
         )
+        snapshot["sources"] = (
+            _source_excerpts(Path(artifact_dir))
+            if isinstance(artifact_dir, str) and artifact_dir
+            else []
+        )
         return snapshot
 
     def start(self, prepared: _PreparedRun) -> None:
@@ -370,7 +382,13 @@ class _UiState:
             )
 
     def _run(self, prepared: _PreparedRun) -> None:
-        log_event(_LOGGER, logging.INFO, "ui.run_requested", mode=prepared.mode)
+        log_event(
+            _LOGGER,
+            logging.INFO,
+            "ui.run_requested",
+            mode=prepared.mode,
+            research_mode=prepared.research_mode,
+        )
         try:
             service = build_service()
             service.set_progress_observer(self._progress)
@@ -813,6 +831,21 @@ def _response_excerpts(artifact_dir: Path) -> list[dict[str, str]]:
         )
     )
     return responses
+
+
+def _source_excerpts(artifact_dir: Path) -> list[dict[str, str]]:
+    return [
+        {
+            "role": source.role,
+            "targetId": source.target_id,
+            "phase": source.phase,
+            "title": source.title,
+            "url": source.url,
+            "claimContext": source.claim_context,
+            "capturedAt": source.captured_at,
+        }
+        for source in load_desktop_web_sources(artifact_dir)[:100]
+    ]
 
 
 def _ui_html() -> bytes:
