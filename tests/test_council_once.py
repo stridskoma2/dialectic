@@ -36,6 +36,7 @@ from dialectic.schemas import (
 )
 from dialectic.service import DialecticService
 from dialectic.store import RunStore, canonical_json_bytes
+from dialectic.turn_timing import TurnDeadlineExpired
 from dialectic.workflow_evidence import canonical_mapping_bytes
 
 
@@ -612,16 +613,25 @@ async def test_council_011_participant_failure_reaps_active_and_retained_peers(
     tmp_path: Path, limits: dict[str, int], phase: str
 ) -> None:
     participant_error: BaseException = RuntimeError("participant failed")
+    error_index = 0
+    if phase == "ballot":
+        error_index = 2
+        participant_error = TurnDeadlineExpired("idle", 90.0)
     if phase == "cross-examination":
         participant_error = NativePreflightError("controller output schema path collided")
     record, handle, adapters, _moderator, _store = await _scenario(
         tmp_path,
         limits,
-        errors={(0, phase): participant_error},
+        errors={(error_index, phase): participant_error},
         delays={(1, phase): 1.0},
     )
     assert (record.status, record.failure_kind) == ("FAILED", "NO_QUORUM")
-    if phase == "cross-examination":
+    if phase == "ballot":
+        assert record.failure_detail == (
+            "persistent participant turn failed: agent turn emitted no observable "
+            "provider activity for 90 seconds"
+        )
+    elif phase == "cross-examination":
         assert record.failure_detail == (
             "native turn preparation failed: controller output schema path collided"
         )
@@ -644,10 +654,7 @@ async def test_council_011_participant_failure_reaps_active_and_retained_peers(
     latest_grok = max(grok_attempts, key=lambda item: phase_order[item.turn_phase])
     assert latest_grok.turn_phase == phase
     assert latest_grok.process_disposition == "closed"
-    if phase == "ballot":
-        assert latest_grok.attempt_end_reason == "response-returned"
-    else:
-        assert latest_grok.attempt_end_reason in {"peer-failure", "agent-failed"}
+    assert latest_grok.attempt_end_reason in {"peer-failure", "agent-failed"}
 
     allowed_phases = tuple(phase_order)[: phase_order[phase] + 1]
     assert all(

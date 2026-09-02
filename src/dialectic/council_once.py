@@ -52,6 +52,7 @@ from .schemas import (
     derive_overall_vote,
 )
 from .service import DialecticFailure, ExecutionContext, WorkflowTimedOut
+from .turn_timing import TurnDeadlineExpired
 from .workflow_evidence import (
     GateAEvidence as _GateAEvidence,
     WorkflowEvidenceSupport,
@@ -896,6 +897,10 @@ class CouncilOnceOrchestrator:
                     "NO_QUORUM",
                     "native turn preparation failed: "
                     f"{_bounded_preflight_diagnostic(exc)}",
+                ) from exc
+            if isinstance(exc, TurnDeadlineExpired):
+                raise DialecticFailure(
+                    "NO_QUORUM", f"persistent participant turn failed: {exc}"
                 ) from exc
             if isinstance(exc, (NativeEnvelopeError, AgentProcessError, TimeoutError)):
                 raise DialecticFailure("NO_QUORUM", "persistent participant turn failed") from exc

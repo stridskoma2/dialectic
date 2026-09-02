@@ -85,7 +85,10 @@ class ProcessSupervisor:
                     except TimeoutError:
                         await unit.force_terminate()
             else:
-                # A normal root exit still owns and reaps lingering unit members.
+                # Spec section 10.4 requires signaling the owned process group after
+                # normal root exit so lingering members cannot survive persistence.
+                # This deliberately accepts the POSIX PID/PGID reuse window in favor
+                # of that bounded descendant cleanup contract.
                 await unit.force_terminate()
 
             confirmed = await unit.confirm_cleanup(graceful_kill_seconds)

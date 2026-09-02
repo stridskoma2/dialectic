@@ -300,6 +300,17 @@ async def test_core_007_timeout_reaps_owned_descendant_before_sentinel() -> None
     assert controller.extend_active(0.03)["extendedTurns"] == 1
     assert await extended == "completed"
 
+    ceiling_request = request.model_copy(
+        update={"target_id": "participant-ceiling", "timeout_seconds": 0.3}
+    )
+    at_ceiling = asyncio.create_task(
+        controller.wait_for(ceiling_request, "claude-code", asyncio.sleep(0.01))
+    )
+    await asyncio.sleep(0)
+    assert controller.snapshot()["canExtend"] is False
+    assert controller.extend_active(0.03)["extendedTurns"] == 0
+    await at_ceiling
+
     streaming_request = request.model_copy(update={"timeout_seconds": 0.2})
     activity = controller.activity_callback(streaming_request)
 

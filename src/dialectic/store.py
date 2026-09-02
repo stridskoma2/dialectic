@@ -393,6 +393,7 @@ class RunStore:
                     raise StateCorruptError("events.jsonl sequence is not contiguous")
         return sequence + 1
 
+
 def _created_record(run_id: str, mode: RunMode) -> RunRecord:
     now = datetime.now(UTC)
     return RunRecord(
