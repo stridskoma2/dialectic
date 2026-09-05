@@ -529,8 +529,19 @@ class MainWindow(QMainWindow):
         layout.addWidget(brand)
         layout.addWidget(subbrand)
         layout.addStretch(1)
+        self.history_button = QPushButton("History…")
+        self.history_button.setToolTip("Search and open saved sessions read-only")
+        self.history_button.clicked.connect(self._show_history)
+        layout.addWidget(self.history_button)
         layout.addWidget(self.header_status)
         return header
+
+    def _show_history(self) -> None:
+        from .history_qt import HistoryDialog
+
+        dialog = HistoryDialog(DialecticService.open_history(), self)
+        dialog.exec()
+        dialog.deleteLater()
 
     def _build_setup_panel(self) -> QWidget:
         scroll = QScrollArea()

@@ -14,6 +14,7 @@ from typing import Callable, Protocol, Sequence
 from .app_logging import log_event
 from .audit import OfflineRunAuditor
 from .config import ConfigError, ConfigLoader, decode_scalar_utf8, validate_mode
+from .history import RunHistory
 from .contracts import (
     ARTIFACT_SCHEMA_VERSION,
     MAX_DIAGNOSTIC_BYTES,
@@ -99,6 +100,11 @@ class WorkflowTimedOut(RuntimeError):
 
 
 class DialecticService:
+    @staticmethod
+    def open_history(state_root: Path | None = None) -> RunHistory:
+        """Provide retained-run inspection without initializing writable state or providers."""
+        return RunHistory(state_root)
+
     def __init__(
         self,
         store: RunStore,

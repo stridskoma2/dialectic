@@ -57,6 +57,16 @@ file into the prompt editor to use its contents as the prompt. Files must be UTF
 **Ctrl+Z** restores it. You can edit the imported text and use **Preview** before
 starting the run.
 
+In the native desktop app, **History…** searches retained sessions by their original
+prompt, run ID, mode, status or outcome. Select a session and choose **Open read-only**
+to inspect its prompt, saved settings, summary, model responses, sources and evidence.
+Failed and partial sessions remain inspectable. The history window preserves the
+main window's draft and active run and has no execution controls. **Audit evidence**
+displays the same offline integrity report as `dial audit`; it never repairs or
+changes retained evidence. Double-click an evidence file for a bounded read-only
+text preview. **Refresh** updates the session list; reopening a session loads a new
+snapshot. No provider credentials or native CLI execution are required to browse.
+
 UI-created runs start each turn with a 30-minute allotment and retain a one-hour
 controller hard ceiling; the whole workflow retains its separate one-hour wall-clock
 limit. The **+5 min** control extends every currently active parallel turn without

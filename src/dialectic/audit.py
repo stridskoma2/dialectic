@@ -8,6 +8,7 @@ import re
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from typing import Protocol
 from pydantic import BaseModel
 
 from .contracts import CODE_PHASES, COUNCIL_PHASES, TOOL_VERSION
@@ -35,7 +36,7 @@ from .schemas import (
     WebSourceCitationArtifact,
     WorkspaceRecord,
 )
-from .store import RunNotFoundError, RunStore, canonical_json_bytes, validate_run_id
+from .store import RunNotFoundError, canonical_json_bytes, validate_run_id
 
 MAX_AUDIT_FILES = 100_000
 MAX_AUDIT_TOTAL_BYTES = 2_147_483_648
@@ -116,10 +117,15 @@ class _AuditState:
         )
 
 
+class AuditStore(Protocol):
+    runs_root: Path
+    capability_attestations_root: Path
+
+
 class OfflineRunAuditor:
     """Inspect a run without repairing it or writing to its evidence tree."""
 
-    def __init__(self, store: RunStore) -> None:
+    def __init__(self, store: AuditStore) -> None:
         self.store = store
 
     def audit(self, run_id: str) -> RunAuditReport:

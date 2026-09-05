@@ -58,18 +58,28 @@ class DesktopWebSource:
         return f"{self.path}:{self.url}"
 
 
-def load_desktop_responses(artifact_dir: Path) -> tuple[DesktopResponse, ...]:
+def load_desktop_responses(
+    artifact_dir: Path, *, contents: dict[str, str] | None = None,
+) -> tuple[DesktopResponse, ...]:
     """Load bounded completed responses without treating them as workflow authority."""
 
     turns = artifact_dir / "turns"
-    if not turns.is_dir():
+    if contents is None and not turns.is_dir():
         return ()
     responses: list[DesktopResponse] = []
-    for path in turns.glob("*/*/*.attempt.json"):
+    paths = (
+        (artifact_dir / name for name in contents if Path(name).match("turns/*/*/*.attempt.json"))
+        if contents is not None else turns.glob("*/*/*.attempt.json")
+    )
+    for path in paths:
         try:
-            if path.stat().st_size > _MAX_ATTEMPT_BYTES:
+            if contents is not None:
+                raw = contents[path.relative_to(artifact_dir).as_posix()]
+            elif path.stat().st_size > _MAX_ATTEMPT_BYTES:
                 continue
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            else:
+                raw = path.read_text(encoding="utf-8")
+            payload = json.loads(raw)
         except (OSError, UnicodeError, json.JSONDecodeError):
             continue
         if not isinstance(payload, dict):
@@ -129,18 +139,28 @@ def attempt_duration_seconds(payload: dict[str, object]) -> float | None:
     return round(duration, 3) if duration >= 0 else None
 
 
-def load_desktop_web_sources(artifact_dir: Path) -> tuple[DesktopWebSource, ...]:
+def load_desktop_web_sources(
+    artifact_dir: Path, *, contents: dict[str, str] | None = None,
+) -> tuple[DesktopWebSource, ...]:
     """Load bounded HTTPS citation projections without treating them as proof."""
 
     source_root = artifact_dir / "research" / "sources"
-    if not source_root.is_dir():
+    if contents is None and not source_root.is_dir():
         return ()
     sources: list[DesktopWebSource] = []
-    for path in source_root.glob("*/*/*.json"):
+    paths = (
+        (artifact_dir / name for name in contents if Path(name).match("research/sources/*/*/*.json"))
+        if contents is not None else source_root.glob("*/*/*.json")
+    )
+    for path in paths:
         try:
-            if path.stat().st_size > _MAX_ATTEMPT_BYTES:
+            if contents is not None:
+                raw = contents[path.relative_to(artifact_dir).as_posix()]
+            elif path.stat().st_size > _MAX_ATTEMPT_BYTES:
                 continue
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            else:
+                raw = path.read_text(encoding="utf-8")
+            payload = json.loads(raw)
         except (OSError, UnicodeError, json.JSONDecodeError):
             continue
         if not isinstance(payload, dict):
