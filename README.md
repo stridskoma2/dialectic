@@ -51,6 +51,12 @@ selector chooses either fresh synthesis only or an independent blind moderator
 opening followed by fresh synthesis. Participant openings, cross-examinations, and
 ballots run in parallel within their respective phases.
 
+In either desktop mode, use **Load file…** or drag a `.md`, `.markdown`, or `.txt`
+file into the prompt editor to use its contents as the prompt. Files must be UTF-8
+(a UTF-8 BOM is supported) and at most 64 KiB. Loading replaces the current prompt;
+**Ctrl+Z** restores it. You can edit the imported text and use **Preview** before
+starting the run.
+
 UI-created runs start each turn with a 30-minute allotment and retain a one-hour
 controller hard ceiling; the whole workflow retains its separate one-hour wall-clock
 limit. The **+5 min** control extends every currently active parallel turn without

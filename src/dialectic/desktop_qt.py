@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QSettings, QThread, QTimer, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QCloseEvent, QDesktopServices, QTextDocument
+from PySide6.QtCore import QMimeData, QSettings, QThread, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QDropEvent, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
 from .app_logging import log_event
 from .contracts import RunMode
 from .desktop import DesktopResponse, load_desktop_responses, load_desktop_web_sources
+from .ingress import acquire_named_file
 from .runtime import build_service
 from .schemas import RunRecord
 from .service import DialecticService
@@ -56,7 +57,7 @@ from .ui import (
     _prepare_run,
     _text_preview,
 )
-from .ui_config import SUPPORTED_EFFORTS
+from .ui_config import DEFAULT_LIMITS, SUPPORTED_EFFORTS
 
 _LOGGER = logging.getLogger("dialectic.desktop")
 _RUNTIME_LABELS = {
@@ -90,6 +91,46 @@ _MARKDOWN_FEATURES = (
     QTextDocument.MarkdownFeature.MarkdownDialectGitHub
     | QTextDocument.MarkdownFeature.MarkdownNoHTML
 )
+_PROMPT_FILE_SUFFIXES = {".md", ".markdown", ".txt"}
+
+
+class PromptEdit(QPlainTextEdit):
+    file_requested = Signal(str)
+
+    def _file_path(self, source: QMimeData) -> str | None:
+        urls = source.urls()
+        if self.isEnabled() and not self.isReadOnly() and len(urls) == 1:
+            url = urls[0]
+            if url.isLocalFile():
+                path = url.toLocalFile()
+                if Path(path).suffix.lower() in _PROMPT_FILE_SUFFIXES:
+                    return path
+        return None
+
+    def canInsertFromMimeData(self, source: QMimeData) -> bool:
+        if source.hasUrls():
+            return self._file_path(source) is not None
+        return super().canInsertFromMimeData(source)
+
+    def insertFromMimeData(self, source: QMimeData) -> None:
+        if source.hasUrls():
+            path = self._file_path(source)
+            if path is not None:
+                self.file_requested.emit(path)
+            return
+        super().insertFromMimeData(source)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        if event.mimeData().hasUrls():
+            if self._file_path(event.mimeData()) is None:
+                event.ignore()
+                return
+            # Importing text must never ask the drag source to move/delete its file.
+            event.setDropAction(Qt.DropAction.CopyAction)
+            self.insertFromMimeData(event.mimeData())
+            event.accept()
+            return
+        super().dropEvent(event)
 
 
 @dataclass(frozen=True, slots=True)
@@ -710,8 +751,23 @@ class MainWindow(QMainWindow):
         head.addStretch(1)
         head.addWidget(self.prompt_counter)
         layout.addLayout(head)
+        file_row = QHBoxLayout()
+        self.load_prompt_button = QPushButton("Load file…")
+        self.load_prompt_button.setToolTip(
+            "Replace the prompt with a UTF-8 .md, .markdown, or .txt file (up to 64 KiB)."
+        )
+        self.load_prompt_button.clicked.connect(self._browse_prompt_file)
+        file_hint = QLabel(
+            "Or drop a Markdown or text file into the editor. Ctrl+Z undoes replacement."
+        )
+        file_hint.setObjectName("Hint")
+        file_hint.setWordWrap(True)
+        file_row.addWidget(self.load_prompt_button)
+        file_row.addWidget(file_hint, 1)
+        layout.addLayout(file_row)
         self.prompt_tabs = QTabWidget()
-        self.prompt_edit = QPlainTextEdit()
+        self.prompt_edit = PromptEdit()
+        self.prompt_edit.file_requested.connect(self._load_prompt_file)
         self.prompt_edit.setPlaceholderText(
             "Describe the change, constraints, and verification you expect…"
         )
@@ -1009,6 +1065,50 @@ class MainWindow(QMainWindow):
         if selected:
             self.repository.setText(selected)
 
+    def _browse_prompt_file(self) -> None:
+        if self._running:
+            return
+        selected, _filter = QFileDialog.getOpenFileName(
+            self,
+            "Load prompt from file",
+            "",
+            "Markdown and text files (*.md *.markdown *.txt)",
+        )
+        if selected:
+            self._load_prompt_file(selected)
+
+    def _load_prompt_file(self, selected: str) -> None:
+        if self._running:
+            return
+        try:
+            path = Path(selected)
+            if path.suffix.lower() not in _PROMPT_FILE_SUFFIXES:
+                raise ValueError("Choose a .md, .markdown, or .txt file.")
+            data = acquire_named_file(
+                path, label="prompt file", ceiling=DEFAULT_LIMITS["max_input_bytes"]
+            )
+            try:
+                text = data.decode("utf-8-sig")
+            except UnicodeDecodeError as exc:
+                raise ValueError("Save the prompt file as UTF-8 text and try again.") from exc
+            if "\x00" in text:
+                raise ValueError("The prompt file contains binary data. Choose a text file.")
+            if not text.strip():
+                raise ValueError("The prompt file is empty. Choose a file containing text.")
+        except ValueError as exc:
+            QMessageBox.warning(self, "Could not load prompt", str(exc))
+            return
+        # One edit block preserves the previous draft as a single undo step.
+        cursor = self.prompt_edit.textCursor()
+        cursor.beginEditBlock()
+        cursor.select(QTextCursor.SelectionType.Document)
+        cursor.insertText(text)
+        cursor.endEditBlock()
+        cursor.setPosition(0)
+        self.prompt_edit.setTextCursor(cursor)
+        self.prompt_tabs.setCurrentWidget(self.prompt_edit)
+        self.prompt_edit.setFocus()
+
     def _prompt_changed(self) -> None:
         self.prompt_counter.setText(f"{len(self.prompt_edit.toPlainText()):,} characters")
         if self.prompt_tabs.currentWidget() is self.prompt_preview:
@@ -1171,6 +1271,7 @@ class MainWindow(QMainWindow):
             self.research_mode,
             self.max_dissenters,
             self.prompt_edit,
+            self.load_prompt_button,
             self.run_button,
         ):
             widget.setDisabled(running)
