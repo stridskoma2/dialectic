@@ -1169,3 +1169,90 @@ class PreflightResult(ClosedModel):
     resolved_requested_model: str | None
     actual_model: str | None
     authentication_verified: bool
+
+
+class DoctorTargetReport(ClosedModel):
+    role: Literal["driver", "reviewer", "participant", "moderator"]
+    target_id: str
+    target: AgentTarget
+    access_mode: Literal["driver-write", "packet-only"]
+    ready: bool
+    resolved_requested_model: str | None
+    resolved_executable: str | None
+    cli_version: str | None
+    adapter_fixture_version: str | None
+    prompt_transport: Literal["stdin", "acp-stdio"] | None
+    process_lifecycle: Literal["per-turn", "persistent-acp-session"] | None
+    capability_attestation_sha256: str | None
+    authentication_verified: bool
+    diagnostic: str | None
+
+    @model_validator(mode="after")
+    def readiness_is_evidenced(self) -> Self:
+        evidence = (
+            self.resolved_executable,
+            self.cli_version,
+            self.adapter_fixture_version,
+            self.prompt_transport,
+            self.process_lifecycle,
+            self.capability_attestation_sha256,
+        )
+        if self.ready:
+            if not self.authentication_verified or any(item is None for item in evidence):
+                raise ValueError("a ready doctor target requires complete preflight evidence")
+            if self.diagnostic is not None:
+                raise ValueError("a ready doctor target cannot carry a diagnostic")
+        elif self.authentication_verified or self.diagnostic is None:
+            raise ValueError("a failed doctor target requires only a diagnostic")
+        return self
+
+
+class DoctorReport(ClosedModel):
+    tool_version: str
+    mode: RunMode
+    config_sha256: str
+    state_root: str
+    healthy: bool
+    targets: list[DoctorTargetReport]
+
+    @model_validator(mode="after")
+    def health_matches_targets(self) -> Self:
+        if not self.targets:
+            raise ValueError("doctor requires at least one configured target")
+        if self.healthy != all(target.ready for target in self.targets):
+            raise ValueError("doctor health must match all target results")
+        return self
+
+
+class RunAuditIssue(ClosedModel):
+    severity: Literal["error", "warning"]
+    code: str = Field(pattern=r"^[A-Z][A-Z0-9_]{0,63}$")
+    path: str | None = Field(max_length=4_096)
+    detail: str = Field(min_length=1, max_length=4_096)
+
+
+class RunAuditReport(ClosedModel):
+    tool_version: str
+    run_id: str
+    valid: bool
+    complete: bool
+    status: RunStatus | None
+    files_checked: int = Field(ge=0)
+    bytes_checked: int = Field(ge=0)
+    events_checked: int = Field(ge=0)
+    attempts_checked: int = Field(ge=0)
+    manifest_sha256: str | None
+    issues: list[RunAuditIssue]
+
+    @model_validator(mode="after")
+    def result_matches_issues(self) -> Self:
+        if self.valid != all(issue.severity != "error" for issue in self.issues):
+            raise ValueError("audit validity must match its error issues")
+        if self.complete and (not self.valid or self.status not in {
+            "FINALIZED",
+            "FAILED",
+            "TIMED_OUT",
+            "CANCELLED",
+        }):
+            raise ValueError("a complete audit requires a valid terminal run")
+        return self

@@ -337,7 +337,7 @@ async def test_council_001_complete_three_participant_artifact_and_persistent_li
     def enable_live_web(data: dict[str, Any]) -> None:
         data["research_mode"] = "live-web"
 
-    record, handle, adapters, moderator, _store = await _scenario(
+    record, handle, adapters, moderator, store = await _scenario(
         tmp_path,
         limits,
         openings=openings,
@@ -418,6 +418,9 @@ async def test_council_001_complete_three_participant_artifact_and_persistent_li
     assert {event["payload"]["process_unit_id"] for event in persistent_events} == {
         by_phase["opening"].process_unit_id
     }
+    audit = DialecticService(store).audit_run(handle.run_id)
+    assert audit.valid and audit.complete, audit.model_dump_json(indent=2)
+    assert audit.attempts_checked == 10
 
     identity_root = tmp_path / "identity-change"
     neutral = (

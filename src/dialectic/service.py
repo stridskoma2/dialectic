@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Callable, Protocol, Sequence
 
 from .app_logging import log_event
+from .audit import OfflineRunAuditor
 from .config import ConfigError, ConfigLoader, decode_scalar_utf8, validate_mode
 from .contracts import (
     ARTIFACT_SCHEMA_VERSION,
@@ -28,13 +29,24 @@ from .redaction import (
     RedactionError,
     redact_config,
 )
-from .schemas import DialecticConfig, RunRecord, SummaryRecord, WorkspaceRecord
+from .schemas import (
+    DialecticConfig,
+    DoctorReport,
+    RunAuditReport,
+    RunRecord,
+    SummaryRecord,
+    WorkspaceRecord,
+)
 from .store import RunHandle, RunStore
 from .turn_timing import TURN_EXTENSION_SECONDS, TurnDeadlineController
 
 
 class RunExecutor(Protocol):
     async def __call__(self, context: "ExecutionContext") -> RunRecord: ...
+
+
+class DoctorExecutor(Protocol):
+    async def __call__(self, context: "DoctorContext") -> DoctorReport: ...
 
 
 CredentialProvider = Callable[[DialecticConfig, RunMode], KnownCredentials]
@@ -65,6 +77,16 @@ class ExecutionContext:
     turn_deadlines: TurnDeadlineController
 
 
+@dataclass(frozen=True, slots=True)
+class DoctorContext:
+    mode: RunMode
+    config: DialecticConfig
+    config_sha256: str
+    credentials: KnownCredentials
+    store: RunStore
+    tool_version: str
+
+
 class DialecticFailure(RuntimeError):
     def __init__(self, kind: FailureKind, detail: str) -> None:
         self.kind = kind
@@ -85,6 +107,7 @@ class DialecticService:
         credential_provider: CredentialProvider | None = None,
         code_executor: RunExecutor | None = None,
         council_executor: RunExecutor | None = None,
+        doctor_executor: DoctorExecutor | None = None,
     ) -> None:
         self.store = store
         self._config_loader = config_loader or ConfigLoader()
@@ -93,6 +116,7 @@ class DialecticService:
             "code": code_executor,
             "council": council_executor,
         }
+        self._doctor_executor = doctor_executor
         self._progress_observer: ProgressObserver | None = None
         self._deadline_lock = threading.RLock()
         self._active_deadlines: dict[str, TurnDeadlineController] = {}
@@ -100,6 +124,33 @@ class DialecticService:
     def set_progress_observer(self, observer: ProgressObserver | None) -> None:
         """Set the non-authoritative presentation observer for durable transitions."""
         self._progress_observer = observer
+
+    async def doctor(self, *, config_bytes: bytes, mode: RunMode) -> DoctorReport:
+        """Qualify configured native targets without creating a workflow run."""
+
+        loaded = self._config_loader.load(config_bytes, mode=mode)
+        credentials = self._credential_provider(loaded.config, mode)
+        credentials.validate_stream_limits(
+            stdout_bytes=loaded.config.limits.max_agent_stdout_bytes,
+            stderr_bytes=loaded.config.limits.max_agent_stderr_bytes,
+        )
+        if self._doctor_executor is None:
+            raise RuntimeError("native doctor is not configured")
+        return await self._doctor_executor(
+            DoctorContext(
+                mode=mode,
+                config=loaded.config,
+                config_sha256=loaded.source_sha256,
+                credentials=credentials,
+                store=self.store,
+                tool_version=TOOL_VERSION,
+            )
+        )
+
+    def audit_run(self, run_id: str) -> RunAuditReport:
+        """Return a bounded, non-mutating integrity report for retained evidence."""
+
+        return OfflineRunAuditor(self.store).audit(run_id)
 
     def turn_deadline_snapshot(self, run_id: str) -> dict[str, object]:
         """Return a presentation-only snapshot of controller-owned turn deadlines."""

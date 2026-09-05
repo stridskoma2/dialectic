@@ -7,6 +7,7 @@ import os
 from .native_runtime import (
     NativeCodeExecutor,
     NativeCouncilExecutor,
+    NativeDoctor,
     native_credentials,
 )
 from .service import DialecticService
@@ -22,4 +23,5 @@ def build_service() -> DialecticService:
         ),
         code_executor=NativeCodeExecutor(source_environment=environment),
         council_executor=NativeCouncilExecutor(source_environment=environment),
+        doctor_executor=NativeDoctor(source_environment=environment),
     )

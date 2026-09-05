@@ -140,6 +140,12 @@ dial council --config dialectic.yaml --prompt-file prompt.md
 
 # Inspect any run
 dial status <run-id>
+
+# Qualify the configured native targets without starting a workflow run
+dial doctor --config dialectic.yaml --mode code
+
+# Validate retained evidence without modifying or repairing it
+dial audit <run-id>
 ```
 
 Example inputs are in [examples/task.md](examples/task.md) and
@@ -147,6 +153,20 @@ Example inputs are in [examples/task.md](examples/task.md) and
 must be scalar-value UTF-8 without a BOM. Limits are controller-enforced; the
 example uses the normative v0.1 defaults. Commands print concise persisted
 phase/status transitions and a final summary, not raw model event streams.
+
+`dial doctor` applies the same active-mode configuration, native-version,
+authentication, policy, and capability preflight used by a real run. It creates no
+run record and launches no workflow turn, but a missing cached capability
+attestation can trigger the same opt-in, potentially cost-bearing native probe used
+by release qualification. Use `--mode code` or `--mode council`; add `--json` for a
+machine-readable report.
+
+`dial audit <run-id>` is offline and read-only. It checks the retained run schemas,
+canonical JSON, event order, summaries, artifact and stream hashes, native request
+links, capability attestations, workflow completeness, and unsafe link/reparse or
+hard-link evidence. It never repairs evidence. A valid in-progress run is reported
+as incomplete; integrity failures return exit code 3. Add `--json` to emit the typed
+report.
 
 ## Runs, artifacts, and cleanup
 

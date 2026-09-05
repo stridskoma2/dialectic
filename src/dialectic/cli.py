@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from enum import Enum
 from pathlib import Path
 from typing import Callable
 
@@ -17,14 +18,21 @@ from .app_logging import (
     log_event,
 )
 from .contracts import exit_code_for
+from .config import ConfigError
 from .ingress import InputAcquisitionError, acquire_named_file
+from .redaction import CredentialBoundaryError
 from .runtime import build_service
-from .schemas import RunRecord, WorkspaceRecord
+from .schemas import DoctorReport, RunAuditReport, RunRecord, WorkspaceRecord
 from .service import DialecticService
 from .store import BootstrapError, InvalidRunIdError, RunNotFoundError, StateCorruptError
 
 ServiceFactory = Callable[[], DialecticService]
 _LOGGER = logging.getLogger("dialectic.cli")
+
+
+class DiagnosticMode(str, Enum):
+    code = "code"
+    council = "council"
 
 
 def create_app(service_factory: ServiceFactory = build_service) -> typer.Typer:
@@ -116,6 +124,50 @@ def create_app(service_factory: ServiceFactory = build_service) -> typer.Typer:
             workspace=workspace,
         )
 
+    @app.command()
+    def doctor(
+        config: Path = typer.Option(..., "--config", dir_okay=False),
+        mode: DiagnosticMode = typer.Option(..., "--mode", case_sensitive=False),
+        json_output: bool = typer.Option(False, "--json"),
+    ) -> None:
+        """Validate configuration, native CLIs, authentication, and capabilities."""
+
+        service = service_factory()
+        try:
+            config_bytes = acquire_named_file(config, label="configuration")
+            report = asyncio.run(
+                service.doctor(config_bytes=config_bytes, mode=mode.value)
+            )
+        except (InputAcquisitionError, ConfigError, CredentialBoundaryError) as exc:
+            console.print(str(exc))
+            raise typer.Exit(2) from exc
+        except Exception as exc:
+            console.print(f"doctor failed: {type(exc).__name__}")
+            raise typer.Exit(3) from exc
+        _print_doctor(console, report, json_output=json_output)
+        if not report.healthy:
+            raise typer.Exit(2)
+
+    @app.command()
+    def audit(
+        run_id: str,
+        json_output: bool = typer.Option(False, "--json"),
+    ) -> None:
+        """Audit retained run evidence without changing or repairing it."""
+
+        service = service_factory()
+        try:
+            report = service.audit_run(run_id)
+        except (InvalidRunIdError, RunNotFoundError) as exc:
+            console.print(str(exc))
+            raise typer.Exit(2) from exc
+        except Exception as exc:
+            console.print(f"audit failed: {type(exc).__name__}")
+            raise typer.Exit(3) from exc
+        _print_audit(console, report, json_output=json_output)
+        if not report.valid:
+            raise typer.Exit(3)
+
     return app
 
 
@@ -143,6 +195,61 @@ def main() -> None:
 
 def _print_progress(console: Console, record: RunRecord) -> None:
     console.print(f"{record.run_id}  {record.phase or '-'}  {record.status}")
+
+
+def _print_doctor(
+    console: Console, report: DoctorReport, *, json_output: bool
+) -> None:
+    if json_output:
+        console.print(
+            report.model_dump_json(indent=2),
+            highlight=False,
+            markup=False,
+            soft_wrap=True,
+        )
+        return
+    console.print(f"doctor  {report.mode}  {'READY' if report.healthy else 'NOT READY'}")
+    console.print(f"config sha256: {report.config_sha256}")
+    console.print(f"state root: {report.state_root}", soft_wrap=True)
+    for target in report.targets:
+        label = f"{target.role}/{target.target_id}"
+        if not target.ready:
+            console.print(f"[FAIL] {label}  {target.target.runtime}: {target.diagnostic}")
+            continue
+        console.print(
+            f"[OK] {label}  {target.target.runtime} {target.cli_version}  "
+            f"{target.prompt_transport}/{target.process_lifecycle}"
+        )
+        console.print(f"     executable: {target.resolved_executable}", soft_wrap=True)
+        console.print(
+            f"     fixture: {target.adapter_fixture_version}; "
+            f"attestation: {target.capability_attestation_sha256}"
+        )
+
+
+def _print_audit(
+    console: Console, report: RunAuditReport, *, json_output: bool
+) -> None:
+    if json_output:
+        console.print(
+            report.model_dump_json(indent=2),
+            highlight=False,
+            markup=False,
+            soft_wrap=True,
+        )
+        return
+    result = "VALID" if report.valid else "INVALID"
+    completeness = "complete" if report.complete else "incomplete"
+    console.print(f"{report.run_id}  {report.status or '-'}  {result} ({completeness})")
+    console.print(
+        f"checked: {report.files_checked} run files, {report.events_checked} events, "
+        f"{report.attempts_checked} attempts, {report.bytes_checked} bytes"
+    )
+    if report.manifest_sha256 is not None:
+        console.print(f"evidence manifest sha256: {report.manifest_sha256}")
+    for issue in report.issues:
+        location = f" [{issue.path}]" if issue.path is not None else ""
+        console.print(f"{issue.severity.upper()} {issue.code}{location}: {issue.detail}")
 
 
 def _print_record(

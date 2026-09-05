@@ -359,6 +359,15 @@ async def test_code_001_happy_path_two_reviewers_return_findings(
     summary_text = (handle.path / "summary.md").read_text(encoding="utf-8")
     assert "Repair turn: performed." in summary_text
     assert "post-repair state has not been re-reviewed" in summary_text
+    audit = DialecticService(store).audit_run(handle.run_id)
+    assert audit.valid and audit.complete, audit.model_dump_json(indent=2)
+    assert audit.attempts_checked == 4
+    (handle.path / "turns/reviewer/reviewer-a/review.stdout.txt").write_bytes(
+        b"tampered"
+    )
+    tampered = DialecticService(store).audit_run(handle.run_id)
+    assert not tampered.valid
+    assert any(issue.code == "STREAM_HASH_MISMATCH" for issue in tampered.issues)
 
 
 @pytest.mark.asyncio
