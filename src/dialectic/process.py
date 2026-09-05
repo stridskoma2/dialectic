@@ -10,7 +10,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, BinaryIO, Callable, Literal, Mapping, Protocol, Sequence
+from typing import Any, Awaitable, BinaryIO, Callable, Iterable, Literal, Mapping, Protocol, Sequence
 
 from .contracts import FailureKind
 from .launcher import DirectLaunchSpec, LaunchSpec, WindowsBatchLaunchSpec
@@ -19,6 +19,29 @@ MAX_READER_CHUNK_BYTES = 65_536
 EXTENDED_STARTUPINFO_PRESENT = 0x0008_0000
 CREATE_SUSPENDED = 0x0000_0004
 CREATE_UNICODE_ENVIRONMENT = 0x0000_0400
+
+
+async def cancel_and_wait(tasks: Iterable[asyncio.Future[Any]]) -> list[Any]:
+    """Drain owned work without hiding cleanup failure behind cancellation."""
+    owned = tuple(tasks)
+    for task in owned:
+        if not task.done() and not (isinstance(task, asyncio.Task) and task.cancelling()):
+            task.cancel()
+    drained = asyncio.gather(*owned, return_exceptions=True)
+    cancelled = False
+    while not drained.done():
+        try:
+            await asyncio.shield(drained)
+        except asyncio.CancelledError:
+            # A second cancellation must not interrupt native process cleanup.
+            cancelled = True
+    results = drained.result()
+    for result in results:
+        if isinstance(result, BaseException) and getattr(result, "kind", None) == "PROCESS_CLEANUP_FAILED":
+            raise result
+    if cancelled:
+        raise asyncio.CancelledError
+    return results
 
 
 class ProcessUnit(Protocol):
@@ -75,15 +98,15 @@ class ProcessSupervisor:
 
             if reason != "completed":
                 graceful_delivered = await unit.request_graceful_termination()
-                if graceful_delivered is False:
-                    await unit.force_terminate()
-                else:
+                if graceful_delivered is not False:
                     try:
                         await asyncio.wait_for(
                             asyncio.shield(root_wait), timeout=graceful_kill_seconds
                         )
                     except TimeoutError:
-                        await unit.force_terminate()
+                        pass
+                # Root exit does not prove that descendants accepted the signal.
+                await unit.force_terminate()
             else:
                 # Spec section 10.4 requires signaling the owned process group after
                 # normal root exit so lingering members cannot survive persistence.

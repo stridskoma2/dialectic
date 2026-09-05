@@ -36,7 +36,7 @@ from dialectic.schemas import (
 )
 from dialectic.service import DialecticService
 from dialectic.store import RunStore, canonical_json_bytes
-from dialectic.turn_timing import TurnDeadlineExpired
+from dialectic.turn_timing import TurnDeadlineController, TurnDeadlineExpired
 from dialectic.workflow_evidence import canonical_mapping_bytes
 
 
@@ -610,7 +610,7 @@ async def test_council_010_zero_dissenters_and_one_abstention_is_contested(tmp_p
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["opening", "cross-examination", "ballot"])
 async def test_council_011_participant_failure_reaps_active_and_retained_peers(
-    tmp_path: Path, limits: dict[str, int], phase: str
+    tmp_path: Path, limits: dict[str, int], phase: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     participant_error: BaseException = RuntimeError("participant failed")
     error_index = 0
@@ -682,6 +682,46 @@ async def test_council_011_participant_failure_reaps_active_and_retained_peers(
         assert not list(handle.path.glob("council/cross-examination/*.json"))
     elif later == "candidate":
         assert not (handle.path / "council/candidate.json").exists()
+
+    if phase == "ballot":
+        for cleanup_fails in (False, True):
+            def close_on_cancel(adapters):  # type: ignore[no-untyped-def]
+                adapter = adapters[2]
+                original = adapter.resume
+
+                async def resume(session_id, request):  # type: ignore[no-untyped-def]
+                    try:
+                        return await original(session_id, request)
+                    except asyncio.CancelledError:
+                        await adapter.close_retained_session(session_id, "cancelled")
+                        raise
+
+                adapter.resume = resume
+
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    "dialectic.service.TurnDeadlineController",
+                    lambda: TurnDeadlineController(idle_seconds=0.02),
+                )
+                failed, failed_handle, *_ = await _scenario(
+                    tmp_path / f"native-timeout-{cleanup_fails}", limits,
+                    delays={(2, "ballot"): 5}, adapter_mutator=close_on_cancel,
+                    persistent_close_error=(
+                        NativeTurnError("PROCESS_CLEANUP_FAILED", "owned child remains")
+                        if cleanup_fails else None
+                    ),
+                )
+            attempt = TurnAttemptArtifact.model_validate_json(
+                (failed_handle.path / "turns/participant/participant-c/ballot.attempt.json").read_bytes(),
+                strict=True,
+            )
+            expected = "PROCESS_CLEANUP_FAILED" if cleanup_fails else "NO_QUORUM"
+            assert (failed.status, failed.failure_kind) == ("FAILED", expected)
+            assert attempt.failure_kind == expected
+            assert attempt.attempt_end_reason == ("cleanup-failed" if cleanup_fails else "timeout")
+            if not cleanup_fails:
+                assert "no observable provider activity" in attempt.bounded_diagnostic
+                assert "CancelledError" not in attempt.bounded_diagnostic
 
 
 @pytest.mark.asyncio
@@ -756,6 +796,36 @@ async def test_council_013_overall_timeout_waits_for_retained_cleanup_and_cleanu
         ),
     )
     assert (record2.status, record2.failure_kind) == ("FAILED", "PROCESS_CLEANUP_FAILED")
+
+    active = asyncio.Event()
+
+    def cleanup_during_active_turn(adapters):  # type: ignore[no-untyped-def]
+        adapter = adapters[2]
+        original = adapter.resume
+
+        async def resume(session_id, request):  # type: ignore[no-untyped-def]
+            active.set()
+            try:
+                return await original(session_id, request)
+            except asyncio.CancelledError:
+                await adapter.close_retained_session(session_id, "cancelled")
+                raise
+
+        adapter.resume = resume
+
+    cancellation = asyncio.create_task(_scenario(
+        tmp_path / "active-cancellation", limits,
+        delays={(2, "cross-examination"): 5}, adapter_mutator=cleanup_during_active_turn,
+        persistent_close_error=NativeTurnError("PROCESS_CLEANUP_FAILED", "owned child remains"),
+    ))
+    await active.wait()
+    cancellation.cancel()
+    cancelled_record, cancelled_handle, *_ = await cancellation
+    assert (cancelled_record.status, cancelled_record.failure_kind) == ("FAILED", "PROCESS_CLEANUP_FAILED")
+    cancelled_attempt = TurnAttemptArtifact.model_validate_json(
+        (cancelled_handle.path / "turns/participant/participant-c/cross-examination.attempt.json").read_bytes()
+    )
+    assert cancelled_attempt.process_disposition == "cleanup-failed"
 
 
 @pytest.mark.asyncio

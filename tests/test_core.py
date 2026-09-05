@@ -61,6 +61,7 @@ from dialectic.locking import (
     resolve_repository_identity,
 )
 from dialectic.output import OutputError, extract_model_payload
+from dialectic.native_adapters import NativeTurnError
 from dialectic.process import (
     CREATE_SUSPENDED,
     CREATE_UNICODE_ENVIRONMENT,
@@ -258,7 +259,9 @@ def test_core_006_known_value_redaction_and_short_credential_preflight(
 
 
 @pytest.mark.asyncio
-async def test_core_007_timeout_reaps_owned_descendant_before_sentinel() -> None:
+async def test_core_007_timeout_reaps_owned_descendant_before_sentinel(
+    tmp_path: Path, config_data: dict[str, object]
+) -> None:
     sentinel: list[str] = []
     unit = FakeProcessUnit(
         root_delay=2,
@@ -276,20 +279,33 @@ async def test_core_007_timeout_reaps_owned_descendant_before_sentinel() -> None
     assert unit.forced
     assert sentinel == []
 
+    class GracefulRootWithStubbornChild(FakeProcessUnit):
+        async def _run_root(self) -> int:
+            while not self.graceful_requested:
+                await asyncio.sleep(0)
+            return 0
+
+    graceful_root = GracefulRootWithStubbornChild(root_delay=1, sentinel_delay=0.2)
+    graceful_result = await ProcessSupervisor().supervise(
+        graceful_root, turn_timeout_seconds=0.01, graceful_kill_seconds=0.02
+    )
+    assert graceful_result.cleanup_confirmed
+    assert graceful_root.forced
+
     request = AgentRequest.model_construct(
         role="participant",
         target_id="participant-a",
         turn_phase="opening",
         prompt="test",
         output_schema=None,
-        timeout_seconds=0.02,
+        timeout_seconds=0.2,
         working_directory=".",
         access_mode="packet-only",
     )
-    controller = TurnDeadlineController(idle_seconds=0.05, maximum_turn_seconds=0.3)
+    controller = TurnDeadlineController(idle_seconds=0.2, maximum_turn_seconds=3.0)
 
     async def completes_after_extension() -> str:
-        await asyncio.sleep(0.04)
+        await asyncio.sleep(0.3)
         return "completed"
 
     extended = asyncio.create_task(
@@ -297,11 +313,11 @@ async def test_core_007_timeout_reaps_owned_descendant_before_sentinel() -> None
     )
     await asyncio.sleep(0.01)
     assert controller.snapshot()["remainingSeconds"] > 0
-    assert controller.extend_active(0.03)["extendedTurns"] == 1
+    assert controller.extend_active(0.3)["extendedTurns"] == 1
     assert await extended == "completed"
 
     ceiling_request = request.model_copy(
-        update={"target_id": "participant-ceiling", "timeout_seconds": 0.3}
+        update={"target_id": "participant-ceiling", "timeout_seconds": 3.0}
     )
     at_ceiling = asyncio.create_task(
         controller.wait_for(ceiling_request, "claude-code", asyncio.sleep(0.01))
@@ -311,7 +327,7 @@ async def test_core_007_timeout_reaps_owned_descendant_before_sentinel() -> None
     assert controller.extend_active(0.03)["extendedTurns"] == 0
     await at_ceiling
 
-    streaming_request = request.model_copy(update={"timeout_seconds": 0.2})
+    streaming_request = request.model_copy(update={"timeout_seconds": 1.0})
     activity = controller.activity_callback(streaming_request)
 
     async def streaming_response() -> str:
@@ -328,6 +344,53 @@ async def test_core_007_timeout_reaps_owned_descendant_before_sentinel() -> None
     with pytest.raises(TurnDeadlineExpired, match="no observable provider activity") as error:
         await controller.wait_for(streaming_request, "codex", asyncio.Event().wait())
     assert error.value.reason == "idle"
+
+    started = asyncio.Event()
+
+    async def ongoing() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    async def executor(context):  # type: ignore[no-untyped-def]
+        await context.turn_deadlines.wait_for(
+            request.model_copy(update={"timeout_seconds": 600}), "claude-code", ongoing()
+        )
+
+    service = DialecticService(RunStore(tmp_path / "extension"), code_executor=executor)
+    handle = service.create_run("code")
+    execution = asyncio.create_task(service.execute_code_once(
+        handle, config_bytes=yaml.safe_dump(config_data).encode(),
+        task_bytes=b"extension test", repository_path=tmp_path,
+    ))
+    await started.wait()
+    snapshot = service.extend_turn_deadlines(handle.run_id)
+    assert snapshot["extendedTurns"] == 1
+    assert snapshot["remainingSeconds"] > 899
+    execution.cancel()
+    assert (await execution).status == "CANCELLED"
+
+    for runtime, elapsed in (("claude-code", 2.0), ("codex", 0.6)):
+        clock = [0.0]
+        expired = TurnDeadlineController(idle_seconds=0.5, monotonic=lambda: clock[0])
+        pending = asyncio.get_running_loop().create_future()
+        long_request = request.model_copy(update={"timeout_seconds": 1})
+        waiter = asyncio.create_task(expired.wait_for(long_request, runtime, pending))
+        await asyncio.sleep(0)
+        clock[0] = elapsed
+        expired.activity_callback(long_request)()
+        assert expired.snapshot()["canExtend"] is False
+        assert expired.extend_active()["extendedTurns"] == 0
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+    completed = TurnDeadlineController()
+    pending = asyncio.get_running_loop().create_future()
+    waiter = asyncio.create_task(completed.wait_for(long_request, "codex", pending))
+    await asyncio.sleep(0)
+    pending.set_result("done")
+    assert completed.extend_active()["extendedTurns"] == 0
+    assert await waiter == "done"
 
 
 @pytest.mark.asyncio
@@ -905,6 +968,51 @@ async def test_core_019_unconfirmed_tree_cleanup_overrides_timeout() -> None:
     assert retained.process_disposition == "retained-for-session"
     assert retained.failure_kind is None
 
+    overflow_capture = BoundedStreamCapture(
+        256, KnownCredentials([KnownCredential("TOKEN", "secretvalue")])
+    )
+    overflow_capture.feed(b"x" * 257)
+    failed_payload = retained.model_dump(mode="python")
+    failed_payload.update(
+        stdout=overflow_capture.finish().result,
+        response=None, response_completed_at=None,
+        attempt_end_reason="cleanup-failed", failure_kind="PROCESS_CLEANUP_FAILED",
+        process_disposition="cleanup-failed",
+    )
+    failed = TurnAttemptArtifact.model_validate(failed_payload)
+    assert failed.stdout.discarded_guard_reason == "overflow"
+    assert failed.failure_kind == "PROCESS_CLEANUP_FAILED"
+
+    for trigger in ("deadline", "cancel"):
+        cleanup_started = asyncio.Event()
+        finish_cleanup = asyncio.Event()
+
+        async def cleanup_failure() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleanup_started.set()
+                await finish_cleanup.wait()
+                raise NativeTurnError("PROCESS_CLEANUP_FAILED", "owned child remains")
+
+        request = AgentRequest.model_construct(
+            role="participant", target_id="participant-a", turn_phase="opening",
+            timeout_seconds=0.02, prompt="test", working_directory=".",
+            access_mode="packet-only", output_schema=None,
+        )
+        controller = TurnDeadlineController()
+        waiter = asyncio.create_task(controller.wait_for(request, "codex", cleanup_failure()))
+        await asyncio.sleep(0.001)
+        if trigger == "cancel":
+            waiter.cancel()
+        await cleanup_started.wait()
+        assert controller.extend_active()["extendedTurns"] == 0
+        waiter.cancel()  # Repeated cancellation must still drain native cleanup.
+        finish_cleanup.set()
+        with pytest.raises(NativeTurnError) as failure:
+            await waiter
+        assert failure.value.kind == "PROCESS_CLEANUP_FAILED"
+
 
 def test_core_020_absent_actual_model_is_recorded_without_mismatch() -> None:
     response = make_response(actual_model=None)
@@ -1249,6 +1357,7 @@ def test_core_026_failure_and_bounded_ingress_contracts(
     for offset, invalid_config, invalid_task in (
         (30, config_bytes, b"\xff"),
         (31, b"version: 1\nunexpected: true\n", b"task"),
+        (33, b"driver:\n  model: ${" + b"A" * 5000 + b"}\n", b"task"),
     ):
         service = DialecticService(
             RunStore(
@@ -1265,6 +1374,7 @@ def test_core_026_failure_and_bounded_ingress_contracts(
             )
         )
         assert (record.status, record.failure_kind) == ("FAILED", "INVALID_INPUT")
+        assert len(record.failure_detail.encode("utf-8")) <= 4096
 
     class TrackingService(DialecticService):
         invalid_input_calls = 0
@@ -1373,12 +1483,18 @@ def test_core_027_stream_scratch_and_cleanup_bounds(tmp_path: Path) -> None:
         for _ in range(1_100):
             cursor /= "d"
             cursor.mkdir()
+        # Accounting, like cleanup, must not depend on Python's recursion limit.
+        deep_usage = scan_scratch(deep_root, ScratchLimits(100, 2_000, 2_000))
+        assert deep_usage.within_limits
+        assert deep_usage.maximum_depth == 1_100
         cleanup_reserved_tree(deep_root, timeout_seconds=10)
         assert not os.path.lexists(deep_root)
 
 
 @pytest.mark.asyncio
-async def test_core_028_windows_reader_handoff_is_byte_and_callback_bounded() -> None:
+async def test_core_028_windows_reader_handoff_is_byte_and_callback_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class ChunkedPipe:
         def __init__(self, chunks: list[bytes]) -> None:
             self._chunks = chunks
@@ -1404,6 +1520,40 @@ async def test_core_028_windows_reader_handoff_is_byte_and_callback_bounded() ->
             time.sleep(0.001)
 
     loop = asyncio.get_running_loop()
+    controller = TurnDeadlineController()
+    request = AgentRequest.model_construct(
+        role="driver", target_id="driver", turn_phase="initial",
+        timeout_seconds=60, prompt="test", working_directory=".",
+        access_mode="driver-write", output_schema=None,
+    )
+    invocation = loop.create_future()
+    waiter = asyncio.create_task(controller.wait_for(request, "codex", invocation))
+    await asyncio.sleep(0)
+    activity = controller.activity_callback(request)
+    queued: list[object] = []
+    original_schedule = loop.call_soon_threadsafe
+
+    def track_schedule(callback, *args, **kwargs):  # type: ignore[no-untyped-def]
+        queued.append(callback)
+        return original_schedule(callback, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(loop, "call_soon_threadsafe", track_schedule)
+        small_reads = WindowsReaderHandoff(
+            limit_bytes=20_000, queue_capacity_bytes=20_000,
+            coordinator=ReaderHandoffCoordinator(), notify=lambda: None,
+            loop=loop, on_activity=activity,
+        )
+        reader = threading.Thread(target=small_reads.read_pipe, args=(ChunkedPipe([b"x"] * 10_000),))
+        reader.start()
+        reader.join(timeout=5)  # Hold the loop still while the real reader emits activity.
+        assert not reader.is_alive()
+        assert len(queued) <= 3  # One activity wakeup plus data and terminal notifications.
+        assert small_reads.peak_queued_bytes == 10_000
+    invocation.set_result(None)
+    await waiter
+    activity()  # A callback retained by a reader is inert after deregistration.
+
     stalled_coordinator = ReaderHandoffCoordinator()
     stalled_notifications: list[str] = []
     stdout = WindowsReaderHandoff(

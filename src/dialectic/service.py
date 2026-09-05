@@ -30,7 +30,7 @@ from .redaction import (
 )
 from .schemas import DialecticConfig, RunRecord, SummaryRecord, WorkspaceRecord
 from .store import RunHandle, RunStore
-from .turn_timing import TurnDeadlineController
+from .turn_timing import TURN_EXTENSION_SECONDS, TurnDeadlineController
 
 
 class RunExecutor(Protocol):
@@ -125,7 +125,7 @@ class DialecticService:
             logging.INFO,
             "turn.deadline_extended",
             run_id=run_id,
-            seconds=int(seconds),
+            seconds=int(TURN_EXTENSION_SECONDS),
             extended_turns=snapshot["extendedTurns"],
         )
         return snapshot
@@ -203,7 +203,7 @@ class DialecticService:
                 )
             input_text = decode_scalar_utf8(input_bytes, input_name)
         except ConfigError as exc:
-            return self.fail_invalid_input(handle, str(exc))
+            return self.fail_invalid_input(handle, _bounded_detail(str(exc)))
 
         try:
             credentials = self._credential_provider(loaded.config, mode)

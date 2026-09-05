@@ -48,6 +48,8 @@ from .schemas import (
     RunRecord,
     WorkspaceRecord,
 )
+from .process import cancel_and_wait
+from .scratch import ScratchLimitExceeded
 from .service import DialecticFailure, ExecutionContext, WorkflowTimedOut
 from .turn_workspace import (
     TurnWorkspace,
@@ -675,18 +677,14 @@ class CodeOnceOrchestrator:
                 )
                 if failure is not None:
                     peer_failure.set()
-                    for task in pending:
-                        task.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
+                    await cancel_and_wait(tasks)
                     if isinstance(failure, DialecticFailure):
                         raise failure
                     raise DialecticFailure("REVIEW_FAILED", "reviewer cohort failed") from failure
             return [task.result() for task in tasks]
         except asyncio.CancelledError:
             peer_failure.set()
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
+            await cancel_and_wait(tasks)
             raise
 
     def _bind_driver(
@@ -753,7 +751,13 @@ class CodeOnceOrchestrator:
             raise DialecticFailure(
                 "PROCESS_CLEANUP_FAILED", detail
             ) from exc
+        except ScratchLimitExceeded as exc:
+            if isinstance(trigger, DialecticFailure) and trigger.kind == "PROCESS_CLEANUP_FAILED":
+                raise trigger
+            raise DialecticFailure("AGENT_OUTPUT_TOO_LARGE", str(exc)) from exc
         except TurnWorkspaceError as exc:
+            if isinstance(trigger, DialecticFailure) and trigger.kind == "PROCESS_CLEANUP_FAILED":
+                raise trigger
             detail = "reserved driver workspace validation failed"
             if trigger_label is not None:
                 detail += f"; initiating failure: {trigger_label}"

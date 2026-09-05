@@ -29,6 +29,7 @@ from .native_adapters import (
     NativeTurnError,
 )
 from .research import persist_source_citations
+from .scratch import ScratchContainmentError, ScratchLimitExceeded, ScratchLimits, with_scratch_monitor
 from .schemas import (
     AgentRequest,
     AgentRequestArtifact,
@@ -340,6 +341,16 @@ class WorkflowEvidenceSupport:
                 if operation == "start"
                 else adapter.resume(session_id or "", request)
             )
+            if access_mode == "driver-write":
+                invocation = with_scratch_monitor(
+                    invocation,
+                    working_directory / ".dialectic-turn" / "tmp",
+                    ScratchLimits(
+                        context.config.limits.max_turn_scratch_bytes,
+                        context.config.limits.max_turn_scratch_entries,
+                        context.config.limits.max_turn_scratch_depth,
+                    ),
+                )
             raw_response = await context.turn_deadlines.wait_for(
                 request, target.runtime, invocation
             )
@@ -361,6 +372,16 @@ class WorkflowEvidenceSupport:
                     "agent response target does not match the immutable request",
                 )
             response = redacted_response(response, context)
+        except ScratchLimitExceeded as exc:
+            termination = "output-limit"
+            attempt_failure = "AGENT_OUTPUT_TOO_LARGE"
+            diagnostic = str(exc)
+            caught = exc
+        except ScratchContainmentError as exc:
+            termination = "agent-failed"
+            attempt_failure = "INTERNAL_ERROR"
+            diagnostic = str(exc)
+            caught = exc
         except asyncio.TimeoutError as exc:
             termination = "timeout"
             attempt_failure = failure_kind
@@ -479,6 +500,8 @@ class WorkflowEvidenceSupport:
                 attempt_failure = evidence.failure_kind  # type: ignore[assignment]
             if evidence.bounded_diagnostic is not None and diagnostic is None:
                 diagnostic = evidence.bounded_diagnostic
+            if attempt_end_reason == "cancelled" and termination in {"timeout", "peer-failure", "output-limit"}:
+                attempt_end_reason = termination
             if process_disposition == "cleanup-failed":
                 attempt_failure = "PROCESS_CLEANUP_FAILED"
                 attempt_end_reason = "cleanup-failed"

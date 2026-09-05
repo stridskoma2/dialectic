@@ -9,7 +9,11 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, TypeVar
+
+from .process import cancel_and_wait
+
+_T = TypeVar("_T")
 
 
 class ScratchError(RuntimeError):
@@ -131,84 +135,97 @@ def _scan_scratch_posix(
         root_fd = os.open(root, flags)
     except OSError as exc:
         raise ScratchContainmentError("scratch root cannot be opened safely") from exc
-    state: dict[str, int | str | None] = {
-        "bytes": 0,
-        "entries": 0,
-        "depth": 0,
-        "overage": None,
-        "invalid": None,
-    }
-
-    def scan(directory_fd: int, depth: int) -> None:
-        for name in os.listdir(directory_fd):
-            child_depth = depth + 1
-            state["entries"] = int(state["entries"]) + 1
-            if int(state["entries"]) > limits.max_entries:
-                state["entries"] = limits.max_entries + 1
-                state["overage"] = "entries"
-                return
-            state["depth"] = max(int(state["depth"]), child_depth)
-            if int(state["depth"]) > limits.max_depth:
-                state["depth"] = limits.max_depth + 1
-                state["overage"] = "depth"
-                return
-            try:
-                information = os.stat(
-                    name, dir_fd=directory_fd, follow_symlinks=False
-                )
-            except OSError as exc:
-                raise ScratchContainmentError(
-                    "scratch entry identity changed during traversal"
-                ) from exc
-            if stat.S_ISLNK(information.st_mode):
-                state["invalid"] = state["invalid"] or "link-or-reparse"
-            elif stat.S_ISDIR(information.st_mode):
-                try:
-                    child_fd = os.open(name, flags, dir_fd=directory_fd)
-                except OSError as exc:
-                    raise ScratchContainmentError(
-                        "scratch directory cannot be opened safely"
-                    ) from exc
-                try:
-                    opened = os.fstat(child_fd)
-                    if (opened.st_dev, opened.st_ino) != (
-                        information.st_dev,
-                        information.st_ino,
-                    ):
-                        raise ScratchContainmentError(
-                            "scratch directory identity changed during traversal"
-                        )
-                    scan(child_fd, child_depth)
-                finally:
-                    os.close(child_fd)
-                if state["overage"] is not None:
-                    return
-            elif stat.S_ISREG(information.st_mode):
-                state["bytes"] = min(
-                    limits.max_bytes + 1,
-                    int(state["bytes"]) + information.st_size,
-                )
-                if int(state["bytes"]) > limits.max_bytes:
-                    state["bytes"] = limits.max_bytes + 1
-                    state["overage"] = "bytes"
-                    return
-            else:
-                state["invalid"] = state["invalid"] or "special-file"
-
+    byte_count = entry_count = maximum_depth = 0
+    invalid_type: str | None = None
+    overage: str | None = None
+    stack: list[tuple[int, Iterator[os.DirEntry[str]], int]] = []
     try:
         opened_root = os.fstat(root_fd)
         if (opened_root.st_dev, opened_root.st_ino) != root_identity:
             raise ScratchContainmentError("scratch root identity changed during traversal")
-        scan(root_fd, 0)
+        stack.append((root_fd, os.scandir(root_fd), 0))
+        while stack:
+            directory_fd, entries, depth = stack[-1]
+            entry = next(entries, None)
+            if entry is None:
+                entries.close()
+                stack.pop()
+                if directory_fd != root_fd:
+                    os.close(directory_fd)
+                continue
+            child_depth = depth + 1
+            entry_count += 1
+            if entry_count > limits.max_entries:
+                overage = "entries"
+                break
+            maximum_depth = max(maximum_depth, child_depth)
+            if maximum_depth > limits.max_depth:
+                overage = "depth"
+                break
+            information = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(information.st_mode):
+                invalid_type = invalid_type or "link-or-reparse"
+            elif stat.S_ISDIR(information.st_mode):
+                child_fd = os.open(entry.name, flags, dir_fd=directory_fd)
+                try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino) != (
+                        information.st_dev, information.st_ino
+                    ):
+                        raise ScratchContainmentError(
+                            "scratch directory identity changed during traversal"
+                        )
+                    child_entries = os.scandir(child_fd)
+                except BaseException:
+                    os.close(child_fd)
+                    raise
+                stack.append((child_fd, child_entries, child_depth))
+            elif stat.S_ISREG(information.st_mode):
+                byte_count = min(limits.max_bytes + 1, byte_count + information.st_size)
+                if byte_count > limits.max_bytes:
+                    overage = "bytes"
+                    break
+            else:
+                invalid_type = invalid_type or "special-file"
+    except OSError as exc:
+        raise ScratchContainmentError("scratch traversal could not verify an entry") from exc
     finally:
+        for directory_fd, entries, _depth in reversed(stack):
+            entries.close()
+            if directory_fd != root_fd:
+                os.close(directory_fd)
         os.close(root_fd)
-    return ScratchUsage(
-        int(state["bytes"]),
-        int(state["entries"]),
-        int(state["depth"]),
-        state["overage"] if isinstance(state["overage"], str) else None,
-        state["invalid"] if isinstance(state["invalid"], str) else None,
+    return ScratchUsage(byte_count, entry_count, maximum_depth, overage, invalid_type)
+
+
+async def with_scratch_monitor(
+    invocation: Awaitable[_T], root: Path, limits: ScratchLimits
+) -> _T:
+    """Stop and drain a driver on sampled overage, preserving cleanup failures."""
+    process_done = asyncio.Event()
+
+    async def invoke() -> _T:
+        try:
+            return await invocation
+        finally:
+            process_done.set()
+
+    task = asyncio.create_task(invoke())
+
+    async def terminate() -> None:
+        await cancel_and_wait((task,))
+
+    monitor = asyncio.create_task(
+        monitor_scratch(root, limits, process_done=process_done, terminate=terminate)
     )
+    try:
+        await asyncio.wait({task, monitor}, return_when=asyncio.FIRST_COMPLETED)
+        usage = await monitor
+        if usage.overage is not None:
+            raise ScratchLimitExceeded(f"scratch {usage.overage} limit exceeded")
+        return await task
+    finally:
+        await cancel_and_wait((task, monitor))
 
 
 async def monitor_scratch(

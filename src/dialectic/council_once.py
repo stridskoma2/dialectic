@@ -52,6 +52,7 @@ from .schemas import (
     derive_overall_vote,
 )
 from .service import DialecticFailure, ExecutionContext, WorkflowTimedOut
+from .process import cancel_and_wait
 from .turn_timing import TurnDeadlineExpired
 from .workflow_evidence import (
     GateAEvidence as _GateAEvidence,
@@ -180,14 +181,10 @@ class CouncilOnceOrchestrator:
                 return await workflow
             assert self._workflow_timeout is not None
             self._workflow_timeout.set()
-            workflow.cancel()
-            result = (await asyncio.gather(workflow, return_exceptions=True))[0]
-            if isinstance(result, DialecticFailure) and result.kind == "PROCESS_CLEANUP_FAILED":
-                raise result
+            await cancel_and_wait((workflow,))
             raise WorkflowTimedOut("Council Once reached its overall wall-clock limit")
         except asyncio.CancelledError:
-            workflow.cancel()
-            await asyncio.gather(workflow, return_exceptions=True)
+            await cancel_and_wait((workflow,))
             raise
         finally:
             deadline.cancel()
@@ -863,7 +860,17 @@ class CouncilOnceOrchestrator:
         except BaseException as exc:
             evidence = _take_native_invocation_evidence(item.adapter)
             if evidence is not None:
-                if isinstance(exc, asyncio.CancelledError):
+                native_failure = evidence.failure_kind in {
+                    "PROCESS_CLEANUP_FAILED", "AGENT_OUTPUT_TOO_LARGE"
+                }
+                if not native_failure and isinstance(exc, TurnDeadlineExpired):
+                    evidence = replace(
+                        evidence,
+                        attempt_end_reason="timeout",
+                        failure_kind="NO_QUORUM",
+                        bounded_diagnostic=str(exc),
+                    )
+                elif not native_failure and isinstance(exc, asyncio.CancelledError):
                     if self._workflow_timeout is not None and self._workflow_timeout.is_set():
                         evidence = replace(
                             evidence,
@@ -880,11 +887,14 @@ class CouncilOnceOrchestrator:
                     item.closed = True
             elif item.session_id is None:
                 self._persist_unstarted(context, item, draft, exc)
+            if evidence is not None and evidence.failure_kind in {
+                "PROCESS_CLEANUP_FAILED", "AGENT_OUTPUT_TOO_LARGE"
+            }:
+                raise DialecticFailure(
+                    evidence.failure_kind,
+                    evidence.bounded_diagnostic or "participant native turn failed",
+                ) from exc
             if isinstance(exc, asyncio.CancelledError):
-                if evidence is not None and evidence.failure_kind == "PROCESS_CLEANUP_FAILED":
-                    raise DialecticFailure(
-                        "PROCESS_CLEANUP_FAILED", "participant cleanup failed during cancellation"
-                    ) from exc
                 raise
             if isinstance(exc, DialecticFailure):
                 raise
@@ -1137,23 +1147,7 @@ class CouncilOnceOrchestrator:
                             failures.append(failure)
                 if failures:
                     peer_failure.set()
-                    for task in pending:
-                        task.cancel()
-                    results = await asyncio.gather(*pending, return_exceptions=True)
-                    failures.extend(
-                        value for value in results if isinstance(value, BaseException)
-                    )
-                    cleanup = next(
-                        (
-                            value
-                            for value in failures
-                            if isinstance(value, DialecticFailure)
-                            and value.kind == "PROCESS_CLEANUP_FAILED"
-                        ),
-                        None,
-                    )
-                    if cleanup is not None:
-                        raise cleanup
+                    await cancel_and_wait(tasks)
                     primary = failures[0]
                     if isinstance(primary, DialecticFailure):
                         raise primary
@@ -1163,10 +1157,7 @@ class CouncilOnceOrchestrator:
         except asyncio.CancelledError:
             if self._workflow_timeout is None or not self._workflow_timeout.is_set():
                 peer_failure.set()
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await cancel_and_wait(tasks)
             raise
         finally:
             self._active_peer_failure = None

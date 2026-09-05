@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
@@ -32,7 +33,10 @@ from dialectic.git_workspace import (
 )
 from dialectic.locking import RepositoryBusyError, RepositoryLock, resolve_repository_identity
 from dialectic.native_adapters import (
+    NativeInvocationEvidence,
     NativePreflightError,
+    NativeTurnError,
+    _empty_capture,
     _fixture as _native_fixture,
     _reject_displacing_codex_policy,
     _trusted_environment,
@@ -460,8 +464,9 @@ async def test_code_006_controller_does_not_inject_transcript_or_repository_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_failure", [False, True])
 async def test_code_007_reviewer_failure_cancels_and_reaps_peers(
-    tmp_path: Path, config_data: dict[str, object]
+    tmp_path: Path, config_data: dict[str, object], cleanup_failure: bool
 ) -> None:
     repo = _make_repo(tmp_path)
     driver_target = AgentTarget(runtime="codex", model="codex-model", effort="high")
@@ -473,12 +478,33 @@ async def test_code_007_reviewer_failure_cancels_and_reaps_peers(
     ]
     bad = ScriptedAgentAdapter(claude, [ScriptedStep(error=RuntimeError("provider down"))])
     slow = ScriptedAgentAdapter(grok, [_review_step(grok, [], delay=5)])
+    if cleanup_failure:
+        original = slow.start
+
+        async def failed_cleanup(request):  # type: ignore[no-untyped-def]
+            started = datetime.now(UTC)
+            try:
+                return await original(request)
+            except asyncio.CancelledError:
+                slow._last_invocation = NativeInvocationEvidence(
+                    started_at=started, response_completed_at=None,
+                    capture_completed_at=datetime.now(UTC), process_origin="spawned-for-attempt",
+                    process_lifecycle="per-turn", process_unit_id="abcdefghijklmnop",
+                    process_exit_code=None, attempt_end_reason="cleanup-failed",
+                    failure_kind="PROCESS_CLEANUP_FAILED", process_disposition="cleanup-failed",
+                    stdout=_empty_capture(256, KnownCredentials()),
+                    stderr=_empty_capture(256, KnownCredentials()),
+                    bounded_diagnostic="reviewer child remains",
+                )
+                raise NativeTurnError("PROCESS_CLEANUP_FAILED", "reviewer child remains")
+
+        slow.start = failed_cleanup
     driver = ScriptedAgentAdapter(driver_target, [_edit_step(driver_target)])
     record, _, handle = await _execute(tmp_path, _config(config_data, reviewers=specs), repo, driver, {"bad": bad, "slow": slow})
-    assert record.failure_kind == "REVIEW_FAILED"
+    assert record.failure_kind == ("PROCESS_CLEANUP_FAILED" if cleanup_failure else "REVIEW_FAILED")
     assert len(driver.invocations) == 1
     slow_attempt = TurnAttemptArtifact.model_validate_json((handle.path / "turns/reviewer/reviewer-b/review.attempt.json").read_bytes())
-    assert slow_attempt.attempt_end_reason == "peer-failure"
+    assert slow_attempt.attempt_end_reason == ("cleanup-failed" if cleanup_failure else "peer-failure")
 
 
 @pytest.mark.asyncio
@@ -1443,6 +1469,10 @@ def test_code_043_post_commit_race_fails_exact_byte_confirmation(tmp_path: Path,
             marks=pytest.mark.skipif(os.name != "nt", reason="Windows reparse contract"),
         ),
         ("cleanup-failure", "PROCESS_CLEANUP_FAILED"),
+        ("scratch-final", "AGENT_OUTPUT_TOO_LARGE"),
+        ("scratch-initial", "AGENT_OUTPUT_TOO_LARGE"),
+        ("scratch-repair", "AGENT_OUTPUT_TOO_LARGE"),
+        ("scratch-cleanup-failure", "PROCESS_CLEANUP_FAILED"),
     ],
 )
 async def test_code_044_reserved_workspace_attacks_fail_closed_before_git(
@@ -1462,11 +1492,23 @@ async def test_code_044_reserved_workspace_attacks_fail_closed_before_git(
     outside_sentinel.write_text("outside-directory-secret", encoding="utf-8")
     race_directory: list[Path] = []
 
-    def attack(request) -> None:  # type: ignore[no-untyped-def]
+    sampled_cancellation = asyncio.Event()
+
+    async def attack(request) -> None:  # type: ignore[no-untyped-def]
         scratch_root = Path(request.working_directory) / ".dialectic-turn"
         output = scratch_root / "control" / "output.json"
         temporary = scratch_root / "tmp"
-        if variant == "control-symlink":
+        if variant.startswith("scratch-"):
+            # Let the initial scan run before growing scratch to exercise polling.
+            await asyncio.sleep(0.01)
+            (temporary / "large").write_bytes(b"x" * 33)
+            if variant != "scratch-final":
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    sampled_cancellation.set()
+                    raise
+        elif variant == "control-symlink":
             output.unlink()
             os.symlink(outside_file, output)
         elif variant == "control-hardlink":
@@ -1504,7 +1546,7 @@ async def test_code_044_reserved_workspace_attacks_fail_closed_before_git(
             )
             assert result.returncode == 0, result.stderr.decode(errors="replace")
 
-    if variant == "cleanup-failure":
+    if variant in {"cleanup-failure", "scratch-cleanup-failure"}:
         def fail_cleanup(*args, **kwargs) -> None:  # type: ignore[no-untyped-def]
             raise ScratchCleanupTimeout("forced cleanup timeout")
 
@@ -1519,16 +1561,27 @@ async def test_code_044_reserved_workspace_attacks_fail_closed_before_git(
 
         monkeypatch.setattr("dialectic.scratch._cleanup_directory_fd", race_cleanup)
 
-    driver = ScriptedAgentAdapter(
-        target, [ScriptedStep(response=_response(target), callback=attack)]
+    steps = [ScriptedStep(response=_response(target), callback=attack)]
+    if variant == "scratch-repair":
+        steps = [_edit_step(target), _review_step(target, [_finding()]), *steps]
+    driver = ScriptedAgentAdapter(target, steps)
+    record, _, handle = await _execute(
+        tmp_path, _config(config_data, limit_updates={"max_turn_scratch_bytes": 32}), repo, driver
     )
-    record, _, handle = await _execute(tmp_path, _config(config_data), repo, driver)
     assert record.failure_kind == expected_kind
+    if variant in {"scratch-initial", "scratch-repair", "scratch-cleanup-failure"}:
+        assert sampled_cancellation.is_set()
+        phase = "repair" if variant == "scratch-repair" else "initial"
+        attempt = TurnAttemptArtifact.model_validate_json(
+            (handle.path / f"turns/driver/driver/{phase}.attempt.json").read_bytes()
+        )
+        assert attempt.failure_kind == "AGENT_OUTPUT_TOO_LARGE"
+        assert attempt.attempt_end_reason == "output-limit"
     assert outside_file.read_text(encoding="utf-8") == "outside-secret"
     assert outside_sentinel.read_text(encoding="utf-8") == "outside-directory-secret"
-    assert not (handle.path / "git/initial.diff").exists()
+    assert (handle.path / "git/initial.diff").exists() == (variant == "scratch-repair")
     workspace = Path(_load_json(handle.path / "git/workspace.json")["dialectic_worktree"])
-    assert int(_git(workspace, "rev-list", "--count", "main..HEAD").stdout) == 0
+    assert int(_git(workspace, "rev-list", "--count", "main..HEAD").stdout) == (1 if variant == "scratch-repair" else 0)
 
 
 @pytest.mark.asyncio

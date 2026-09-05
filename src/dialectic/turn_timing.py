@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TypeVar
 
+from .process import cancel_and_wait
 from .schemas import AgentRequest
 
 IDLE_WATCHDOG_SECONDS = 90.0
@@ -51,6 +52,9 @@ class _ActiveTurn:
     last_activity_monotonic: float
     wakeup: asyncio.Event
     loop: asyncio.AbstractEventLoop
+    invocation: asyncio.Future[object] | None = None
+    stopping: bool = False
+    wakeup_pending: bool = False
 
 
 class TurnDeadlineController:
@@ -81,9 +85,10 @@ class TurnDeadlineController:
         def record() -> None:
             with self._lock:
                 turn = self._active.get(key)
-                if turn is not None:
-                    turn.last_activity_monotonic = self._monotonic()
-                    turn.loop.call_soon_threadsafe(turn.wakeup.set)
+                now = self._monotonic()
+                if turn is not None and self._is_running(turn, now):
+                    turn.last_activity_monotonic = now
+                    self._notify_locked(turn)
 
         return record
 
@@ -121,13 +126,14 @@ class TurnDeadlineController:
             self._active[key] = turn
 
         task = asyncio.ensure_future(invocation)
+        with self._lock:
+            turn.invocation = task
         wakeup_task = asyncio.create_task(turn.wakeup.wait())
         try:
             while True:
                 reason, remaining = self._remaining(key)
                 if remaining <= 0:
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    await cancel_and_wait((task,))
                     seconds = idle if reason == "idle" else turn.allotted_seconds
                     raise TurnDeadlineExpired(reason, float(seconds or 0))
                 done, _ = await asyncio.wait(
@@ -140,16 +146,16 @@ class TurnDeadlineController:
                     turn.wakeup.clear()
                     wakeup_task = asyncio.create_task(turn.wakeup.wait())
         except BaseException:
-            if not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+            with self._lock:
+                turn.stopping = True
+            await cancel_and_wait((task,))
             raise
         finally:
+            with self._lock:
+                self._active.pop(key, None)
             if not wakeup_task.done():
                 wakeup_task.cancel()
             await asyncio.gather(wakeup_task, return_exceptions=True)
-            with self._lock:
-                self._active.pop(key, None)
 
     def extend_active(self, seconds: float = TURN_EXTENSION_SECONDS) -> dict[str, object]:
         """Extend every active turn, capped by the controller hard ceiling."""
@@ -158,7 +164,10 @@ class TurnDeadlineController:
             raise ValueError("turn extension must be positive")
         extended = 0
         with self._lock:
+            now = self._monotonic()
             for turn in self._active.values():
+                if not self._can_extend(turn, now):
+                    continue
                 previous = turn.deadline_monotonic
                 turn.deadline_monotonic = min(
                     turn.deadline_monotonic + seconds,
@@ -167,7 +176,7 @@ class TurnDeadlineController:
                 if turn.deadline_monotonic > previous:
                     turn.allotted_seconds += turn.deadline_monotonic - previous
                     extended += 1
-                    turn.loop.call_soon_threadsafe(turn.wakeup.set)
+                    self._notify_locked(turn)
         snapshot = self.snapshot()
         snapshot["extendedTurns"] = extended
         return snapshot
@@ -205,17 +214,49 @@ class TurnDeadlineController:
             turn = self._active.get(key)
             if turn is None:
                 return "allotted", 0.0
-            allotted_remaining = turn.deadline_monotonic - now
-            if turn.idle_seconds is None:
-                return "allotted", allotted_remaining
-            idle_remaining = turn.last_activity_monotonic + turn.idle_seconds - now
-            if idle_remaining <= allotted_remaining:
-                return "idle", idle_remaining
-            return "allotted", allotted_remaining
+            reason, remaining = self._remaining_turn(turn, now)
+            if remaining <= 0:
+                turn.stopping = True
+            return reason, remaining
 
     @staticmethod
+    def _remaining_turn(turn: _ActiveTurn, now: float) -> tuple[str, float]:
+        allotted = turn.deadline_monotonic - now
+        if turn.idle_seconds is not None:
+            idle = turn.last_activity_monotonic + turn.idle_seconds - now
+            if idle <= allotted:
+                return "idle", idle
+        return "allotted", allotted
+
+    @classmethod
+    def _is_running(cls, turn: _ActiveTurn, now: float) -> bool:
+        task = turn.invocation
+        return (
+            not turn.stopping
+            and (task is None or not task.done())
+            and not (isinstance(task, asyncio.Task) and task.cancelling())
+            and cls._remaining_turn(turn, now)[1] > 0
+        )
+
+    @classmethod
+    def _can_extend(cls, turn: _ActiveTurn, now: float) -> bool:
+        return cls._is_running(turn, now) and turn.deadline_monotonic < turn.maximum_deadline_monotonic
+
+    def _notify_locked(self, turn: _ActiveTurn) -> None:
+        if turn.wakeup_pending or turn.wakeup.is_set():
+            return
+        turn.wakeup_pending = True
+        turn.loop.call_soon_threadsafe(self._wake_turn, turn)
+
+    def _wake_turn(self, turn: _ActiveTurn) -> None:
+        with self._lock:
+            turn.wakeup_pending = False
+            if self._active.get(turn.key) is turn:
+                turn.wakeup.set()
+
+    @classmethod
     def _snapshot_turn(
-        turn: _ActiveTurn, now: float, wall_now: datetime
+        cls, turn: _ActiveTurn, now: float, wall_now: datetime
     ) -> dict[str, object]:
         remaining = max(0.0, turn.deadline_monotonic - now)
         maximum_remaining = max(0.0, turn.maximum_deadline_monotonic - now)
@@ -242,5 +283,5 @@ class TurnDeadlineController:
                 else remaining
             ),
             "maximumRemainingSeconds": math.ceil(maximum_remaining),
-            "canExtend": turn.deadline_monotonic < turn.maximum_deadline_monotonic,
+            "canExtend": cls._can_extend(turn, now),
         }

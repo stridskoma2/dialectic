@@ -113,6 +113,8 @@ class TurnWorkspace:
         except (OSError, ScratchContainmentError, ScratchCleanupTimeout) as exc:
             raise TurnWorkspaceCleanupError("reserved turn workspace cleanup failed") from exc
         if validation_error is not None:
+            if isinstance(validation_error, ScratchLimitExceeded):
+                raise validation_error
             raise TurnWorkspaceError("reserved turn workspace validation failed") from validation_error
 
 

@@ -955,9 +955,9 @@ class TurnAttemptArtifact(ControllerArtifact):
             ):
                 raise ValueError("epoch-boundary guard requires a retained ACP attempt")
             if stream.discarded_guard_reason == "overflow" and (
-                self.attempt_end_reason != "output-limit"
+                self.attempt_end_reason not in {"output-limit", "cleanup-failed"}
             ):
-                raise ValueError("overflow guard requires output-limit attempt end")
+                raise ValueError("overflow guard requires output-limit or cleanup-failed attempt end")
         return self
 
 
