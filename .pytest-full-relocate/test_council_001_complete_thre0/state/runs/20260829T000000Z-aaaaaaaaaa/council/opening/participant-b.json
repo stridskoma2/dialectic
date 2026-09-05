@@ -1,0 +1,1 @@
+{"artifact_schema_version":1,"packet_sha256":"b801e3111550b7b619b8523a48e172b0d5b501afaa33290b1c93efc3434e45ee","participant_alias":"Participant B","position":{"claims":[{"assumption":null,"evidence":"Evidence 1","statement":"Claim 1"}],"conclusion":"Independent conclusion 1","confidence":0.75,"schema_version":1,"uncertainties":["Uncertainty 1"]},"tool_version":"0.1.0"}

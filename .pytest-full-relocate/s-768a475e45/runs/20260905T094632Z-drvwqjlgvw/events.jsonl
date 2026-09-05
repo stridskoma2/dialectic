@@ -1,0 +1,2 @@
+{"artifact_schema_version":1,"event_type":"phase-started","payload":{"phase":"PREFLIGHT"},"phase":"PREFLIGHT","run_id":"20260905T094632Z-drvwqjlgvw","sequence":1,"timestamp":"2026-09-05T09:46:32.330549Z","tool_version":"0.1.0"}
+{"artifact_schema_version":1,"event_type":"run-failed","payload":{"failure_kind":"UNSUPPORTED_REPOSITORY"},"phase":"PREFLIGHT","run_id":"20260905T094632Z-drvwqjlgvw","sequence":2,"timestamp":"2026-09-05T09:46:32.614017Z","tool_version":"0.1.0"}

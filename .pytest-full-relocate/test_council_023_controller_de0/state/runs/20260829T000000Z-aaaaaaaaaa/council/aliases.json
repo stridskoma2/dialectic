@@ -1,0 +1,1 @@
+{"aliases":{"Participant A":{"effort":null,"model":"codex-model","runtime":"codex"},"Participant B":{"effort":null,"model":"claude-model","runtime":"claude-code"},"Participant C":{"effort":null,"model":"grok-model","runtime":"grok-build"},"Participant D":{"effort":null,"model":"codex-alt","runtime":"codex"}},"artifact_schema_version":1,"tool_version":"0.1.0"}

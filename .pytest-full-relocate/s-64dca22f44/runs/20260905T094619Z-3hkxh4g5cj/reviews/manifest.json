@@ -1,0 +1,1 @@
+{"artifact_schema_version":1,"base_sha":"4a6e6711c7c6a18eac2d1667fd4044f3b5357b48","diff_sha256":"cd5f334b8032453b3bb3a9b12c05a0f978eb91df144ec3f985cf47cca793b448","reports":["reviews/reviewer-a.json","reviews/reviewer-b.json"],"review_sha":"e51c9f1a92088978acc1fee01a4490a79ed1ef38","reviewer_aliases":["reviewer-a","reviewer-b"],"tool_version":"0.1.0"}

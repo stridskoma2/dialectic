@@ -251,6 +251,8 @@ def build_native_adapter(
     turn_deadlines: TurnDeadlineController | None,
 ) -> AgentAdapter:
     limits = config.limits
+    paths = config.native_executables.get(target.runtime)
+    selected_executable = getattr(paths, role) if paths is not None else None
     common = {
         "role": role,
         "access_mode": access_mode,
@@ -272,6 +274,10 @@ def build_native_adapter(
         "claude-code": ClaudeAdapter,
         "grok-build": GrokAdapter,
     }[target.runtime]
+    if selected_executable is not None:
+        # The normal adapter still resolves, qualifies and binds this exact
+        # binary. Never fall back to PATH when an explicit selection fails.
+        common["which"] = lambda _name: selected_executable
     return adapter_type(target, **common)  # type: ignore[arg-type,return-value]
 
 

@@ -1,0 +1,1 @@
+{"role": "participant", "target_id": "participant-a", "turn_phase": "opening", "started_at": "2026-09-01T01:01:00Z", "response_completed_at": "2026-09-01T01:02:03Z", "response": {"runtime": "codex", "requested_model": "gpt-5.6-sol", "text": "# Opening\n\nComplete **Markdown** response."}}

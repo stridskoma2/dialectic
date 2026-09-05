@@ -1,0 +1,4 @@
+# Dialectic run 20260905T094821Z-wc6y5nu275
+
+Status: FAILED
+Failure: UNSUPPORTED_CHANGE

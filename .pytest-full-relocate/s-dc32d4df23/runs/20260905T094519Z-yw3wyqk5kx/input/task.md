@@ -1,0 +1,1 @@
+Keep C:/authored/product/path intact.

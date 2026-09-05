@@ -15,7 +15,7 @@ from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from dialectic.config import ConfigLoader
-from dialectic.desktop_qt import MainWindow, RunWorker
+from dialectic.desktop_qt import MainWindow, NativeExecutablesDialog, RunWorker
 from dialectic.service import DialecticService
 from dialectic.store import RunStore
 from dialectic.ui import _model_options, _prepare_run
@@ -67,6 +67,46 @@ def _options() -> dict[str, object]:
 def _window(tmp_path: Path) -> MainWindow:
     settings = QSettings(str(tmp_path / "desktop.ini"), QSettings.Format.IniFormat)
     return MainWindow(options=_options(), settings=settings)
+
+
+def test_native_cli_paths_dialog_persists_and_submits_separate_roles(
+    qt_app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = {"codex": {"driver": str(tmp_path / "Sol CLI.exe"), "reviewer": str(tmp_path / "Astra CLI.exe")}}
+    dialog = NativeExecutablesDialog({})
+    for role, path in paths["codex"].items():
+        dialog.path_inputs["codex", role].setText(path)
+    dialog.accept()
+    assert dialog.selections == paths
+    assert dialog.result() == NativeExecutablesDialog.DialogCode.Accepted
+    window = _window(tmp_path)
+    def edit_and_accept(instance):
+        instance.selections = paths
+        return NativeExecutablesDialog.DialogCode.Accepted
+    monkeypatch.setattr(NativeExecutablesDialog, "exec", edit_and_accept)
+    window.cli_paths_button.click()
+    window.repository.setText(str(tmp_path))
+    window.prompt_edit.setPlainText("Implement the task")
+    config = ConfigLoader({}).load(_prepare_run(window._payload()).config_bytes).config
+    assert config.model_dump()["native_executables"] == paths
+    window.close()
+    restored = _window(tmp_path)
+    assert restored._payload()["nativeExecutables"] == paths
+    restored._set_running(True)
+    assert not restored.cli_paths_button.isEnabled()
+    restored._set_running(False)
+    restored.close()
+    dialog.close()
+
+
+def test_invalid_saved_cli_paths_cannot_silently_fall_back_to_path(qt_app: QApplication, tmp_path: Path) -> None:
+    settings = QSettings(str(tmp_path / "desktop.ini"), QSettings.Format.IniFormat)
+    settings.setValue("desktop/nativeExecutables", '{"codex":{"driver":"relative"}}')
+    window = MainWindow(options=_options(), settings=settings)
+    with pytest.raises(ValueError, match="Saved CLI paths are invalid"):
+        window._payload()
+    window.close()
+    assert settings.value("desktop/nativeExecutables") == '{"codex":{"driver":"relative"}}'
 
 
 @pytest.mark.parametrize("mode", ["code", "council"])

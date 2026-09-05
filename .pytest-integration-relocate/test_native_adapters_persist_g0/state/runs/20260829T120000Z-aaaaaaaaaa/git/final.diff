@@ -1,0 +1,7 @@
+diff --git a/native.txt b/native.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..e5c02dc0bd2740eeca0d39c7585e7b5c27844837
+--- /dev/null
++++ b/native.txt
+@@ -0,0 +1 @@
++native adapter

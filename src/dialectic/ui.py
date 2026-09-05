@@ -155,6 +155,7 @@ def _prepare_run(payload: object) -> _PreparedRun:
             research_mode=cast(ResearchMode, research_mode),
             max_dissenters=max_dissenters,
             moderator_mode=cast(ModeratorMode, moderator_mode),
+            native_executables=cast(Any, payload.get("nativeExecutables", {})),
         )
     )
 

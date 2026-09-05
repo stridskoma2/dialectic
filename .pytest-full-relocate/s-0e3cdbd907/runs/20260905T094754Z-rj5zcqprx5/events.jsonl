@@ -1,0 +1,4 @@
+{"artifact_schema_version":1,"event_type":"phase-started","payload":{"phase":"PREFLIGHT"},"phase":"PREFLIGHT","run_id":"20260905T094754Z-rj5zcqprx5","sequence":1,"timestamp":"2026-09-05T09:47:54.539597Z","tool_version":"0.1.0"}
+{"artifact_schema_version":1,"event_type":"phase-started","payload":{"phase":"WORKTREE_SETUP"},"phase":"WORKTREE_SETUP","run_id":"20260905T094754Z-rj5zcqprx5","sequence":2,"timestamp":"2026-09-05T09:47:55.665178Z","tool_version":"0.1.0"}
+{"artifact_schema_version":1,"event_type":"phase-started","payload":{"phase":"DRIVER_INITIAL"},"phase":"DRIVER_INITIAL","run_id":"20260905T094754Z-rj5zcqprx5","sequence":3,"timestamp":"2026-09-05T09:47:55.924027Z","tool_version":"0.1.0"}
+{"artifact_schema_version":1,"event_type":"run-failed","payload":{"failure_kind":"AGENT_OUTPUT_TOO_LARGE"},"phase":"DRIVER_INITIAL","run_id":"20260905T094754Z-rj5zcqprx5","sequence":4,"timestamp":"2026-09-05T09:47:55.972882Z","tool_version":"0.1.0"}

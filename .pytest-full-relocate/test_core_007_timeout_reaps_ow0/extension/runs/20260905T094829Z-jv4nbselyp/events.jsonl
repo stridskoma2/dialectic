@@ -1,0 +1,2 @@
+{"artifact_schema_version":1,"event_type":"phase-started","payload":{"phase":"PREFLIGHT"},"phase":"PREFLIGHT","run_id":"20260905T094829Z-jv4nbselyp","sequence":1,"timestamp":"2026-09-05T09:48:29.216048Z","tool_version":"0.1.0"}
+{"artifact_schema_version":1,"event_type":"run-cancelled","payload":{},"phase":"PREFLIGHT","run_id":"20260905T094829Z-jv4nbselyp","sequence":2,"timestamp":"2026-09-05T09:48:29.225417Z","tool_version":"0.1.0"}

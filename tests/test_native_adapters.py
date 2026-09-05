@@ -35,11 +35,23 @@ from dialectic.native_adapters import (
 )
 from dialectic.launcher import DirectLaunchSpec
 from dialectic.native_process import BoundedNativeProcessTransport
+from dialectic.native_runtime import NativeCodeExecutor, NativeDoctor, build_native_adapter
 from dialectic.redaction import BoundedStreamCapture, KnownCredential, KnownCredentials
 from dialectic.schemas import AgentRequest, AgentTarget, CapabilityBindingArtifact
 from dialectic.service import DialecticService
 from dialectic.store import RunStore
 from dialectic.workflow_evidence import bounded_preflight_diagnostic
+
+
+def _selected_native_adapter(config, store, *, role="reviewer"):
+    from dialectic.schemas import DialecticConfig
+    return build_native_adapter(
+        AgentTarget(runtime="codex", model="codex-model"), role=role,
+        access_mode="driver-write" if role == "driver" else "packet-only",
+        config=DialecticConfig.model_validate(config), store=store,
+        credentials=KnownCredentials(), source_environment=_source_environment(),
+        probe_provider=recorded_probe_provider, turn_deadlines=None,
+    )
 
 
 class FakeNativeTransport:
@@ -378,7 +390,82 @@ def test_codex_01534_is_qualified_only_for_native_windows_packet_roles() -> None
             source_environment={},
         )
     if os.name == "nt":
-        assert "required tmp writes and read-only Git inspection failed" in str(rejected.value)
+        assert "cannot reopen writable descendants under read-only carveouts" in str(rejected.value)
+        assert "protected scratch root" in str(rejected.value)
+        assert "No permission boundary was weakened" in str(rejected.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["complete", "not-executed", "missing-file", "sentinel-replaced", "hardlink-created"])
+async def test_native_codex_driver_probe_distinguishes_denials_from_unavailable_operations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str,
+) -> None:
+    import dialectic.native_adapters as native
+    from dialectic.json_schema import validate_json_schema
+
+    # This exercises controller interpretation and preservation of diagnostics;
+    # native sandbox enforcement is covered only by opt-in qualification.
+    monkeypatch.setattr(native, "_initialize_probe_repository", lambda root: (root / ".git").mkdir())
+    monkeypatch.setattr(native, "_create_probe_linked_worktree", lambda original, worktree: worktree.mkdir())
+    secret = "probe-diagnostic-secret"
+    adapter = CodexAdapter(
+        AgentTarget(runtime="codex", model="codex-model", effort="low"),
+        role="driver", access_mode="driver-write", store=RunStore(tmp_path / "state"),
+        credentials=KnownCredentials([KnownCredential("OPENAI_API_KEY", secret)]),
+        preflight_seconds=10, capability_probe_seconds=10, stdout_limit=4096,
+        stderr_limit=4096, graceful_kill_seconds=1, source_environment=_source_environment(),
+    )
+    fixture = _versioned_fixture(
+        "codex", "0.150.0-alpha.12.2", role="driver", access_mode="driver-write",
+        source_environment=_source_environment(),
+    )
+    assert fixture.fixture_test_version == "slice-2-native-driver-diagnostics-v2"
+    assert ":tmpdir" in fixture.capability_fixture.template["permissions"]["dialectic-driver"]["filesystem"]
+
+    async def response(_fixture, *, dynamic_paths, working_directory, prompt, schema, target_id):
+        assert "Do not suppress stderr or use empty catch blocks" in prompt
+        assert "A policy instruction alone is not an observed denial" in prompt
+        assert "git -C" in prompt
+        paths = json.loads(prompt.split("Paths: ", 1)[1])
+        assert paths["worktree"] == str(working_directory)
+        assert Path(paths["os_temp"]).is_file()
+        assert not Path(paths["os_temp"]).is_relative_to(working_directory.parent)
+        parent = adapter.store.role_directories_root or adapter.store.state_root
+        assert working_directory.is_relative_to(parent)
+        values = {name: "denied" for name in schema["properties"]}
+        values.update(product_write="allowed", tmp_write="allowed", git_read="allowed",
+                      cwd=str(working_directory), diagnostics=f"Access denied; native exit=128; {secret}")
+        if scenario != "missing-file":
+            (working_directory / "product-probe.txt").write_text("probe", encoding="utf-8")
+        (dynamic_paths["turn_scratch_tmp"] / "tmp-probe.txt").write_text("probe", encoding="utf-8")
+        if scenario == "not-executed":
+            values.update(state_read="unavailable", control_write="unavailable")
+        elif scenario == "sentinel-replaced":
+            sentinel = Path(paths["sentinels"]["control"])
+            previous = sentinel.read_bytes()
+            # Keeping the old inode/file alive makes the replacement identity distinct.
+            sentinel.rename(sentinel.with_name("retained-old-sentinel.txt"))
+            sentinel.write_bytes(previous)
+        elif scenario == "hardlink-created":
+            link = paths["hardlinks"]["git_hardlink"]
+            os.link(link["source"], link["destination"])
+        validate_json_schema(values, schema)
+        return values
+
+    monkeypatch.setattr(adapter, "_run_probe_turn", response)
+    results = {item.probe_id: item for item in await adapter._probe_driver_capabilities(fixture)}
+    assert tuple(results) == fixture.capability_fixture.probe_ids
+    assert results["saved-auth-read-deny"].passed
+    assert results["state-root-read-deny"].passed == (scenario != "not-executed")
+    assert results["control-write-deny"].passed == (scenario not in {"not-executed", "sentinel-replaced"})
+    assert results["product-write-allow"].passed == (scenario != "missing-file")
+    assert results["git-hardlink-deny"].passed == (scenario not in {"sentinel-replaced", "hardlink-created"})
+    if scenario == "not-executed":
+        assert results["control-write-deny"].observed == "unavailable"
+    for item in results.values():
+        assert "native exit=128" in item.bounded_diagnostic
+        assert "cwd=" in item.bounded_diagnostic
+        assert secret not in item.bounded_diagnostic
 
 
 def test_stable_codex_rejection_explains_failed_permission_matrix() -> None:
@@ -1507,3 +1594,124 @@ async def test_native_adapters_persist_gate_a_binding_and_real_stream_evidence(
     assert attempt["process_exit_code"] == 0
     assert attempt["stdout"]["persisted_sha256"] == hashlib.sha256(stdout).hexdigest()
     assert not list(handle.path.rglob("*.response.json"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["missing", "unqualified"])
+async def test_selected_codex_fails_closed_without_path_fallback(
+    tmp_path: Path, config_data: dict, failure: str
+) -> None:
+    executable = tmp_path / "selected build" / ("codex.exe" if os.name == "nt" else "codex")
+    executable.parent.mkdir()
+    if failure == "unqualified":
+        executable.write_bytes(b"unqualified executable")
+    config_data["native_executables"] = {"codex": {"driver": str(executable)}}
+    adapter = _selected_native_adapter(config_data, RunStore(tmp_path / "state"), role="driver")
+    transport = FakeNativeTransport([(b"codex-cli 0.153.4\n", b"", 0)])
+    adapter.transport = transport
+    expected_error = FileNotFoundError if failure == "missing" else NativePreflightError
+    with pytest.raises(expected_error):
+        await adapter.preflight(adapter.target)
+    assert len(transport.calls) == (0 if failure == "missing" else 1)
+    assert all(call["plan"].executable == executable.resolve() for call in transport.calls)
+    assert not list(adapter.store.capability_attestations_root.glob("*.json"))
+
+
+def test_omitted_role_keeps_existing_path_lookup(tmp_path: Path, config_data: dict) -> None:
+    import shutil
+    config_data["native_executables"] = {"codex": {"driver": str(tmp_path / "driver.exe")}}
+    adapter = _selected_native_adapter(config_data, RunStore(tmp_path / "state"))
+    assert adapter.which is shutil.which
+
+
+@pytest.mark.asyncio
+async def test_selected_binary_identity_separates_capability_cache(
+    tmp_path: Path, config_data: dict
+) -> None:
+    store = RunStore(tmp_path / "state")
+    builds = [tmp_path / f"build-{index}" / ("codex.exe" if os.name == "nt" else "codex") for index in range(2)]
+    for index, binary in enumerate(builds):
+        binary.parent.mkdir()
+        binary.write_bytes(f"fake build {index}".encode())
+    probed: list[str] = []
+    hashes: list[str] = []
+    def probe(adapter, fixture, expected):
+        probed.append(expected["executable_sha256"])
+        return recorded_probe_provider(adapter, fixture, expected)
+    for binary in (builds[0], builds[1], builds[0]):
+        config_data["native_executables"] = {"codex": {"reviewer": str(binary)}}
+        adapter = _selected_native_adapter(config_data, store)
+        adapter.transport = CodeOnceNativeTransport(driver=False)
+        adapter.probe_provider = probe
+        await adapter.preflight(adapter.target)
+        material = adapter.preflight_material()
+        hashes.append(material.resolved_executable_sha256)
+        assert material.attestation.executable_sha256 == hashlib.sha256(binary.read_bytes()).hexdigest()
+    assert hashes[0] == hashes[2] != hashes[1]
+    assert probed == hashes[:2]
+    assert len(list(store.capability_attestations_root.glob("*.json"))) == 2
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alias_reviewer", [False, True])
+async def test_separate_cli_builds_flow_through_doctor_and_code_once(
+    tmp_path: Path, config_data: dict, monkeypatch: pytest.MonkeyPatch,
+    alias_reviewer: bool,
+) -> None:
+    import dialectic.native_runtime as native_runtime
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (("init", "-b", "main"), ("config", "user.email", "test@example.invalid"), ("config", "user.name", "Dialectic Test")):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    (repo / "base.txt").write_text("base\n")
+    for args in (("add", "base.txt"), ("commit", "-m", "base")):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    executables = {}
+    for role in ("driver", "reviewer"):
+        binary = tmp_path / (role + " build") / ("codex.exe" if os.name == "nt" else "codex")
+        binary.parent.mkdir()
+        binary.write_bytes(role.encode())
+        executables[role] = str(binary)
+    versions = {"driver": "0.150.0-alpha.12.2", "reviewer": "0.153.4" if os.name == "nt" else "0.151.0-alpha.7.1"}
+    config_data["native_executables"] = {"codex": executables}
+    config_data["driver"]["model"] = "gpt-5.6-sol"
+    config_data["reviewers"] = [{"id": "review", "lens": "correctness", **(
+        {"target": "@driver"} if alias_reviewer else {"runtime": "codex", "model": "gpt-6-astra"}
+    )}]
+    adapters = []
+    def factory(target, **kwargs):
+        adapter = build_native_adapter(target, **kwargs)
+        transport = CodeOnceNativeTransport(driver=kwargs["role"] == "driver")
+        version = versions[kwargs["role"]]
+        transport.outputs[0] = (f"codex-cli {version}\n".encode(), b"", 0)
+        transport.outputs[4] = (_codex_doctor_report(version), b"", 0)
+        adapter.transport = transport
+        adapters.append(adapter)
+        return adapter
+    monkeypatch.setattr(native_runtime, "build_native_adapter", factory)
+    source = _source_environment()
+    store = RunStore(tmp_path / "state")
+    service = DialecticService(
+        store,
+        code_executor=NativeCodeExecutor(source_environment=source, probe_provider=recorded_probe_provider),
+        doctor_executor=NativeDoctor(source_environment=source, probe_provider=recorded_probe_provider),
+    )
+    config_bytes = yaml.safe_dump(config_data).encode()
+    report = await service.doctor(config_bytes=config_bytes, mode="code")
+    assert report.healthy, report
+    assert {t.role: t.resolved_executable for t in report.targets} == executables
+    handle = service.create_run("code")
+    record = await service.execute_code_once(handle, config_bytes=config_bytes, task_bytes=b"Create native.txt", repository_path=repo)
+    assert record.status == "FINALIZED", record.failure_detail
+    assert len(adapters) == 4
+    for adapter in adapters:
+        material = adapter.preflight_material()
+        assert str(material.resolved_executable) == executables[adapter.role]
+        assert material.cli_version == versions[adapter.role]
+        assert all(str(call["plan"].executable) == executables[adapter.role] for call in adapter.transport.calls)
+        assert all(path.encode() not in call["stdin"] for path in executables.values() for call in adapter.transport.calls)
+    for role, target_id in (("driver", "driver"), ("reviewer", "reviewer-a")):
+        evidence = json.loads((handle.path / f"audit/targets/{role}/{target_id}.json").read_text())
+        assert evidence["resolved_executable"] == executables[role]
+        assert evidence["cli_version"] == versions[role]

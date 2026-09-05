@@ -1,0 +1,10 @@
+diff --git a/empty.txt b/empty.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/nonempty.txt b/nonempty.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..32e6f59c4ff525b643babb090c9043cb227c648b
+--- /dev/null
++++ b/nonempty.txt
+@@ -0,0 +1 @@
++content

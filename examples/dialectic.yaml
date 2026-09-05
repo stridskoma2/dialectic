@@ -1,6 +1,15 @@
 version: 1
 research_mode: offline
 
+# Optional: use separate qualified native builds by runtime and execution role.
+# Omitted roles use PATH. Values must be absolute executable paths, not commands.
+# native_executables:
+#   codex:
+#     driver: ${CODEX_DRIVER_EXECUTABLE}
+#     reviewer: ${CODEX_REVIEWER_EXECUTABLE}
+#     participant: ${CODEX_PARTICIPANT_EXECUTABLE}
+#     moderator: ${CODEX_MODERATOR_EXECUTABLE}
+
 driver:
   runtime: codex
   model: ${CODEX_DRIVER_MODEL}

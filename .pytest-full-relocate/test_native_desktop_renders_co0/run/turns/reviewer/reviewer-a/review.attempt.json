@@ -1,0 +1,1 @@
+{"role": "reviewer", "target_id": "reviewer-a", "turn_phase": "review", "started_at": "2026-09-01T01:01:00Z", "response_completed_at": "2026-09-01T01:02:03Z", "response": {"runtime": "claude-code", "requested_model": "claude-model", "text": "# Review\n\nThe complete response is visible."}}

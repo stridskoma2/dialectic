@@ -1,0 +1,1 @@
+{"role": "moderator", "target_id": "moderator", "turn_phase": "moderation", "captured_at": "2026-09-01T01:04:03Z", "sources": [{"title": "Example Domain", "url": "https://example.com/", "claim_context": "Used for the current-product comparison."}, {"title": "Unsafe", "url": "http://example.com/", "claim_context": "Ignored by the presentation boundary."}]}

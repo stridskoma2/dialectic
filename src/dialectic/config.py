@@ -131,7 +131,11 @@ class ConfigLoader:
                 self._expand_environment(child, (*path, index))
                 for index, child in enumerate(value)
             ]
-        if not isinstance(value, str) or not path or path[-1] not in _EXPANDABLE_FIELDS:
+        executable_path = len(path) == 3 and path[0] == "native_executables"
+        if (
+            not isinstance(value, str) or not path
+            or (path[-1] not in _EXPANDABLE_FIELDS and not executable_path)
+        ):
             return value
 
         escaped: dict[str, str] = {}

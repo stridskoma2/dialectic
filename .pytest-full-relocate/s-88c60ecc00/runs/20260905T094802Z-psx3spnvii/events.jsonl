@@ -1,0 +1,4 @@
+{"artifact_schema_version":1,"event_type":"phase-started","payload":{"phase":"PREFLIGHT"},"phase":"PREFLIGHT","run_id":"20260905T094802Z-psx3spnvii","sequence":1,"timestamp":"2026-09-05T09:48:02.204133Z","tool_version":"0.1.0"}
+{"artifact_schema_version":1,"event_type":"phase-started","payload":{"phase":"WORKTREE_SETUP"},"phase":"WORKTREE_SETUP","run_id":"20260905T094802Z-psx3spnvii","sequence":2,"timestamp":"2026-09-05T09:48:03.328913Z","tool_version":"0.1.0"}
+{"artifact_schema_version":1,"event_type":"phase-started","payload":{"phase":"DRIVER_INITIAL"},"phase":"DRIVER_INITIAL","run_id":"20260905T094802Z-psx3spnvii","sequence":3,"timestamp":"2026-09-05T09:48:03.568877Z","tool_version":"0.1.0"}
+{"artifact_schema_version":1,"event_type":"run-failed","payload":{"failure_kind":"PROCESS_CLEANUP_FAILED"},"phase":"DRIVER_INITIAL","run_id":"20260905T094802Z-psx3spnvii","sequence":4,"timestamp":"2026-09-05T09:48:03.863843Z","tool_version":"0.1.0"}

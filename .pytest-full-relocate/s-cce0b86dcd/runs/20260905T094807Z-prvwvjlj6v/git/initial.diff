@@ -1,0 +1,28 @@
+diff --git a/delete.txt b/delete.txt
+deleted file mode 100644
+index c8b1b42336f7e2c26898b5b99441d324f2de5412..0000000000000000000000000000000000000000
+--- a/delete.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-delete
+diff --git a/nested/deep/leaf.txt b/nested/deep/leaf.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..eeacbdb6b832e024b53d4148bf37fbb054e2f44d
+--- /dev/null
++++ b/nested/deep/leaf.txt
+@@ -0,0 +1 @@
++two
+diff --git a/rename.txt b/rename.txt
+deleted file mode 100644
+index a4ec98f2e280f532fb765337db0876bd6d14586c..0000000000000000000000000000000000000000
+--- a/rename.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-rename
+diff --git a/renamed.txt b/renamed.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..a4ec98f2e280f532fb765337db0876bd6d14586c
+--- /dev/null
++++ b/renamed.txt
+@@ -0,0 +1 @@
++rename

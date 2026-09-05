@@ -1,0 +1,1 @@
+{"artifact_schema_version":1,"event_type":"run-failed","payload":{"failure_kind":"NO_CHANGES"},"phase":"PREFLIGHT","run_id":"20260828T060606Z-aaaaaaaaaa","sequence":1,"timestamp":"2026-09-05T09:48:33.088094Z","tool_version":"0.1.0"}

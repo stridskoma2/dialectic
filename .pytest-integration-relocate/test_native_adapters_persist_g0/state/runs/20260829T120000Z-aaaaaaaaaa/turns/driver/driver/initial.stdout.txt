@@ -1,0 +1,3 @@
+{"type": "thread.started", "thread_id": "driver-native-session"}
+{"type": "item.completed", "item": {"type": "agent_message", "text": "implemented"}}
+{"type": "turn.completed", "usage": {"output_tokens": 1}}

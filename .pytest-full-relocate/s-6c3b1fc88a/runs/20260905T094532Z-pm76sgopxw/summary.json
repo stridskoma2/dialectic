@@ -1,0 +1,1 @@
+{"artifact_paths":{"events":"events.jsonl","run":"run.json","workspace":"git/workspace.json"},"artifact_schema_version":1,"failure_kind":"REVIEW_FAILED","mode":"code","outcome":null,"run_id":"20260905T094532Z-pm76sgopxw","status":"FAILED","tool_version":"0.1.0","unresolved_items":[]}

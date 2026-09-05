@@ -142,10 +142,16 @@ qualified `0.150.0-alpha.12.2`; Dialectic rejects the newer alpha as a driver be
 incurring a model turn.
 
 Codex `0.153.4` adds native-Windows packet-role support for GPT-6 Astra with the
-same v3 permission profiles and required CLI controls. Its native driver probe
-still failed required product/temporary writes and read-only Git inspection, so
-it remains ineligible for Code Once's writable driver. Linux/WSL qualification
-for this version is outstanding. See the
+same v3 permission profiles and required CLI controls. On an ordinary Git path,
+its driver preserves the CWD and writes product files, but temporary writes and
+read-only Git inspection still fail. Removing the conflicting temporary-directory
+alias exposes an explicit Windows sandbox limitation: it cannot reopen a writable
+`tmp` child beneath the protected scratch root. It remains ineligible for Code
+Once's writable driver; broadening scratch access would violate the contract.
+A WSL2 follow-up with Astra and candidate Linux profile corrections demonstrated
+product writes, scratch writes, and Git inspection, but still omitted automatic
+`AGENTS.md` discovery under the required untrusted-project configuration. The
+Linux driver therefore also remains unqualified. See the
 [0.153.4 qualification report](GptPro/DIALECTIC_CODEX_0.153.4_QUALIFICATION.md)
 for native evidence and validation scope.
 
@@ -154,6 +160,33 @@ for native evidence and validation scope.
 Copy [examples/dialectic.yaml](examples/dialectic.yaml), set the referenced model
 environment variables, and remove unused targets if necessary. A present unused
 mode section must still be valid, but it is not resolved or launched.
+
+To use different CLI builds for different roles, add optional executable paths
+to the same configuration. For example, a Sol driver and an Astra reviewer may
+select separate Codex installations while keeping their normal model settings:
+
+```yaml
+native_executables:
+  codex:
+    driver: ${CODEX_DRIVER_EXECUTABLE}
+    reviewer: ${CODEX_REVIEWER_EXECUTABLE}
+```
+
+Set each variable to one absolute executable path on the controller's operating
+system, or write the path directly as a quoted YAML string. Omitted roles use
+PATH; an invalid explicit selection fails without falling back. Council supports
+separate `participant` and `moderator` paths. Claude Code and Grok Build accept
+the same packet-role settings under `claude-code` and `grok-build`. All targets
+with the same runtime and role share that selection. An `@driver` reviewer
+inherits the driver's model but uses the reviewer executable and permissions.
+
+In the desktop app, choose **Native CLI paths…**; these settings persist across
+launches. The browser UI has a **Native CLI paths (optional)** section. Each
+selected binary still passes the existing version and capability checks; this
+setting does not qualify `0.153.4` for driver writes. Doctor and run evidence
+record the actual selected executable, version, and content hash. The
+[executable selection extension](GptPro/DIALECTIC_NATIVE_EXECUTABLE_SELECTION_EXTENSION_V0.1.md)
+defines the configuration and qualification behavior.
 
 ```bash
 # One coding/review/repair pass

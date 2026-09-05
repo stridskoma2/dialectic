@@ -1,0 +1,3 @@
+{"type": "thread.started", "thread_id": "reviewer-native-session"}
+{"type": "item.completed", "item": {"type": "agent_message", "text": "{\"schema_version\": 1, \"base_sha\": \"20f0ce0867f3ebd20f1459e62bd6e2ef141e8763\", \"head_sha\": \"e6c40042519088bbba90d07a94afb96da4bf4541\", \"verdict\": \"pass\", \"summary\": \"native reviewer passed\", \"findings\": []}"}}
+{"type": "turn.completed", "usage": {"output_tokens": 1}}

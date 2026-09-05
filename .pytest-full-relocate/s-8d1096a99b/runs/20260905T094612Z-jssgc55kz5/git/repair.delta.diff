@@ -1,0 +1,8 @@
+diff --git a/feature.txt b/feature.txt
+index 978dddd5a1ac882fb73446160722966250505409..75fd73bcea319eb6ecb97af67abdf2989ed5fa40 100644
+--- a/feature.txt
++++ b/feature.txt
+@@ -1 +1,2 @@
+-implemented
++implemented
++guarded

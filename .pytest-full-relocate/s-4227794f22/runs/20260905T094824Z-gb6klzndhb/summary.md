@@ -1,0 +1,4 @@
+# Dialectic run 20260905T094824Z-gb6klzndhb
+
+Status: FAILED
+Failure: UNSUPPORTED_REPOSITORY

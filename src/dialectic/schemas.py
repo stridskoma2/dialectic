@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Literal, Self
 from urllib.parse import urlsplit
 
@@ -12,7 +13,9 @@ from pydantic import (
     ConfigDict,
     Field,
     ValidationInfo,
+    SerializerFunctionWrapHandler,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -228,6 +231,25 @@ class LimitsSpec(ClosedModel):
         return self
 
 
+class NativeExecutablePaths(ClosedModel):
+    driver: str | None = None
+    reviewer: str | None = None
+    participant: str | None = None
+    moderator: str | None = None
+
+    @field_validator("driver", "reviewer", "participant", "moderator")
+    @classmethod
+    def absolute_executable_path(cls, value: str | None) -> str:
+        if (
+            value is None or not value or value != value.strip()
+            or len(value) > 4096
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)
+            or not Path(value).is_absolute()
+        ):
+            raise ValueError("native executable must be an absolute path without whitespace padding or control characters (1..4096 characters)")
+        return value
+
+
 class DialecticConfig(ClosedModel):
     version: Literal[1]
     research_mode: ResearchMode = "offline"
@@ -235,9 +257,28 @@ class DialecticConfig(ClosedModel):
     reviewers: list[ReviewerSpec] | None = None
     council: CouncilSpec | None = None
     limits: LimitsSpec
+    native_executables: dict[
+        Literal["codex", "claude-code", "grok-build"], NativeExecutablePaths
+    ] = Field(default_factory=dict)
+
+    @model_serializer(mode="wrap")
+    def serialize_config(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data = handler(self)
+        # Adding an optional host setting must not change old retained configs.
+        if not self.native_executables:
+            data.pop("native_executables", None)
+        elif "native_executables" in data:
+            data["native_executables"] = {
+                runtime: {role: path for role, path in paths.items() if path is not None}
+                for runtime, paths in data["native_executables"].items()
+            }
+        return data
 
     @model_validator(mode="after")
     def present_sections_obey_controller_limits(self) -> Self:
+        for runtime, paths in self.native_executables.items():
+            if runtime != "codex" and paths.driver is not None:
+                raise ValueError("only Codex may select a driver executable")
         limits = self.limits
         if self.reviewers is not None:
             if not 1 <= len(self.reviewers) <= 5:

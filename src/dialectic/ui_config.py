@@ -2,17 +2,43 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, TypeAlias
 
 import yaml
+from pydantic import TypeAdapter, ValidationError
 
 from .config import ConfigLoader
 from .contracts import ResearchMode, RunMode
+from .schemas import NativeExecutablePaths
 
 RuntimeName: TypeAlias = Literal["codex", "claude-code", "grok-build"]
 ReviewRuntime: TypeAlias = RuntimeName | Literal["@driver"]
 ModeratorMode: TypeAlias = Literal["fresh", "independent-opening"]
+NATIVE_EXECUTABLE_ROLES: dict[str, tuple[str, ...]] = {
+    "codex": ("driver", "reviewer", "participant", "moderator"),
+    "claude-code": ("reviewer", "participant", "moderator"),
+    "grok-build": ("reviewer", "participant", "moderator"),
+}
+
+
+def validate_native_executables(value: object) -> dict[str, dict[str, str]]:
+    try:
+        selections = TypeAdapter(dict[RuntimeName, NativeExecutablePaths]).validate_python(
+            value, strict=True
+        )
+    except ValidationError as exc:
+        first = exc.errors(include_input=False)[0]
+        location = ".".join(str(part) for part in first["loc"])
+        raise ValueError(f"Invalid native CLI path {location}: {first['msg']}") from exc
+    for runtime, paths in selections.items():
+        if runtime != "codex" and paths.driver is not None:
+            raise ValueError("Only Codex may select a driver executable")
+    return {
+        runtime: paths.model_dump(exclude_none=True)
+        for runtime, paths in selections.items()
+        if paths.model_dump(exclude_none=True)
+    }
 
 SUPPORTED_EFFORTS: dict[RuntimeName, tuple[str, ...]] = {
     "codex": ("", "low", "medium", "high", "xhigh", "max", "ultra"),
@@ -76,6 +102,7 @@ class UiRunConfig:
     research_mode: ResearchMode = "offline"
     max_dissenters: int = 0
     moderator_mode: ModeratorMode = "fresh"
+    native_executables: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 def build_config_bytes(request: UiRunConfig) -> bytes:
@@ -94,6 +121,9 @@ def build_config_bytes(request: UiRunConfig) -> bytes:
         "research_mode": request.research_mode,
         "limits": dict(DEFAULT_LIMITS),
     }
+    native_executables = validate_native_executables(request.native_executables)
+    if native_executables:
+        data["native_executables"] = native_executables
     main_target: dict[str, str] = {
         "runtime": request.main_runtime,
         "model": main_model,

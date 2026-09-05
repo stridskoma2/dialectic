@@ -1,0 +1,1 @@
+{"additionalProperties":false,"properties":{"repair":{"type":"string"}},"required":["repair"],"type":"object"}

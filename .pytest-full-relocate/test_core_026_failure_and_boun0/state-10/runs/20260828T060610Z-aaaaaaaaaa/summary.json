@@ -1,0 +1,1 @@
+{"artifact_paths":{"events":"events.jsonl","run":"run.json"},"artifact_schema_version":1,"failure_kind":"AGENT_OUTPUT_TOO_LARGE","mode":"code","outcome":null,"run_id":"20260828T060610Z-aaaaaaaaaa","status":"FAILED","tool_version":"0.1.0","unresolved_items":[]}

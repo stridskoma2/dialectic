@@ -1,0 +1,7 @@
+diff --git a/source.py b/source.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..31ba3a2f0e57fd4b44f0d1bbcd1700a33a3dcca6
+--- /dev/null
++++ b/source.py
+@@ -0,0 +1 @@
++VALUE = 1

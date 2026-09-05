@@ -23,6 +23,10 @@ behavior, bounded provider-native web research, and controller-owned idle/allott
 turn deadlines while preserving fresh final synthesis, one cross-examination round,
 non-voting moderation, and the packet-only security boundary.
 
+`GptPro/DIALECTIC_NATIVE_EXECUTABLE_SELECTION_EXTENSION_V0.1.md` adds optional
+controller-only native CLI paths by runtime and role. It preserves existing
+version qualification, capability binding, and workflow bounds.
+
 Read the relevant section before implementing against it. It went through five
 review rounds with two independent reviewers and its clauses are load-bearing:
 bounds, orderings, and failure kinds are deliberate, not incidental. When code and

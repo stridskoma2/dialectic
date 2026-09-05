@@ -1,0 +1,2 @@
+{"artifact_schema_version":1,"event_type":"phase-started","payload":{"phase":"PREFLIGHT"},"phase":"PREFLIGHT","run_id":"20260828T062659Z-aaaaaaaaaa","sequence":1,"timestamp":"2026-09-05T09:48:33.491311Z","tool_version":"0.1.0"}
+{"artifact_schema_version":1,"event_type":"run-failed","payload":{"failure_kind":"INTERNAL_ERROR"},"phase":"PREFLIGHT","run_id":"20260828T062659Z-aaaaaaaaaa","sequence":2,"timestamp":"2026-09-05T09:48:33.501715Z","tool_version":"0.1.0"}

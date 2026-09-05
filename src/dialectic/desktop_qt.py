@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -57,7 +58,10 @@ from .ui import (
     _prepare_run,
     _text_preview,
 )
-from .ui_config import DEFAULT_LIMITS, SUPPORTED_EFFORTS
+from .ui_config import (
+    DEFAULT_LIMITS, NATIVE_EXECUTABLE_ROLES, SUPPORTED_EFFORTS,
+    validate_native_executables,
+)
 
 _LOGGER = logging.getLogger("dialectic.desktop")
 _RUNTIME_LABELS = {
@@ -396,7 +400,7 @@ class AgentRow(QFrame):
             label = _RUNTIME_LABELS[runtime]
             if runtime != "@driver":
                 runtime_status = _runtime_status(options, runtime)
-                label += " · installed" if runtime_status else " · not installed"
+                label += " · on PATH" if runtime_status else " · not on PATH"
             self.runtime.addItem(label, runtime)
         selected_runtime = choice.get("runtime", "codex")
         _select_data(self.runtime, selected_runtime)
@@ -476,6 +480,8 @@ class MainWindow(QMainWindow):
         self._agent_rows: list[AgentRow] = []
         self._settings = settings or QSettings("OpenAI", "Dialectic")
         self._drafts = _default_drafts(self._options)
+        self._native_executables: dict[str, dict[str, str]] = {}
+        self._native_executables_invalid = False
 
         self.setWindowTitle("Dialectic")
         self.resize(1280, 820)
@@ -608,6 +614,10 @@ class MainWindow(QMainWindow):
         self.main_model_hint.setObjectName("Hint")
         self.main_model_hint.setWordWrap(True)
         panel_layout.addWidget(self.main_model_hint)
+        self.cli_paths_button = QPushButton("Native CLI paths…")
+        self.cli_paths_button.setToolTip("Optionally choose a separate CLI executable for each runtime and role")
+        self.cli_paths_button.clicked.connect(self._edit_native_executables)
+        panel_layout.addWidget(self.cli_paths_button)
         self.main_runtime.currentIndexChanged.connect(self._main_runtime_changed)
         self.main_model.currentIndexChanged.connect(self._show_main_model_hint)
 
@@ -951,7 +961,7 @@ class MainWindow(QMainWindow):
         )
         for item in runtimes:
             label = _RUNTIME_LABELS[item]
-            label += " · installed" if _runtime_status(self._options, item) else " · not installed"
+            label += " · on PATH" if _runtime_status(self._options, item) else " · not on PATH"
             self.main_runtime.addItem(label, item)
         _select_data(self.main_runtime, "codex" if self._mode == "code" else runtime)
         self.main_runtime.setDisabled(self._mode == "code")
@@ -1134,6 +1144,8 @@ class MainWindow(QMainWindow):
         _set_markdown(self.prompt_preview, markdown or "_Nothing to preview yet._")
 
     def _payload(self) -> dict[str, object]:
+        if self._native_executables_invalid:
+            raise ValueError("Saved CLI paths are invalid. Open Native CLI paths and save valid selections before running.")
         return {
             "mode": self._mode,
             "prompt": self.prompt_edit.toPlainText(),
@@ -1147,7 +1159,17 @@ class MainWindow(QMainWindow):
             "maxDissenters": self.max_dissenters.value(),
             "moderatorMode": str(self.moderator_mode.currentData() or "fresh"),
             "researchMode": str(self.research_mode.currentData() or "offline"),
+            "nativeExecutables": self._native_executables,
         }
+
+    def _edit_native_executables(self) -> None:
+        dialog = NativeExecutablesDialog(self._native_executables, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._native_executables = dialog.selections
+            self._native_executables_invalid = False
+            self._settings.setValue(
+                "desktop/nativeExecutables", json.dumps(self._native_executables)
+            )
 
     def _start_run(self) -> None:
         try:
@@ -1276,6 +1298,7 @@ class MainWindow(QMainWindow):
             self.main_runtime,
             self.main_model,
             self.main_effort,
+            self.cli_paths_button,
             self.repository,
             self.browse,
             self.moderator_mode,
@@ -1560,11 +1583,21 @@ class MainWindow(QMainWindow):
         repository = self._settings.value("desktop/repository", "")
         if isinstance(repository, str):
             self.repository.setText(repository)
+        try:
+            self._native_executables = validate_native_executables(
+                json.loads(str(self._settings.value("desktop/nativeExecutables", "{}")))
+            )
+        except ValueError:
+            self._native_executables_invalid = True
+            log_event(_LOGGER, logging.WARNING, "ui.invalid_saved_cli_paths")
+            self.result_detail.setText("Saved CLI paths are invalid. Open Native CLI paths to configure them again.")
 
     def _save_settings(self) -> None:
         self._settings.setValue("desktop/geometry", self.saveGeometry())
         self._settings.setValue("desktop/mainSplitter", self.main_splitter.saveState())
         self._settings.setValue("desktop/repository", self.repository.text())
+        if not self._native_executables_invalid:
+            self._settings.setValue("desktop/nativeExecutables", json.dumps(self._native_executables))
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._running and self._worker is not None:
@@ -1586,6 +1619,75 @@ class MainWindow(QMainWindow):
             return
         self._save_settings()
         event.accept()
+
+
+class NativeExecutablesDialog(QDialog):
+    """Local executable selection; no binary is launched by this dialog."""
+
+    def __init__(
+        self, selections: dict[str, dict[str, str]], parent: QWidget | None = None
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("Root")
+        self.setWindowTitle("Native CLI paths")
+        self.resize(740, 360)
+        self.selections = selections
+        self.path_inputs: dict[tuple[str, str], QLineEdit] = {}
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "Choose an absolute executable path for each role, or leave it blank to use PATH. "
+            "All selected builds still require native qualification."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        tabs = QTabWidget()
+        labels = {"driver": "Code driver", "reviewer": "Code reviewers", "participant": "Council participants", "moderator": "Council moderator"}
+        for runtime, roles in NATIVE_EXECUTABLE_ROLES.items():
+            page = QWidget()
+            grid = QGridLayout(page)
+            for row, role in enumerate(roles):
+                edit = QLineEdit(selections.get(runtime, {}).get(role, ""))
+                edit.setPlaceholderText("Use PATH")
+                edit.setAccessibleName(f"{_RUNTIME_LABELS[runtime]} {labels[role]} executable")
+                browse = QPushButton("Browse")
+                browse.clicked.connect(lambda _checked=False, target=edit: self._browse(target))
+                self.path_inputs[runtime, role] = edit
+                grid.addWidget(QLabel(labels[role]), row, 0)
+                grid.addWidget(edit, row, 1)
+                grid.addWidget(browse, row, 2)
+            grid.setColumnStretch(1, 1)
+            grid.setRowStretch(len(roles), 1)
+            tabs.addTab(page, _RUNTIME_LABELS[runtime])
+        layout.addWidget(tabs)
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("Save")
+        save.clicked.connect(self.accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(save)
+        layout.addLayout(buttons)
+
+    def _browse(self, target: QLineEdit) -> None:
+        selected, _filter = QFileDialog.getOpenFileName(
+            self, "Select native CLI executable", target.text(), "All files (*)"
+        )
+        if selected:
+            target.setText(selected)
+
+    def accept(self) -> None:
+        values: dict[str, dict[str, str]] = {}
+        for (runtime, role), edit in self.path_inputs.items():
+            value = edit.text().strip()
+            if value:
+                values.setdefault(runtime, {})[role] = value
+        try:
+            self.selections = validate_native_executables(values)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid native CLI path", str(exc))
+            return
+        super().accept()
 
 
 class _TextPreviewDialog(QDialog):
