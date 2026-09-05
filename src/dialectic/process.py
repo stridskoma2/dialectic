@@ -10,7 +10,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, BinaryIO, Callable, Iterable, Literal, Mapping, Protocol, Sequence
+from typing import Awaitable, BinaryIO, Callable, Literal, Mapping, Protocol, Sequence
 
 from .contracts import FailureKind
 from .launcher import DirectLaunchSpec, LaunchSpec, WindowsBatchLaunchSpec
@@ -19,29 +19,6 @@ MAX_READER_CHUNK_BYTES = 65_536
 EXTENDED_STARTUPINFO_PRESENT = 0x0008_0000
 CREATE_SUSPENDED = 0x0000_0004
 CREATE_UNICODE_ENVIRONMENT = 0x0000_0400
-
-
-async def cancel_and_wait(tasks: Iterable[asyncio.Future[Any]]) -> list[Any]:
-    """Drain owned work without hiding cleanup failure behind cancellation."""
-    owned = tuple(tasks)
-    for task in owned:
-        if not task.done() and not (isinstance(task, asyncio.Task) and task.cancelling()):
-            task.cancel()
-    drained = asyncio.gather(*owned, return_exceptions=True)
-    cancelled = False
-    while not drained.done():
-        try:
-            await asyncio.shield(drained)
-        except asyncio.CancelledError:
-            # A second cancellation must not interrupt native process cleanup.
-            cancelled = True
-    results = drained.result()
-    for result in results:
-        if isinstance(result, BaseException) and getattr(result, "kind", None) == "PROCESS_CLEANUP_FAILED":
-            raise result
-    if cancelled:
-        raise asyncio.CancelledError
-    return results
 
 
 class ProcessUnit(Protocol):
@@ -105,14 +82,10 @@ class ProcessSupervisor:
                         )
                     except TimeoutError:
                         pass
-                # Root exit does not prove that descendants accepted the signal.
-                await unit.force_terminate()
-            else:
-                # Spec section 10.4 requires signaling the owned process group after
-                # normal root exit so lingering members cannot survive persistence.
-                # This deliberately accepts the POSIX PID/PGID reuse window in favor
-                # of that bounded descendant cleanup contract.
-                await unit.force_terminate()
+            # Spec section 10.4: root exit, including after a graceful signal, does
+            # not prove descendant cleanup. Signal the owned unit even after exit,
+            # accepting the POSIX PID/PGID reuse window for bounded tree cleanup.
+            await unit.force_terminate()
 
             confirmed = await unit.confirm_cleanup(graceful_kill_seconds)
             if exit_code is None and root_wait.done() and not root_wait.cancelled():

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, TypeVar
 
-from .process import cancel_and_wait
+from .task_cleanup import cancel_and_wait
 
 _T = TypeVar("_T")
 
@@ -58,7 +58,10 @@ class ScratchUsage:
 
 def scan_scratch(root: Path | str, limits: ScratchLimits) -> ScratchUsage:
     root_path = Path(root)
-    root_info = root_path.lstat()
+    try:
+        root_info = root_path.lstat()
+    except OSError as exc:
+        raise ScratchContainmentError("scratch root cannot be inspected safely") from exc
     if not stat.S_ISDIR(root_info.st_mode) or _is_reparse(root_info):
         raise ScratchContainmentError("scratch root is not a non-reparse directory")
     if os.name != "nt":
@@ -162,11 +165,21 @@ def _scan_scratch_posix(
             if maximum_depth > limits.max_depth:
                 overage = "depth"
                 break
-            information = entry.stat(follow_symlinks=False)
+            try:
+                information = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise ScratchContainmentError(
+                    "scratch entry identity changed during traversal"
+                ) from exc
             if stat.S_ISLNK(information.st_mode):
                 invalid_type = invalid_type or "link-or-reparse"
             elif stat.S_ISDIR(information.st_mode):
-                child_fd = os.open(entry.name, flags, dir_fd=directory_fd)
+                try:
+                    child_fd = os.open(entry.name, flags, dir_fd=directory_fd)
+                except OSError as exc:
+                    raise ScratchContainmentError(
+                        "scratch directory cannot be opened safely"
+                    ) from exc
                 try:
                     opened = os.fstat(child_fd)
                     if (opened.st_dev, opened.st_ino) != (

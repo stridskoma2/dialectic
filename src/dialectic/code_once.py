@@ -48,9 +48,9 @@ from .schemas import (
     RunRecord,
     WorkspaceRecord,
 )
-from .process import cancel_and_wait
 from .scratch import ScratchLimitExceeded
 from .service import DialecticFailure, ExecutionContext, WorkflowTimedOut
+from .task_cleanup import cancel_and_wait
 from .turn_workspace import (
     TurnWorkspace,
     TurnWorkspaceCleanupError,

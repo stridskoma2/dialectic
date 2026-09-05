@@ -10,7 +10,9 @@ import logging
 import os
 import socket
 import subprocess
+import sys
 import sysconfig
+import textwrap
 import threading
 import time
 from types import SimpleNamespace
@@ -99,6 +101,7 @@ from dialectic.schemas import (
 )
 from dialectic.scratch import (
     ScratchCleanupTimeout,
+    ScratchContainmentError,
     ScratchLimits,
     cleanup_reserved_tree,
     scan_scratch,
@@ -369,17 +372,20 @@ async def test_core_007_timeout_reaps_owned_descendant_before_sentinel(
     execution.cancel()
     assert (await execution).status == "CANCELLED"
 
+    long_request = request.model_copy(update={"timeout_seconds": 1})
     for runtime, elapsed in (("claude-code", 2.0), ("codex", 0.6)):
         clock = [0.0]
         expired = TurnDeadlineController(idle_seconds=0.5, monotonic=lambda: clock[0])
         pending = asyncio.get_running_loop().create_future()
-        long_request = request.model_copy(update={"timeout_seconds": 1})
         waiter = asyncio.create_task(expired.wait_for(long_request, runtime, pending))
         await asyncio.sleep(0)
         clock[0] = elapsed
         expired.activity_callback(long_request)()
         assert expired.snapshot()["canExtend"] is False
         assert expired.extend_active()["extendedTurns"] == 0
+        service._active_deadlines[handle.run_id] = expired
+        with pytest.raises(ValueError, match="^no active turn is eligible for extension$"):
+            service.extend_turn_deadlines(handle.run_id)
         waiter.cancel()
         with pytest.raises(asyncio.CancelledError):
             await waiter
@@ -390,6 +396,9 @@ async def test_core_007_timeout_reaps_owned_descendant_before_sentinel(
     await asyncio.sleep(0)
     pending.set_result("done")
     assert completed.extend_active()["extendedTurns"] == 0
+    service._active_deadlines[handle.run_id] = completed
+    with pytest.raises(ValueError, match="^no active turn is eligible for extension$"):
+        service.extend_turn_deadlines(handle.run_id)
     assert await waiter == "done"
 
 
@@ -1409,7 +1418,9 @@ def test_core_026_failure_and_bounded_ingress_contracts(
     assert tracking_service.get_run(cli_run_id).failure_kind == "INVALID_INPUT"
 
 
-def test_core_027_stream_scratch_and_cleanup_bounds(tmp_path: Path) -> None:
+def test_core_027_stream_scratch_and_cleanup_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     secret = "credential-value"
     credentials = KnownCredentials([KnownCredential("TOKEN", secret)])
     capture = BoundedStreamCapture(256, credentials)
@@ -1465,6 +1476,24 @@ def test_core_027_stream_scratch_and_cleanup_bounds(tmp_path: Path) -> None:
     (depth_root / "one" / "two").mkdir(parents=True)
     assert scan_scratch(depth_root, ScratchLimits(100, 10, 1)).maximum_depth == 2
 
+    missing_root = tmp_path / "missing-scratch"
+    with pytest.raises(ScratchContainmentError, match="scratch root cannot be inspected safely") as failure:
+        scan_scratch(missing_root, ScratchLimits(100, 10, 3))
+    assert isinstance(failure.value.__cause__, FileNotFoundError)
+
+    original_lstat = Path.lstat
+
+    def inaccessible_root(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if path == bytes_root:
+            raise PermissionError("simulated root access failure")
+        return original_lstat(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "lstat", inaccessible_root)
+        with pytest.raises(ScratchContainmentError, match="scratch root cannot be inspected safely") as failure:
+            scan_scratch(bytes_root, ScratchLimits(100, 10, 3))
+        assert isinstance(failure.value.__cause__, PermissionError)
+
     cleanup_root = tmp_path / "cleanup"
     cleanup_root.mkdir()
     (cleanup_root / "entry").touch()
@@ -1477,18 +1506,67 @@ def test_core_027_stream_scratch_and_cleanup_bounds(tmp_path: Path) -> None:
         )
 
     if os.name != "nt":
-        deep_root = tmp_path / "deep-cleanup"
-        deep_root.mkdir()
-        cursor = deep_root
-        for _ in range(1_100):
-            cursor /= "d"
-            cursor.mkdir()
-        # Accounting, like cleanup, must not depend on Python's recursion limit.
-        deep_usage = scan_scratch(deep_root, ScratchLimits(100, 2_000, 2_000))
-        assert deep_usage.within_limits
-        assert deep_usage.maximum_depth == 1_100
-        cleanup_reserved_tree(deep_root, timeout_seconds=10)
-        assert not os.path.lexists(deep_root)
+        # Exercise the production depth ceiling with a 1024-fd limit. Lowering the
+        # child's recursion limit still catches recursive walks, without requiring
+        # a >1000-level tree that exceeds both production bounds and ordinary fd limits.
+        # Both process limits stay isolated from pytest and its plugins.
+        depth_probe = textwrap.dedent("""
+            import resource
+            import sys
+            from pathlib import Path
+            from dialectic.scratch import ScratchLimits, scan_scratch, cleanup_reserved_tree
+
+            _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (1024, hard))
+            sys.setrecursionlimit(128)
+            root = Path(sys.argv[1])
+            root.mkdir()
+            cursor = root
+            for _ in range(256):
+                cursor /= 'd'
+                cursor.mkdir()
+            try:
+                for _ in range(3):
+                    usage = scan_scratch(root, ScratchLimits(100, 1000, 256))
+                    assert usage.within_limits
+                    assert usage.maximum_depth == 256
+                    assert scan_scratch(root, ScratchLimits(100, 1000, 128)).overage == 'depth'
+            finally:
+                cleanup_reserved_tree(root, timeout_seconds=10)
+            assert not root.exists()
+        """)
+        result = subprocess.run(
+            [sys.executable, "-c", depth_probe, str(tmp_path / "deep-cleanup")],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=30, check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+        original_open = os.open
+
+        def inaccessible_child(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if path == "one":
+                raise PermissionError("simulated child access failure")
+            return original_open(path, flags, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "open", inaccessible_child)
+            with pytest.raises(ScratchContainmentError, match="scratch directory cannot be opened safely") as failure:
+                scan_scratch(depth_root, ScratchLimits(100, 10, 3))
+            assert isinstance(failure.value.__cause__, PermissionError)
+
+        class InaccessibleEntry:
+            def stat(self, *, follow_symlinks: bool):  # type: ignore[no-untyped-def]
+                raise PermissionError("simulated entry identity failure")
+
+        def inaccessible_entries(_directory_fd):  # type: ignore[no-untyped-def]
+            yield InaccessibleEntry()
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "scandir", inaccessible_entries)
+            with pytest.raises(ScratchContainmentError, match="scratch entry identity changed during traversal") as failure:
+                scan_scratch(depth_root, ScratchLimits(100, 10, 3))
+            assert isinstance(failure.value.__cause__, PermissionError)
 
 
 @pytest.mark.asyncio

@@ -117,9 +117,7 @@ class DialecticService:
             raise ValueError("no active turn is available to extend")
         snapshot = controller.extend_active()
         if snapshot["extendedTurns"] == 0:
-            if snapshot["turnCount"] == 0:
-                raise ValueError("no active turn is available to extend")
-            raise ValueError("active turns have reached the one-hour hard ceiling")
+            raise ValueError("no active turn is eligible for extension")
         log_event(
             _LOGGER,
             logging.INFO,

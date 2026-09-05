@@ -500,7 +500,9 @@ class WorkflowEvidenceSupport:
                 attempt_failure = evidence.failure_kind  # type: ignore[assignment]
             if evidence.bounded_diagnostic is not None and diagnostic is None:
                 diagnostic = evidence.bounded_diagnostic
-            if attempt_end_reason == "cancelled" and termination in {"timeout", "peer-failure", "output-limit"}:
+            if attempt_end_reason == "cancelled" and termination in {
+                "timeout", "peer-failure", "output-limit", "agent-failed"
+            }:
                 attempt_end_reason = termination
             if process_disposition == "cleanup-failed":
                 attempt_failure = "PROCESS_CLEANUP_FAILED"

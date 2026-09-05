@@ -52,7 +52,7 @@ from .schemas import (
     derive_overall_vote,
 )
 from .service import DialecticFailure, ExecutionContext, WorkflowTimedOut
-from .process import cancel_and_wait
+from .task_cleanup import cancel_and_wait
 from .turn_timing import TurnDeadlineExpired
 from .workflow_evidence import (
     GateAEvidence as _GateAEvidence,

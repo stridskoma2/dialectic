@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TypeVar
 
-from .process import cancel_and_wait
 from .schemas import AgentRequest
+from .task_cleanup import cancel_and_wait
 
 IDLE_WATCHDOG_SECONDS = 90.0
 MAXIMUM_TURN_SECONDS = 3_600.0
@@ -131,7 +131,7 @@ class TurnDeadlineController:
         wakeup_task = asyncio.create_task(turn.wakeup.wait())
         try:
             while True:
-                reason, remaining = self._remaining(key)
+                reason, remaining = self._begin_stop_if_expired(key)
                 if remaining <= 0:
                     await cancel_and_wait((task,))
                     seconds = idle if reason == "idle" else turn.allotted_seconds
@@ -208,7 +208,8 @@ class TurnDeadlineController:
             "turns": items,
         }
 
-    def _remaining(self, key: str) -> tuple[str, float]:
+    def _begin_stop_if_expired(self, key: str) -> tuple[str, float]:
+        """Read the remaining time and atomically close expired turns to extension."""
         now = self._monotonic()
         with self._lock:
             turn = self._active.get(key)

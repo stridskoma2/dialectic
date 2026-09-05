@@ -1473,6 +1473,7 @@ def test_code_043_post_commit_race_fails_exact_byte_confirmation(tmp_path: Path,
         ("scratch-initial", "AGENT_OUTPUT_TOO_LARGE"),
         ("scratch-repair", "AGENT_OUTPUT_TOO_LARGE"),
         ("scratch-cleanup-failure", "PROCESS_CLEANUP_FAILED"),
+        ("scratch-missing-root", "INTERNAL_ERROR"),
     ],
 )
 async def test_code_044_reserved_workspace_attacks_fail_closed_before_git(
@@ -1499,9 +1500,12 @@ async def test_code_044_reserved_workspace_attacks_fail_closed_before_git(
         output = scratch_root / "control" / "output.json"
         temporary = scratch_root / "tmp"
         if variant.startswith("scratch-"):
-            # Let the initial scan run before growing scratch to exercise polling.
+            # Let the initial scan run before changing scratch to exercise polling.
             await asyncio.sleep(0.01)
-            (temporary / "large").write_bytes(b"x" * 33)
+            if variant == "scratch-missing-root":
+                temporary.rmdir()
+            else:
+                (temporary / "large").write_bytes(b"x" * 33)
             if variant != "scratch-final":
                 try:
                     await asyncio.Event().wait()
@@ -1569,14 +1573,21 @@ async def test_code_044_reserved_workspace_attacks_fail_closed_before_git(
         tmp_path, _config(config_data, limit_updates={"max_turn_scratch_bytes": 32}), repo, driver
     )
     assert record.failure_kind == expected_kind
-    if variant in {"scratch-initial", "scratch-repair", "scratch-cleanup-failure"}:
+    if variant in {"scratch-initial", "scratch-repair", "scratch-cleanup-failure", "scratch-missing-root"}:
         assert sampled_cancellation.is_set()
         phase = "repair" if variant == "scratch-repair" else "initial"
         attempt = TurnAttemptArtifact.model_validate_json(
             (handle.path / f"turns/driver/driver/{phase}.attempt.json").read_bytes()
         )
-        assert attempt.failure_kind == "AGENT_OUTPUT_TOO_LARGE"
-        assert attempt.attempt_end_reason == "output-limit"
+        if variant == "scratch-missing-root":
+            assert attempt.failure_kind == "INTERNAL_ERROR"
+            assert attempt.attempt_end_reason == "agent-failed"
+            assert attempt.bounded_diagnostic == "scratch root cannot be inspected safely"
+        else:
+            assert attempt.failure_kind == "AGENT_OUTPUT_TOO_LARGE"
+            assert attempt.attempt_end_reason == "output-limit"
+        assert attempt.process_origin == "spawned-for-attempt"
+        assert attempt.process_disposition == "closed"
     assert outside_file.read_text(encoding="utf-8") == "outside-secret"
     assert outside_sentinel.read_text(encoding="utf-8") == "outside-directory-secret"
     assert (handle.path / "git/initial.diff").exists() == (variant == "scratch-repair")
