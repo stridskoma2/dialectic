@@ -1579,6 +1579,8 @@ def _versioned_fixture(
     if access_mode == "driver-write" and research_mode != "offline":
         raise NativePreflightError("the writable driver cannot receive live web access")
     codex_versions = {"0.150.0-alpha.12.2", "0.151.0-alpha.7.1"}
+    if os.name == "nt":
+        codex_versions.add("0.153.4")
     supported = {
         "codex": codex_versions,
         "claude-code": {"2.1.177"},
@@ -1621,14 +1623,14 @@ def _versioned_fixture(
         )
     if (
         runtime == "codex"
-        and version == "0.151.0-alpha.7.1"
+        and version in {"0.151.0-alpha.7.1", "0.153.4"}
         and os.name == "nt"
         and access_mode == "driver-write"
     ):
         raise NativePreflightError(
-            "Codex CLI 0.151.0-alpha.7.1 is qualified on native Windows for "
+            f"Codex CLI {version} is qualified on native Windows for "
             "packet-only roles, but its elevated sandbox failed Dialectic's driver-write "
-            "matrix: product writes worked while required tmp writes and read-only Git "
+            "matrix: required tmp writes and read-only Git "
             "inspection failed. No permission boundary was weakened. Use this CLI for "
             "Council/reviewer roles, or install 0.150.0-alpha.12.2 for the Codex driver."
         )

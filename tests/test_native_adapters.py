@@ -318,6 +318,8 @@ def test_unqualified_native_version_error_names_the_installed_and_qualified_vers
         )
 
     qualified = ["0.150.0-alpha.12.2", "0.151.0-alpha.7.1"]
+    if os.name == "nt":
+        qualified.append("0.153.4")
     assert str(rejected.value) == (
         "Codex CLI 0.152.0 is installed but has not been qualified by Dialectic 0.1.0; "
         f"qualified versions: {', '.join(sorted(qualified))}. Install a qualified CLI "
@@ -348,6 +350,35 @@ def test_stable_codex_is_not_fixture_eligible() -> None:
             rejected.value
         )
         assert "0.150.0-alpha.12.2" in str(rejected.value)
+
+
+def test_codex_01534_is_qualified_only_for_native_windows_packet_roles() -> None:
+    for role in ("reviewer", "participant", "moderator"):
+        for research_mode in ("offline", "live-web"):
+            arguments = dict(
+                role=role,
+                access_mode="packet-only",
+                source_environment={},
+                research_mode=research_mode,
+            )
+            if os.name != "nt":
+                with pytest.raises(NativePreflightError, match="has not been qualified"):
+                    _versioned_fixture("codex", "0.153.4", **arguments)
+                continue
+            fixture = _versioned_fixture("codex", "0.153.4", **arguments)
+            previous = _versioned_fixture("codex", "0.151.0-alpha.7.1", **arguments)
+            assert fixture.cli_version == "0.153.4"
+            assert fixture.adapter_fixture_version != previous.adapter_fixture_version
+            assert fixture.capability_fixture == previous.capability_fixture
+            assert fixture.static_flags == previous.static_flags
+
+    with pytest.raises(NativePreflightError) as rejected:
+        _versioned_fixture(
+            "codex", "0.153.4", role="driver", access_mode="driver-write",
+            source_environment={},
+        )
+    if os.name == "nt":
+        assert "required tmp writes and read-only Git inspection failed" in str(rejected.value)
 
 
 def test_stable_codex_rejection_explains_failed_permission_matrix() -> None:

@@ -90,7 +90,7 @@ current host's native capability probe before any model turn:
 |---|---|---|
 | Codex on Linux/WSL | `codex` | `0.150.0-alpha.12.2`, `0.151.0-alpha.7.1` |
 | Codex driver on native Windows | `codex` | `0.150.0-alpha.12.2` |
-| Codex packet roles on native Windows | `codex` | `0.150.0-alpha.12.2`, `0.151.0-alpha.7.1` |
+| Codex packet roles on native Windows | `codex` | `0.150.0-alpha.12.2`, `0.151.0-alpha.7.1`, `0.153.4` |
 | Claude Code | `claude` | `2.1.177` |
 | Grok Build | `grok` | `0.1.220` |
 
@@ -124,6 +124,14 @@ Council/reviewer/moderator roles. Its driver-write matrix still denies required
 `tmp/` writes and read-only Git inspection, so Code mode requires the separately
 qualified `0.150.0-alpha.12.2`; Dialectic rejects the newer alpha as a driver before
 incurring a model turn.
+
+Codex `0.153.4` adds native-Windows packet-role support for GPT-6 Astra with the
+same v3 permission profiles and required CLI controls. Its native driver probe
+still failed required product/temporary writes and read-only Git inspection, so
+it remains ineligible for Code Once's writable driver. Linux/WSL qualification
+for this version is outstanding. See the
+[0.153.4 qualification report](GptPro/DIALECTIC_CODEX_0.153.4_QUALIFICATION.md)
+for native evidence and validation scope.
 
 ## Configure and run
 
