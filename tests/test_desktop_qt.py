@@ -17,7 +17,7 @@ from dialectic.config import ConfigLoader
 from dialectic.desktop_qt import MainWindow, RunWorker
 from dialectic.service import DialecticService
 from dialectic.store import RunStore
-from dialectic.ui import _prepare_run
+from dialectic.ui import _model_options, _prepare_run
 
 
 @pytest.fixture(scope="module")
@@ -126,15 +126,21 @@ def test_native_desktop_builds_the_same_validated_code_request(
 ) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
-    window = _window(tmp_path)
+    settings = QSettings(str(tmp_path / "desktop.ini"), QSettings.Format.IniFormat)
+    window = MainWindow(options=_model_options(), settings=settings)
     try:
         window.repository.setText(str(repository))
         window.prompt_edit.setPlainText("Implement the focused change.")
+        model_index = window.main_model.findData("gpt-6-astra")
+        assert model_index >= 0
+        assert window.main_model.itemText(model_index) == "GPT-6 Astra"
+        window.main_model.setCurrentIndex(model_index)
 
         run = _prepare_run(window._payload())
         config = ConfigLoader({}).load(run.config_bytes, mode="code").config
         assert run.repository == repository.resolve()
         assert config.driver is not None
+        assert config.driver.model == "gpt-6-astra"
         assert config.reviewers is not None
         assert len(config.reviewers) == 2
         assert config.research_mode == "offline"

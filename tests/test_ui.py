@@ -171,7 +171,7 @@ def test_desktop_model_options_use_friendly_names_and_report_installed_clis(
 
     options = _model_options()
 
-    assert options["models"]["codex"][:2] == [
+    assert options["models"]["codex"][:3] == [
         {
             "id": "organization-codex-model",
             "name": "Configured model (organization-codex-model)",
@@ -182,6 +182,12 @@ def test_desktop_model_options_use_friendly_names_and_report_installed_clis(
             "id": "gpt-5.6-sol",
             "name": "GPT-5.6 Sol",
             "description": "Flagship capability for complex work",
+            "source": "catalog",
+        },
+        {
+            "id": "gpt-6-astra",
+            "name": "GPT-6 Astra",
+            "description": "Most capable model for complex, demanding work",
             "source": "catalog",
         },
     ]

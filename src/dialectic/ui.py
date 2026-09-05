@@ -49,6 +49,7 @@ _LOGGER = logging.getLogger("dialectic.ui")
 _MODEL_CATALOG: dict[RuntimeName, tuple[tuple[str, str, str], ...]] = {
     "codex": (
         ("gpt-5.6-sol", "GPT-5.6 Sol", "Flagship capability for complex work"),
+        ("gpt-6-astra", "GPT-6 Astra", "Most capable model for complex, demanding work"),
         ("gpt-5.6-terra", "GPT-5.6 Terra", "Balanced capability and cost"),
         ("gpt-5.6-luna", "GPT-5.6 Luna", "Fast, economical high-volume work"),
     ),
